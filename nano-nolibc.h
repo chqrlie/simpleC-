@@ -21,16 +21,18 @@ int strcmp(const char *a, const char *b) {
 long _a1, _a2, _a3, _a4, _a5, _a6, _n, _ret;
 
 void _do_syscall() {
+    // nano_cc passes the __asm__ body straight through to the assembler
+    // (GNU as, .intel_syntax noprefix). Globals are addressed RIP-relative.
     __asm__(
-        "mov rax, _n\n"
-        "mov rdi, _a1\n"
-        "mov rsi, _a2\n"
-        "mov rdx, _a3\n"
-        "mov r10, _a4\n"
-        "mov r8,  _a5\n"
-        "mov r9,  _a6\n"
+        "mov rax, [rip + _n]\n"
+        "mov rdi, [rip + _a1]\n"
+        "mov rsi, [rip + _a2]\n"
+        "mov rdx, [rip + _a3]\n"
+        "mov r10, [rip + _a4]\n"
+        "mov r8,  [rip + _a5]\n"
+        "mov r9,  [rip + _a6]\n"
         "syscall\n"
-        "mov _ret, rax\n"
+        "mov [rip + _ret], rax\n"
     );
 }
 
