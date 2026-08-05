@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo clean
+.PHONY: all run test demo structs clean
 
 all: $(BIN)
 
@@ -42,5 +42,13 @@ demo: $(BIN)
 	@echo "---- ./features_prog output ----"
 	@./features_prog
 
+# struct/union + member access + sizeof + string-return demo.
+structs: $(BIN)
+	./$(BIN) structs.c structs.s
+	$(CC) -nostdlib -no-pie structs.s -o structs_prog
+	@echo "---- ./structs_prog output ----"
+	@./structs_prog
+
 clean:
-	rm -f $(BIN) sample.s sample_prog test.s test_prog features.s features_prog
+	rm -f $(BIN) sample.s sample_prog test.s test_prog \
+	      features.s features_prog structs.s structs_prog

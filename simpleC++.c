@@ -4,17 +4,18 @@
 // Emits GNU-as compatible x86_64 assembly (.intel_syntax noprefix) that
 // links with:  gcc -nostdlib -no-pie out.s -o prog
 //
-// Supported subset (enough to compile the bundled nano-nolibc.h + test.c):
+// Supported subset:
 //   * preprocessor: #include "...", #define (object macros),
 //                   #ifndef/#ifdef/#else/#endif include guards,
 //                   // and /* */ comments
-//   * types: int, long, char, void, pointers, char arrays, const/unsigned
-//            qualifiers (parsed, ignored), static/inline (ignored)
+//   * types: int, long, char, void, pointers, arrays, struct/union,
+//            const/unsigned qualifiers (parsed, ignored), static/inline
 //   * expressions: + - * / %, < > <= >= == !=, && ||, unary - ! * &,
-//                  postfix ++/--, casts, function calls, indexing a[i],
+//                  prefix & postfix ++/--, ternary ?:, casts, sizeof,
+//                  function calls, indexing a[i], member access . and ->,
 //                  assignment and compound assignment (+= -= *= /= %=)
-//   * statements: if/else, while, return, blocks, __asm__("..."),
-//                 declarations (incl. comma lists and initialisers)
+//   * statements: if/else, while, for, do/while, break, continue, return,
+//                 blocks, __asm__("..."), declarations (comma lists + init)
 //
 // Build:  gcc -std=c11 -O2 -Wall -Wextra -o nano_cc 'simpleC++.c'
 // Use:    ./nano_cc input.c output.s
@@ -224,10 +225,11 @@ enum {
     T_INC, T_DEC,
     T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
-    T_SEMI, T_COMMA, T_QUESTION, T_COLON,
+    T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW,
     T_KINT, T_KLONG, T_KCHAR, T_KVOID,
     T_KIF, T_KELSE, T_KWHILE, T_KRETURN, T_KASM,
     T_KFOR, T_KDO, T_KBREAK, T_KCONTINUE,
+    T_KSTRUCT, T_KUNION, T_KSIZEOF,
     T_EOF
 };
 
@@ -299,6 +301,9 @@ static void lex(void) {
             else if (!strcmp(buf, "do"))       k = T_KDO;
             else if (!strcmp(buf, "break"))    k = T_KBREAK;
             else if (!strcmp(buf, "continue")) k = T_KCONTINUE;
+            else if (!strcmp(buf, "struct"))   k = T_KSTRUCT;
+            else if (!strcmp(buf, "union"))    k = T_KUNION;
+            else if (!strcmp(buf, "sizeof"))   k = T_KSIZEOF;
             else if (!strcmp(buf, "__asm__") || !strcmp(buf, "asm")) k = T_KASM;
             else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
                      !strcmp(buf, "signed") || !strcmp(buf, "static") ||
@@ -338,7 +343,7 @@ static void lex(void) {
         #define TWO(a,b,K)  if (c==a && c2==b) { sp += 2; add_tok(K); goto next; }
         TWO('=','=',T_EQ) TWO('!','=',T_NE) TWO('<','=',T_LE) TWO('>','=',T_GE)
         TWO('&','&',T_ANDAND) TWO('|','|',T_OROR)
-        TWO('+','+',T_INC) TWO('-','-',T_DEC)
+        TWO('+','+',T_INC) TWO('-','-',T_DEC) TWO('-','>',T_ARROW)
         TWO('+','=',T_PLUSEQ) TWO('-','=',T_MINUSEQ) TWO('*','=',T_STAREQ)
         TWO('/','=',T_SLASHEQ) TWO('%','=',T_PERCENTEQ)
         #undef TWO
@@ -354,6 +359,7 @@ static void lex(void) {
             case '{': add_tok(T_LBRACE); break;  case '}': add_tok(T_RBRACE); break;
             case ';': add_tok(T_SEMI);   break;  case ',': add_tok(T_COMMA);  break;
             case '?': add_tok(T_QUESTION);break; case ':': add_tok(T_COLON);  break;
+            case '.': add_tok(T_DOT);    break;
             case '|': continue;                  // stray '|' — ignore
             default:  die("unknown character in source");
         }
@@ -364,21 +370,35 @@ static void lex(void) {
 // =====================================================================
 // 3. TYPES
 // =====================================================================
-enum { TY_INT, TY_CHAR, TY_LONG, TY_VOID, TY_PTR };
+enum { TY_INT, TY_CHAR, TY_LONG, TY_VOID, TY_PTR, TY_STRUCT };
 typedef struct Type Type;
-struct Type { int kind; Type *ptr; int is_array; int arr_len; };
+typedef struct Member { char name[256]; Type *type; int offset; struct Member *next; } Member;
+struct Type {
+    int kind; Type *ptr; int is_array; int arr_len;
+    Member *members; int struct_size; char tag[256];  // TY_STRUCT
+};
 
-static Type *ty_int(void)  { static Type t = { TY_INT,  0, 0, 0 }; return &t; }
-static Type *ty_char(void) { static Type t = { TY_CHAR, 0, 0, 0 }; return &t; }
-static Type *ty_long(void) { static Type t = { TY_LONG, 0, 0, 0 }; return &t; }
-static Type *ty_void(void) { static Type t = { TY_VOID, 0, 0, 0 }; return &t; }
+static Type *ty_int(void)  { static Type t = { TY_INT,  0, 0, 0, 0, 0, {0} }; return &t; }
+static Type *ty_char(void) { static Type t = { TY_CHAR, 0, 0, 0, 0, 0, {0} }; return &t; }
+static Type *ty_long(void) { static Type t = { TY_LONG, 0, 0, 0, 0, 0, {0} }; return &t; }
+static Type *ty_void(void) { static Type t = { TY_VOID, 0, 0, 0, 0, 0, {0} }; return &t; }
 
 static Type *ptr_to(Type *base) {
     Type *t = calloc(1, sizeof(Type)); t->kind = TY_PTR; t->ptr = base; return t;
 }
 static int ty_size(Type *t) {
     if (t->is_array) return t->arr_len * ty_size(t->ptr);
-    switch (t->kind) { case TY_CHAR: return 1; case TY_VOID: return 0; default: return 8; }
+    switch (t->kind) {
+        case TY_CHAR:   return 1;
+        case TY_VOID:   return 0;
+        case TY_STRUCT: return t->struct_size;
+        default:        return 8;
+    }
+}
+static Member *find_member(Type *st, const char *name) {
+    if (st->kind == TY_PTR) st = st->ptr;
+    for (Member *m = st->members; m; m = m->next) if (!strcmp(m->name, name)) return m;
+    return NULL;
 }
 // element size for pointer/array arithmetic (bytes per step); 0 if not a pointer
 static int elem_size(Type *t) {
@@ -395,7 +415,8 @@ enum {
     N_NUM, N_STR, N_VAR, N_CALL, N_ASSIGN, N_BIN, N_UNARY,
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
-    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE
+    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
+    N_MEMBER, N_SIZEOF
 };
 
 typedef struct Node Node;
@@ -440,24 +461,78 @@ static int  at(int k)   { return toks[P].kind == k; }
 static int  eat(int k)  { if (toks[P].kind == k) { P++; return 1; } return 0; }
 static void expect(int k) { if (!eat(k)) { fprintf(stderr, "nano_cc: parse error near token %d (kind %d)\n", P, toks[P].kind); exit(1); } }
 
-static int is_type_start(int k) { return k == T_KINT || k == T_KLONG || k == T_KCHAR || k == T_KVOID; }
+static int is_type_start(int k) {
+    return k == T_KINT || k == T_KLONG || k == T_KCHAR || k == T_KVOID ||
+           k == T_KSTRUCT || k == T_KUNION;
+}
 
-// parse base type + pointer stars; returns Type*
-static Type *parse_type(void) {
-    Type *base;
-    if      (eat(T_KINT))  base = ty_int();
-    else if (eat(T_KLONG)) base = ty_long();
-    else if (eat(T_KCHAR)) base = ty_char();
-    else if (eat(T_KVOID)) base = ty_void();
-    else { die("type expected"); return 0; }
-    while (eat(T_STAR)) base = ptr_to(base);
-    return base;
+// ---- struct/union tag table ----
+typedef struct Tag { char name[256]; Type *type; struct Tag *next; } Tag;
+static Tag *tags = NULL;
+static Type *tag_find(const char *name) {
+    for (Tag *t = tags; t; t = t->next) if (!strcmp(t->name, name)) return t->type;
+    return NULL;
+}
+static Type *tag_get(const char *name) {          // find or forward-declare
+    Type *t = tag_find(name);
+    if (t) return t;
+    t = calloc(1, sizeof(Type)); t->kind = TY_STRUCT; snprintf(t->tag, sizeof(t->tag), "%s", name);
+    Tag *e = calloc(1, sizeof(Tag)); snprintf(e->name, sizeof(e->name), "%s", name);
+    e->type = t; e->next = tags; tags = e;
+    return t;
 }
 
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(void);
+
+// struct/union specifier:  (struct|union) [tag] [ { members } ]
+static Type *parse_struct_specifier(void) {
+    int is_union = eat(T_KUNION); if (!is_union) expect(T_KSTRUCT);
+    char tag[256] = {0};
+    if (at(T_ID)) { snprintf(tag, sizeof(tag), "%s", cur()->text); P++; }
+    Type *st;
+    if (tag[0]) st = tag_get(tag);
+    else { st = calloc(1, sizeof(Type)); st->kind = TY_STRUCT; }
+    if (eat(T_LBRACE)) {                           // definition
+        Member *head = NULL, *tail = NULL;
+        int off = 0, maxsz = 0;
+        while (!at(T_RBRACE) && !at(T_EOF)) {
+            Type *mbase = parse_type_base_only();
+            for (;;) {
+                Type *mt = mbase;
+                while (eat(T_STAR)) mt = ptr_to(mt);
+                char mnm[256]; snprintf(mnm, sizeof(mnm), "%s", cur()->text); expect(T_ID);
+                if (eat(T_LBRK)) {                 // array member
+                    long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
+                    Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = mt;
+                    arr->is_array = 1; arr->arr_len = (int)len; mt = arr;
+                }
+                int msz = ty_size(mt);
+                int align = msz < 8 ? (msz ? msz : 1) : 8;
+                Member *m = calloc(1, sizeof(Member));
+                snprintf(m->name, sizeof(m->name), "%s", mnm); m->type = mt;
+                if (is_union) { m->offset = 0; if (msz > maxsz) maxsz = msz; }
+                else { off = (off + align - 1) & ~(align - 1); m->offset = off; off += msz; }
+                if (!head) head = tail = m; else { tail->next = m; tail = m; }
+                if (!eat(T_COMMA)) break;
+            }
+            expect(T_SEMI);
+        }
+        expect(T_RBRACE);
+        st->members = head;
+        st->struct_size = is_union ? ((maxsz + 7) & ~7) : ((off + 7) & ~7);
+    }
+    return st;
+}
+
+// parse base type + pointer stars; returns Type*
+static Type *parse_type(void) {
+    Type *base = parse_type_base_only();
+    while (eat(T_STAR)) base = ptr_to(base);
+    return base;
+}
 
 static Node *parse_primary(void) {
     if (eat(T_LP)) {
@@ -497,6 +572,13 @@ static Node *parse_postfix(void) {
             Node *idx = parse_expr(); expect(T_RBRK);
             Node *add = new_node(N_BIN); add->op = T_PLUS; add->lhs = n; add->rhs = idx;
             Node *d = new_node(N_DEREF); d->lhs = add; n = d;
+        } else if (eat(T_DOT)) {               // a.field
+            Node *m = new_node(N_MEMBER); m->lhs = n;
+            snprintf(m->name, sizeof(m->name), "%s", cur()->text); expect(T_ID); n = m;
+        } else if (eat(T_ARROW)) {             // p->field  ==  (*p).field
+            Node *d = new_node(N_DEREF); d->lhs = n;
+            Node *m = new_node(N_MEMBER); m->lhs = d;
+            snprintf(m->name, sizeof(m->name), "%s", cur()->text); expect(T_ID); n = m;
         } else if (at(T_INC) || at(T_DEC)) {
             Node *p = new_node(N_POST); p->op = cur()->kind; p->lhs = n; P++; n = p;
         } else break;
@@ -505,6 +587,12 @@ static Node *parse_postfix(void) {
 }
 
 static Node *parse_unary(void) {
+    if (eat(T_KSIZEOF)) {
+        Node *n = new_node(N_SIZEOF);
+        if (at(T_LP) && is_type_start(toks[P+1].kind)) { P++; n->type = parse_type(); expect(T_RP); }
+        else n->lhs = parse_unary();
+        return n;
+    }
     if (eat(T_MINUS)) { Node *n = new_node(N_UNARY); n->op = T_MINUS; n->lhs = parse_unary(); return n; }
     if (eat(T_NOT))   { Node *n = new_node(N_UNARY); n->op = T_NOT;   n->lhs = parse_unary(); return n; }
     if (eat(T_STAR))  { Node *n = new_node(N_DEREF); n->lhs = parse_unary(); return n; }
@@ -580,6 +668,7 @@ static Node *parse_expr(void) { return parse_assign(); }
 static Node *parse_decl_stmt(void) {
     Type *base = parse_type_base_only();   // fwd-declared below
     Node *blk = new_node(N_BLOCK);
+    if (eat(T_SEMI)) return blk;           // bare  struct Foo { ... };  (type only)
     for (;;) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
@@ -597,8 +686,9 @@ static Node *parse_decl_stmt(void) {
     expect(T_SEMI);
     return blk;
 }
-// parse just the base type keyword (no stars) — stars belong to each declarator
+// parse just the base type (no trailing stars) — stars belong to each declarator
 static Type *parse_type_base_only(void) {
+    if (at(T_KSTRUCT) || at(T_KUNION)) return parse_struct_specifier();
     if      (eat(T_KINT))  return ty_int();
     if      (eat(T_KLONG)) return ty_long();
     if      (eat(T_KCHAR)) return ty_char();
@@ -676,6 +766,7 @@ static Func *funcs = NULL, *funcs_tail = NULL;
 
 static void parse_toplevel(void) {
     Type *base = parse_type_base_only();
+    if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
     Type *t = base;
     while (eat(T_STAR)) t = ptr_to(t);
     char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
@@ -735,7 +826,7 @@ static void collect_locals(Node *n) {
         case N_WHILE: case N_DOWHILE:
                       collect_locals(n->lhs); collect_locals(n->cond); break;
         case N_FOR:   collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs); collect_locals(n->lhs); break;
-        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR: case N_CAST: case N_POST: case N_PRE:
+        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR: case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
                       collect_locals(n->lhs); break;
         case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
                       collect_locals(n->lhs); collect_locals(n->rhs); break;
@@ -780,7 +871,29 @@ static Type *gen_addr(Node *n) {
         Type *t = gen_expr(n->lhs);
         return is_ptrish(t) ? t->ptr : ty_long();
     }
+    if (n->kind == N_MEMBER) {                      // &(s.field)
+        Type *st = gen_addr(n->lhs);               // rax = &struct
+        Member *m = find_member(st, n->name);
+        if (!m) die("no such struct member");
+        if (m->offset) emit("    add rax, %d", m->offset);
+        return m->type;
+    }
     die("not an lvalue"); return 0;
+}
+
+// best-effort static type inference (used only by sizeof(expr))
+static Type *static_typeof(Node *n) {
+    switch (n->kind) {
+        case N_NUM:    return n->type ? n->type : ty_long();
+        case N_STR:    return ptr_to(ty_char());
+        case N_CAST:   return n->type;
+        case N_VAR:  { Sym *s = lookup(n->name); return s ? s->type : ty_long(); }
+        case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
+                         return m ? m->type : ty_long(); }
+        case N_DEREF: { Type *t = static_typeof(n->lhs); return is_ptrish(t) ? t->ptr : ty_long(); }
+        case N_ADDR:   return ptr_to(static_typeof(n->lhs));
+        default:       return ty_long();
+    }
 }
 
 static void gen_string(Node *n) {
@@ -808,9 +921,21 @@ static Type *gen_expr(Node *n) {
     case N_VAR: {
         Sym *s = lookup(n->name);
         if (!s) die("undeclared identifier");
-        if (s->type->is_array) { gen_addr(n); return s->type; }   // array decays to address
+        // arrays and structs are used by-address (decay); scalars are loaded
+        if (s->type->is_array || s->type->kind == TY_STRUCT) { gen_addr(n); return s->type; }
         gen_addr(n); load_rax(ty_size(s->type));
         return s->type;
+    }
+    case N_MEMBER: {
+        Type *mt = gen_addr(n);                    // rax = &member
+        if (mt->is_array || mt->kind == TY_STRUCT) return mt;   // decay
+        load_rax(ty_size(mt));
+        return mt;
+    }
+    case N_SIZEOF: {
+        Type *t = n->type ? n->type : static_typeof(n->lhs);
+        emit("    mov rax, %d", ty_size(t));
+        return ty_long();
     }
     case N_CAST: gen_expr(n->lhs); return n->type;
     case N_DEREF: {
