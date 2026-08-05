@@ -13,7 +13,7 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test clean
+.PHONY: all run test demo clean
 
 all: $(BIN)
 
@@ -34,5 +34,13 @@ test: $(BIN)
 	@echo "---- ./test_prog output ----"
 	@./test_prog
 
+# Control-flow / operator feature demo (for, do/while, break, continue,
+# prefix ++/--, ternary).
+demo: $(BIN)
+	./$(BIN) features.c features.s
+	$(CC) -nostdlib -no-pie features.s -o features_prog
+	@echo "---- ./features_prog output ----"
+	@./features_prog
+
 clean:
-	rm -f $(BIN) sample.s sample_prog test.s test_prog
+	rm -f $(BIN) sample.s sample_prog test.s test_prog features.s features_prog

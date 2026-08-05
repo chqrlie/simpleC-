@@ -224,9 +224,10 @@ enum {
     T_INC, T_DEC,
     T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
-    T_SEMI, T_COMMA,
+    T_SEMI, T_COMMA, T_QUESTION, T_COLON,
     T_KINT, T_KLONG, T_KCHAR, T_KVOID,
     T_KIF, T_KELSE, T_KWHILE, T_KRETURN, T_KASM,
+    T_KFOR, T_KDO, T_KBREAK, T_KCONTINUE,
     T_EOF
 };
 
@@ -294,6 +295,10 @@ static void lex(void) {
             else if (!strcmp(buf, "else"))     k = T_KELSE;
             else if (!strcmp(buf, "while"))    k = T_KWHILE;
             else if (!strcmp(buf, "return"))   k = T_KRETURN;
+            else if (!strcmp(buf, "for"))      k = T_KFOR;
+            else if (!strcmp(buf, "do"))       k = T_KDO;
+            else if (!strcmp(buf, "break"))    k = T_KBREAK;
+            else if (!strcmp(buf, "continue")) k = T_KCONTINUE;
             else if (!strcmp(buf, "__asm__") || !strcmp(buf, "asm")) k = T_KASM;
             else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
                      !strcmp(buf, "signed") || !strcmp(buf, "static") ||
@@ -348,6 +353,7 @@ static void lex(void) {
             case '[': add_tok(T_LBRK);   break;  case ']': add_tok(T_RBRK);   break;
             case '{': add_tok(T_LBRACE); break;  case '}': add_tok(T_RBRACE); break;
             case ';': add_tok(T_SEMI);   break;  case ',': add_tok(T_COMMA);  break;
+            case '?': add_tok(T_QUESTION);break; case ':': add_tok(T_COLON);  break;
             case '|': continue;                  // stray '|' — ignore
             default:  die("unknown character in source");
         }
@@ -388,7 +394,8 @@ static int is_ptrish(Type *t) { return t->is_array || t->kind == TY_PTR; }
 enum {
     N_NUM, N_STR, N_VAR, N_CALL, N_ASSIGN, N_BIN, N_UNARY,
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
-    N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY
+    N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
+    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE
 };
 
 typedef struct Node Node;
@@ -502,6 +509,9 @@ static Node *parse_unary(void) {
     if (eat(T_NOT))   { Node *n = new_node(N_UNARY); n->op = T_NOT;   n->lhs = parse_unary(); return n; }
     if (eat(T_STAR))  { Node *n = new_node(N_DEREF); n->lhs = parse_unary(); return n; }
     if (eat(T_AMP))   { Node *n = new_node(N_ADDR);  n->lhs = parse_unary(); return n; }
+    if (at(T_INC) || at(T_DEC)) {            // prefix ++x / --x
+        Node *n = new_node(N_PRE); n->op = cur()->kind; P++; n->lhs = parse_unary(); return n;
+    }
     return parse_postfix();
 }
 
@@ -538,8 +548,17 @@ static Node *parse_lor(void) {
     while (eat(T_OROR)) { Node *a = new_node(N_LOGOR); a->lhs = n; a->rhs = parse_land(); n = a; }
     return n;
 }
-static Node *parse_assign(void) {
+static Node *parse_ternary(void) {
     Node *n = parse_lor();
+    if (eat(T_QUESTION)) {
+        Node *t = new_node(N_TERNARY);
+        t->cond = n; t->lhs = parse_expr(); expect(T_COLON); t->rhs = parse_ternary();
+        return t;
+    }
+    return n;
+}
+static Node *parse_assign(void) {
+    Node *n = parse_ternary();
     if (eat(T_ASSIGN)) {
         Node *a = new_node(N_ASSIGN); a->lhs = n; a->rhs = parse_assign(); return a;
     }
@@ -611,6 +630,27 @@ static Node *parse_stmt(void) {
         n->lhs = parse_stmt();
         return n;
     }
+    if (eat(T_KFOR)) {
+        Node *n = new_node(N_FOR);
+        expect(T_LP);
+        if (is_type_start(cur()->kind)) n->init = parse_decl_stmt();      // consumes ';'
+        else if (!at(T_SEMI)) { Node *e = new_node(N_EXPR); e->lhs = parse_expr(); n->init = e; expect(T_SEMI); }
+        else expect(T_SEMI);
+        if (!at(T_SEMI)) n->cond = parse_expr();
+        expect(T_SEMI);
+        if (!at(T_RP)) n->rhs = parse_expr();                             // step
+        expect(T_RP);
+        n->lhs = parse_stmt();                                            // body
+        return n;
+    }
+    if (eat(T_KDO)) {
+        Node *n = new_node(N_DOWHILE);
+        n->lhs = parse_stmt();
+        expect(T_KWHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP); expect(T_SEMI);
+        return n;
+    }
+    if (eat(T_KBREAK))    { expect(T_SEMI); return new_node(N_BREAK); }
+    if (eat(T_KCONTINUE)) { expect(T_SEMI); return new_node(N_CONTINUE); }
     if (eat(T_KRETURN)) {
         Node *n = new_node(N_RETURN);
         if (!at(T_SEMI)) n->lhs = parse_expr();
@@ -690,9 +730,12 @@ static void collect_locals(Node *n) {
             if (!sym_find(locals, n->name)) add_local(n->name, n->type);
             if (n->init) collect_locals(n->init);
             break;
-        case N_IF:    collect_locals(n->lhs); collect_locals(n->els); collect_locals(n->cond); break;
-        case N_WHILE: collect_locals(n->lhs); collect_locals(n->cond); break;
-        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR: case N_CAST: case N_POST:
+        case N_IF: case N_TERNARY:
+                      collect_locals(n->cond); collect_locals(n->lhs); collect_locals(n->rhs); collect_locals(n->els); break;
+        case N_WHILE: case N_DOWHILE:
+                      collect_locals(n->lhs); collect_locals(n->cond); break;
+        case N_FOR:   collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs); collect_locals(n->lhs); break;
+        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR: case N_CAST: case N_POST: case N_PRE:
                       collect_locals(n->lhs); break;
         case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
                       collect_locals(n->lhs); collect_locals(n->rhs); break;
@@ -802,6 +845,27 @@ static Type *gen_expr(Node *n) {
         emit("    add rsp, 8");
         return lt;                                 // rax still = old value
     }
+    case N_PRE: {                                  // ++x / --x  (returns new value)
+        Type *lt = gen_addr(n->lhs);
+        int step = is_ptrish(lt) ? elem_size(lt) : 1;
+        int sz = ty_size(lt);
+        emit("    push rax");                      // save &x
+        load_rax(sz);                              // rax = old
+        if (n->op == T_INC) emit("    add rax, %d", step);
+        else                emit("    sub rax, %d", step);
+        emit("    mov rcx, [rsp]");                // rcx = &x
+        store_rcx_rax(sz);                         // *&x = new (rax)
+        emit("    add rsp, 8");
+        return lt;                                 // rax = new value
+    }
+    case N_TERNARY: {
+        int els = label_id++, end = label_id++;
+        gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", els);
+        gen_expr(n->lhs);  emit("    jmp .L%d", end);
+        emit(".L%d:", els); gen_expr(n->rhs);
+        emit(".L%d:", end);
+        return ty_long();
+    }
     case N_UNARY:
         gen_expr(n->lhs);
         if (n->op == T_MINUS) emit("    neg rax");
@@ -880,6 +944,11 @@ static void gen_asm(Node *n) {
     }
 }
 
+// break/continue target stack
+static int brk_lbl[64], cont_lbl[64], loop_sp = 0;
+static void loop_push(int b, int c) { brk_lbl[loop_sp] = b; cont_lbl[loop_sp] = c; loop_sp++; }
+static void loop_pop(void) { loop_sp--; }
+
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (int i = 0; i < n->nbody; i++) gen_stmt(n->body[i]); break;
@@ -911,11 +980,40 @@ static void gen_stmt(Node *n) {
         int top = label_id++, end = label_id++;
         emit(".L%d:", top);
         gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", end);
-        gen_stmt(n->lhs);
+        loop_push(end, top); gen_stmt(n->lhs); loop_pop();
         emit("    jmp .L%d", top);
         emit(".L%d:", end);
         break;
     }
+    case N_DOWHILE: {
+        int top = label_id++, cont = label_id++, end = label_id++;
+        emit(".L%d:", top);
+        loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
+        emit(".L%d:", cont);
+        gen_expr(n->cond); emit("    test rax, rax"); emit("    jnz .L%d", top);
+        emit(".L%d:", end);
+        break;
+    }
+    case N_FOR: {
+        int top = label_id++, cont = label_id++, end = label_id++;
+        if (n->init) gen_stmt(n->init);
+        emit(".L%d:", top);
+        if (n->cond) { gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", end); }
+        loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
+        emit(".L%d:", cont);
+        if (n->rhs) gen_expr(n->rhs);                 // step
+        emit("    jmp .L%d", top);
+        emit(".L%d:", end);
+        break;
+    }
+    case N_BREAK:
+        if (loop_sp == 0) die("break outside loop");
+        emit("    jmp .L%d", brk_lbl[loop_sp-1]);
+        break;
+    case N_CONTINUE:
+        if (loop_sp == 0) die("continue outside loop");
+        emit("    jmp .L%d", cont_lbl[loop_sp-1]);
+        break;
     case N_ASM: gen_asm(n); break;
     default: gen_expr(n); break;                    // expression used as statement
     }
