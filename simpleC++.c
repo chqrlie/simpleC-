@@ -1288,33 +1288,51 @@ static void gen_func(Func *fn) {
 // 8. MAIN
 // =====================================================================
 int main(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "Usage: %s <input.c> <output.s>\n", argv[0]); return 1; }
+    // Optional flags may precede the file names.  --kernel suppresses the
+    // Linux _start/exit stub so a bare-metal boot stub can provide the entry
+    // point and simply call main() (no Linux syscalls exist in a kernel).
+    int kernel_mode = 0;
+    const char *inpath = NULL, *outpath = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
+        else if (!inpath)  inpath  = argv[i];
+        else if (!outpath) outpath = argv[i];
+    }
+    if (!inpath || !outpath) {
+        fprintf(stderr, "Usage: %s [--kernel] <input.c> <output.s>\n", argv[0]);
+        return 1;
+    }
 
-    preprocess(argv[1]);
+    preprocess(inpath);
     SRC[SRC_LEN] = 0;
     lex();
 
     while (!at(T_EOF)) parse_toplevel();
 
-    fout = fopen(argv[2], "w");
+    fout = fopen(outpath, "w");
     if (!fout) { perror("fopen"); return 1; }
 
     emit(".intel_syntax noprefix");
     emit("    .section .text");
-    emit("    .globl _start");
     emit("    .globl main");
 
-    // freestanding entry point: run main, then exit(rax)
-    emit("_start:");
-    emit("    call main");
-    emit("    mov rdi, rax");
-    emit("    mov rax, 60");
-    emit("    syscall");
+    if (!kernel_mode) {
+        // hosted freestanding entry point: run main, then exit(rax)
+        emit("    .globl _start");
+        emit("_start:");
+        emit("    call main");
+        emit("    mov rdi, rax");
+        emit("    mov rax, 60");
+        emit("    syscall");
+    }
 
     for (Func *f = funcs; f; f = f->next) gen_func(f);
 
-    // globals -> .bss
-    emit("    .section .bss");
+    // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
+    // mode uses .data so the zero bytes are emitted into the object and survive
+    // an objcopy to a flat binary — the bare-metal image needs no separate
+    // .bss zero-fill step.
+    emit(kernel_mode ? "    .section .data" : "    .section .bss");
     emit("    .align 8");
     for (Sym *g = globals; g; g = g->next) {
         int sz = ty_size(g->type); if (sz < 1) sz = 8;
@@ -1322,6 +1340,6 @@ int main(int argc, char **argv) {
     }
 
     fclose(fout);
-    printf("Compiled %s -> %s\n", argv[1], argv[2]);
+    printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     return 0;
 }
