@@ -89,6 +89,52 @@ int strcmp(char *a, char *b) {
     return *a - *b;
 }
 
+// ---------- stdarg + printf (variadic functions) ----------
+#define va_list         long
+#define va_start(ap, l) __builtin_va_start(ap)
+#define va_arg(ap, t)   __builtin_va_arg(ap)
+#define va_end(ap)      __builtin_va_end(ap)
+
+void _put_uint(long n, int base) {
+    char buf[32]; int i; char *digits;
+    digits = "0123456789abcdef";
+    if (n == 0) { putc('0'); return; }
+    i = 0;
+    while (n > 0) { buf[i] = digits[n % base]; i = i + 1; n = n / base; }
+    while (i > 0) { i = i - 1; putc(buf[i]); }
+}
+
+// printf straight to the VGA screen (and serial mirror).  %d %x %c %s %%.
+void printf(char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    while (*fmt) {
+        if (*fmt == '%') {
+            fmt = fmt + 1;
+            if (*fmt == 'd') {
+                long v; v = va_arg(ap, int);
+                if (v < 0) { putc('-'); v = -v; }
+                _put_uint(v, 10);
+            } else if (*fmt == 'x') {
+                _put_uint(va_arg(ap, int), 16);
+            } else if (*fmt == 's') {
+                char *s; s = (char *)va_arg(ap, char *);
+                puts(s);
+            } else if (*fmt == 'c') {
+                putc(va_arg(ap, int));
+            } else if (*fmt == '%') {
+                putc('%');
+            } else {
+                putc('%'); putc(*fmt);
+            }
+        } else {
+            putc(*fmt);
+        }
+        fmt = fmt + 1;
+    }
+    va_end(ap);
+}
+
 // ---------- PS/2 keyboard ----------
 // US-QWERTY scancode set 1 -> ASCII, built once into a .bss table.
 char g_keymap[128];

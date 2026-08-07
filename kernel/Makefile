@@ -42,27 +42,32 @@ kernel.elf: boot32.s blob.s kernel64.bin final.ld
 run: kernel.elf
 	$(QEMU) $(QFLAGS)
 
-# Headless self-test: type "help" then "bits" via emulated keystrokes and
-# confirm the shell responded on the serial port.
+# Headless self-test: type "help", "bits" and "echo hi" via emulated
+# keystrokes and confirm the shell (and its printf) responded on serial.
 test: kernel.elf
 	@rm -f serial.log
-	@( sleep 2; for k in h e l p ret; do echo "sendkey $$k"; sleep 0.25; done; \
-	   sleep 0.5; for k in b i t s ret; do echo "sendkey $$k"; sleep 0.25; done; \
+	@( sleep 2; for k in h e l p ret; do echo "sendkey $$k"; sleep 0.22; done; \
+	   sleep 0.3; for k in b i t s ret; do echo "sendkey $$k"; sleep 0.22; done; \
+	   sleep 0.3; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.22; done; \
 	   sleep 0.6; echo quit ) | \
-	 timeout 20 $(QEMU) $(QFLAGS) -display none -serial file:serial.log -monitor stdio >/dev/null 2>&1; \
+	 timeout 25 $(QEMU) $(QFLAGS) -display none -serial file:serial.log -monitor stdio >/dev/null 2>&1; \
 	 echo "---- serial output ----"; cat serial.log; echo "-----------------------"; \
-	 grep -q "Commands: help, clear, bits" serial.log && grep -q "0x0F & 0x05 = 5" serial.log \
-	   && echo "PASS: keyboard + shell + bitwise all working" \
+	 tr -d '\r' < serial.log > serial.clean; \
+	 grep -q "Commands: help, clear, bits" serial.clean && grep -q "0xf & 0x5 = 5" serial.clean \
+	   && grep -qx "hi" serial.clean \
+	   && echo "PASS: keyboard + shell + bitwise + printf all working" \
 	   || { echo "FAIL"; exit 1; }
 
 # Boot, type into it, and save a VGA screenshot to vga.png.
 shot: kernel.elf
 	@rm -f vga.ppm vga.png
-	@( sleep 2; for k in h e l p ret; do echo "sendkey $$k"; sleep 0.25; done; \
-	   sleep 0.4; for k in b i t s ret; do echo "sendkey $$k"; sleep 0.25; done; \
+	@( sleep 2; for k in h e l p ret; do echo "sendkey $$k"; sleep 0.22; done; \
+	   sleep 0.3; for k in v e r ret; do echo "sendkey $$k"; sleep 0.22; done; \
+	   sleep 0.3; for k in b i t s ret; do echo "sendkey $$k"; sleep 0.22; done; \
+	   sleep 0.3; for k in e c h o spc h i ret; do echo "sendkey $$k"; sleep 0.22; done; \
 	   sleep 0.5; echo "screendump vga.ppm"; sleep 0.8; echo quit ) | \
-	 timeout 20 $(QEMU) $(QFLAGS) -display none -serial file:serial.log -monitor stdio >/dev/null 2>&1
+	 timeout 25 $(QEMU) $(QFLAGS) -display none -serial file:serial.log -monitor stdio >/dev/null 2>&1
 	@convert vga.ppm vga.png && echo "wrote vga.png"
 
 clean:
-	rm -f *.o shell.s kernel64.elf kernel64.bin kernel.elf serial.log vga.ppm vga.png
+	rm -f *.o shell.s kernel64.elf kernel64.bin kernel.elf serial.log serial.clean vga.ppm vga.png

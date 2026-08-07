@@ -311,7 +311,7 @@ enum {
     T_INC, T_DEC,
     T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
-    T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW,
+    T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW, T_ELLIPSIS,
     T_KINT, T_KLONG, T_KCHAR, T_KVOID,
     T_KIF, T_KELSE, T_KWHILE, T_KRETURN, T_KASM,
     T_KFOR, T_KDO, T_KBREAK, T_KCONTINUE,
@@ -426,6 +426,9 @@ static void lex(void) {
         }
 
         char c2 = (sp + 1 < SRC_LEN) ? SRC[sp+1] : 0;
+        if (c == '.' && c2 == '.' && sp + 2 < SRC_LEN && SRC[sp+2] == '.') {
+            sp += 3; add_tok(T_ELLIPSIS); continue;      // '...' varargs marker
+        }
         #define TWO(a,b,K)  if (c==a && c2==b) { sp += 2; add_tok(K); goto next; }
         TWO('=','=',T_EQ) TWO('!','=',T_NE) TWO('<','=',T_LE) TWO('>','=',T_GE)
         TWO('&','&',T_ANDAND) TWO('|','|',T_OROR)
@@ -872,7 +875,8 @@ static Node *parse_stmt(void) {
 }
 
 // ---- top level ----
-typedef struct Func { char name[256]; Node *params[8]; int nparams; Type *ptype[8]; Node *body; struct Func *next; } Func;
+typedef struct Func { char name[256]; Node *params[8]; int nparams; Type *ptype[8];
+                      int is_variadic; Node *body; struct Func *next; } Func;
 static Func *funcs = NULL, *funcs_tail = NULL;
 
 static void parse_toplevel(void) {
@@ -885,6 +889,7 @@ static void parse_toplevel(void) {
     if (eat(T_LP)) {                                   // function definition
         Func *fn = calloc(1, sizeof(Func)); snprintf(fn->name, sizeof(fn->name), "%s", nm);
         while (!at(T_RP)) {
+            if (eat(T_ELLIPSIS)) { fn->is_variadic = 1; break; }   // printf(char *fmt, ...)
             Type *pt = parse_type_base_only();
             while (eat(T_STAR)) pt = ptr_to(pt);
             if (pt->kind == TY_VOID && !at(T_ID)) break;   // (void)
@@ -952,6 +957,9 @@ static void collect_locals(Node *n) {
 // =====================================================================
 static int label_id = 0;
 static const char *ARGREG[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+
+// current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
+static int cur_va_off = 0, cur_named = 0;
 
 static Type *gen_expr(Node *n);       // fwd
 static void  gen_stmt(Node *n);
@@ -1126,6 +1134,26 @@ static Type *gen_expr(Node *n) {
         return ty_long();
     }
     case N_CALL: {
+        // ---- variadic built-ins (handled inline, not real calls) ----
+        if (!strcmp(n->name, "__builtin_va_start")) {
+            gen_addr(n->args[0]);                  // rax = &ap
+            emit("    mov rcx, rax");
+            emit("    lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
+            emit("    mov [rcx], rax");            // ap = first vararg slot
+            return ty_long();
+        }
+        if (!strcmp(n->name, "__builtin_va_arg")) {
+            gen_addr(n->args[0]);                  // rax = &ap
+            emit("    mov rcx, rax");              // rcx = &ap
+            emit("    mov rax, [rcx]");            // rax = ap
+            emit("    mov rdx, [rax]");            // rdx = *ap  (the argument value)
+            emit("    add rax, 8");
+            emit("    mov [rcx], rax");            // ap += 8
+            emit("    mov rax, rdx");
+            return ty_long();
+        }
+        if (!strcmp(n->name, "__builtin_va_end")) return ty_long();   // no-op
+
         for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("    push rax"); }
         for (int i = n->nargs - 1; i >= 0; i--) emit("    pop %s", ARGREG[i]);
         emit("    xor eax, eax");                  // variadic-safe; harmless otherwise
@@ -1267,6 +1295,10 @@ static void gen_func(Func *fn) {
     // params first (so they get the lowest offsets, in declared order)
     for (int i = 0; i < fn->nparams; i++) add_local(fn->params[i]->name, fn->ptype[i]);
     collect_locals(fn->body);
+    // reserve a 48-byte register save area for variadic functions
+    int va_off = 0;
+    if (fn->is_variadic) { frame_size += 48; va_off = frame_size; }
+    cur_va_off = va_off; cur_named = fn->nparams;
     int fs = (frame_size + 15) & ~15;
 
     emit("%s:", fn->name);
@@ -1279,6 +1311,11 @@ static void gen_func(Func *fn) {
         if (sz == 1) emit("    mov [rbp - %d], %s", s->offset,
                           i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
         else emit("    mov [rbp - %d], %s", s->offset, ARGREG[i]);
+    }
+    if (fn->is_variadic) {
+        // spill all six integer arg registers so va_arg can walk them
+        const char *r[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+        for (int i = 0; i < 6; i++) emit("    mov [rbp - %d], %s", va_off - i * 8, r[i]);
     }
     gen_stmt(fn->body);
     emit("    leave"); emit("    ret");             // safety epilogue

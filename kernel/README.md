@@ -6,8 +6,9 @@ two things end to end:
 
 1. `keyboard_getchar()` is a **real hardware read** — it polls the i8042 PS/2
    controller (status port `0x64`, data port `0x60`) for scancodes.
-2. The **bitwise operators** added to the compiler generate correct machine
-   code that runs correctly with no OS underneath it.
+2. The **bitwise operators** and **variadic functions** added to the compiler
+   generate correct machine code with no OS underneath it — the shell's output
+   goes through a `printf()` that is itself compiled by `nano_cc`.
 
 ![screenshot](vga.png)
 
@@ -69,8 +70,10 @@ full language subset — is identical.
 
 - `help`  — list commands
 - `clear` — clear the VGA screen
-- `bits`  — run a few bitwise operations and print the results (proves the
-  new `& | ^ << >>` codegen works at runtime)
+- `ver`   — print a version line (via `printf`)
+- `bits`  — run a few bitwise operations and print the results with `printf`
+  (proves the `& | ^ << >>` codegen works at runtime)
+- `echo <text>` — print the rest of the line back
 
 Note: `ld` may print `LOAD segment with RWX permissions` — that is a normal,
 harmless note for a flat kernel image.
