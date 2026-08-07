@@ -44,7 +44,13 @@ static void emit(const char *fmt, ...) {
 static char SRC[MAX_SRC];
 static int  SRC_LEN = 0;
 
-typedef struct { char name[64]; char value[512]; } Macro;
+// A macro is either object-like (#define PI 3) or function-like
+// (#define MAX(a,b) ((a)>(b)?(a):(b))).  For function-like macros we keep
+// the parameter names so expand_line() can substitute call arguments.
+typedef struct {
+    char name[64]; char value[512];
+    int  is_func; char params[8][64]; int nparams;
+} Macro;
 #define MAX_MACROS 1024
 static Macro macros[MAX_MACROS];
 static int   macro_cnt = 0;
@@ -54,10 +60,13 @@ static Macro *macro_find(const char *name) {
         if (!strcmp(macros[i].name, name)) return &macros[i];
     return NULL;
 }
-static void macro_define(const char *name, const char *value) {
+// Find-or-create a macro slot, reset to a clean object-like state.
+static Macro *macro_intern(const char *name) {
     Macro *m = macro_find(name);
-    if (!m) { m = &macros[macro_cnt++]; snprintf(m->name, sizeof(m->name), "%s", name); }
-    snprintf(m->value, sizeof(m->value), "%s", value);
+    if (!m) { m = &macros[macro_cnt++]; }
+    snprintf(m->name, sizeof(m->name), "%s", name);
+    m->value[0] = 0; m->is_func = 0; m->nparams = 0;
+    return m;
 }
 static void src_putc(char c) {
     if (SRC_LEN >= MAX_SRC - 1) die("source too large");
@@ -65,34 +74,94 @@ static void src_putc(char c) {
 }
 static void src_puts(const char *s) { while (*s) src_putc(*s++); }
 
-// Expand object-like macros inside a single logical line of code.
+// Substitute a function-like macro body: copy m->value into out[], replacing
+// each parameter name with the matching call argument text.  argv[k] holds the
+// (already whitespace-trimmed) text of the k-th argument.
+static int subst_macro_body(const Macro *m, char argv[8][512], int argc,
+                            char *out, int j, int cap) {
+    #define PUT(ch) do { if (j < cap - 1) out[j++] = (ch); } while (0)
+    for (int vi = 0; m->value[vi]; ) {
+        char vc = m->value[vi];
+        if (isalpha((unsigned char)vc) || vc == '_') {
+            char w[64]; int k = 0;
+            while (m->value[vi] && (isalnum((unsigned char)m->value[vi]) || m->value[vi] == '_') && k < 63)
+                w[k++] = m->value[vi++];
+            w[k] = 0;
+            int pi = -1;
+            for (int a = 0; a < m->nparams; a++) if (!strcmp(w, m->params[a])) { pi = a; break; }
+            if (pi >= 0 && pi < argc) { for (const char *s = argv[pi]; *s; s++) PUT(*s); }
+            else                      { for (int t = 0; w[t]; t++) PUT(w[t]); }
+        } else {
+            PUT(vc); vi++;
+        }
+    }
+    #undef PUT
+    return j;
+}
+
+// Expand object-like and simple function-like macros in one logical line.
 static void expand_line(const char *in) {
     char work[8192];
     snprintf(work, sizeof(work), "%s", in);
     for (int pass = 0; pass < 8; pass++) {
         char out[8192]; int j = 0, changed = 0;
+        #define OPUT(ch) do { if (j < (int)sizeof(out) - 1) out[j++] = (ch); } while (0)
         for (int i = 0; work[i]; ) {
             char c = work[i];
             if (c == '"' || c == '\'') {          // copy string/char literal verbatim
-                char q = c; out[j++] = work[i++];
+                char q = c; OPUT(work[i++]);
                 while (work[i] && work[i] != q) {
-                    if (work[i] == '\\' && work[i+1]) out[j++] = work[i++];
-                    out[j++] = work[i++];
+                    if (work[i] == '\\' && work[i+1]) OPUT(work[i++]);
+                    OPUT(work[i++]);
                 }
-                if (work[i]) out[j++] = work[i++];
+                if (work[i]) OPUT(work[i++]);
             } else if (isalpha((unsigned char)c) || c == '_') {
                 char word[64]; int k = 0;
                 while (work[i] && (isalnum((unsigned char)work[i]) || work[i] == '_') && k < 63)
                     word[k++] = work[i++];
                 word[k] = 0;
                 Macro *m = macro_find(word);
-                if (m) { for (const char *p = m->value; *p; p++) out[j++] = *p; changed = 1; }
-                else   { for (int t = 0; word[t]; t++) out[j++] = word[t]; }
+                if (m && m->is_func) {
+                    int t = i; while (work[t] == ' ' || work[t] == '\t') t++;
+                    if (work[t] == '(') {          // it's a macro invocation
+                        t++;                       // past '('
+                        char argv[8][512]; int argc = 0, ci = 0; argv[0][0] = 0;
+                        int depth = 1;
+                        while (work[t] && depth > 0) {
+                            char cc = work[t];
+                            if (cc == '(') { depth++; if (argc < 8 && ci < 511) argv[argc][ci++] = cc; t++; }
+                            else if (cc == ')') { depth--; if (depth > 0) { if (argc < 8 && ci < 511) argv[argc][ci++] = cc; } t++; }
+                            else if (cc == ',' && depth == 1) { if (argc < 8) { argv[argc][ci] = 0; argc++; } ci = 0; if (argc < 8) argv[argc][0] = 0; t++; }
+                            else { if (argc < 8 && ci < 511) argv[argc][ci++] = cc; t++; }
+                        }
+                        if (argc < 8) { argv[argc][ci] = 0; argc++; }
+                        // trim leading/trailing whitespace on each argument
+                        for (int a = 0; a < argc; a++) {
+                            char *s = argv[a]; int st = 0, en = (int)strlen(s);
+                            while (s[st] == ' ' || s[st] == '\t') st++;
+                            while (en > st && (s[en-1] == ' ' || s[en-1] == '\t')) en--;
+                            memmove(s, s + st, en - st); s[en - st] = 0;
+                        }
+                        // empty call MACRO()  ->  zero arguments
+                        if (argc == 1 && argv[0][0] == 0 && m->nparams == 0) argc = 0;
+                        j = subst_macro_body(m, argv, argc, out, j, (int)sizeof(out));
+                        i = t;                     // consume through ')'
+                        changed = 1;
+                    } else {                       // name not followed by '(' -> literal
+                        for (int q = 0; word[q]; q++) OPUT(word[q]);
+                    }
+                } else if (m) {                    // object-like macro
+                    for (const char *p = m->value; *p; p++) OPUT(*p);
+                    changed = 1;
+                } else {
+                    for (int t = 0; word[t]; t++) OPUT(word[t]);
+                }
             } else {
-                out[j++] = work[i++];
+                OPUT(work[i++]);
             }
             if (j >= (int)sizeof(out) - 2) break;
         }
+        #undef OPUT
         out[j] = 0;
         memcpy(work, out, j + 1);
         if (!changed) break;
@@ -173,12 +242,28 @@ static void process_text(const char *text) {
                     char nm[64]; int k = 0;
                     while (*p && (isalnum((unsigned char)*p) || *p == '_') && k < 63) nm[k++] = *p++;
                     nm[k] = 0;
+                    Macro *m = macro_intern(nm);
+                    // function-like macro: '(' immediately after name (no space)
+                    if (*p == '(') {
+                        m->is_func = 1; p++;
+                        while (*p && *p != ')') {
+                            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+                            int ai = 0;
+                            while (isalnum((unsigned char)*p) || *p == '_') {
+                                if (ai < 63 && m->nparams < 8) m->params[m->nparams][ai++] = *p;
+                                p++;
+                            }
+                            if (ai > 0) { if (m->nparams < 8) { m->params[m->nparams][ai] = 0; m->nparams++; } }
+                            else if (*p && *p != ')' && *p != ' ' && *p != '\t' && *p != ',') p++; // progress guard
+                        }
+                        if (*p == ')') p++;
+                    }
                     while (*p == ' ' || *p == '\t') p++;
                     char val[512]; int v = 0;
                     while (*p && v < 511) val[v++] = *p++;
                     while (v > 0 && (val[v-1] == ' ' || val[v-1] == '\t' || val[v-1] == '\r')) v--;
                     val[v] = 0;
-                    macro_define(nm, val);
+                    snprintf(m->value, sizeof(m->value), "%s", val);
                 }
             } else if (!strcmp(dir, "undef")) {
                 // leave defined (rare); no-op is safe for our inputs
@@ -222,6 +307,7 @@ enum {
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
     T_ASSIGN, T_EQ, T_NE, T_LT, T_GT, T_LE, T_GE,
     T_ANDAND, T_OROR, T_NOT, T_AMP,
+    T_BITOR, T_BITXOR, T_BITNOT, T_SHL, T_SHR,
     T_INC, T_DEC,
     T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
@@ -308,7 +394,7 @@ static void lex(void) {
             else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
                      !strcmp(buf, "signed") || !strcmp(buf, "static") ||
                      !strcmp(buf, "inline") || !strcmp(buf, "register") ||
-                     !strcmp(buf, "volatile")) continue;   // qualifier: drop
+                     !strcmp(buf, "volatile") || !strcmp(buf, "extern")) continue;   // qualifier: drop
             if (k == T_ID) snprintf(toks[ntok].text, sizeof(toks[ntok].text), "%s", buf);
             add_tok(k); continue;
         }
@@ -343,6 +429,7 @@ static void lex(void) {
         #define TWO(a,b,K)  if (c==a && c2==b) { sp += 2; add_tok(K); goto next; }
         TWO('=','=',T_EQ) TWO('!','=',T_NE) TWO('<','=',T_LE) TWO('>','=',T_GE)
         TWO('&','&',T_ANDAND) TWO('|','|',T_OROR)
+        TWO('<','<',T_SHL) TWO('>','>',T_SHR)
         TWO('+','+',T_INC) TWO('-','-',T_DEC) TWO('-','>',T_ARROW)
         TWO('+','=',T_PLUSEQ) TWO('-','=',T_MINUSEQ) TWO('*','=',T_STAREQ)
         TWO('/','=',T_SLASHEQ) TWO('%','=',T_PERCENTEQ)
@@ -360,7 +447,8 @@ static void lex(void) {
             case ';': add_tok(T_SEMI);   break;  case ',': add_tok(T_COMMA);  break;
             case '?': add_tok(T_QUESTION);break; case ':': add_tok(T_COLON);  break;
             case '.': add_tok(T_DOT);    break;
-            case '|': continue;                  // stray '|' — ignore
+            case '|': add_tok(T_BITOR);  break;  case '^': add_tok(T_BITXOR); break;
+            case '~': add_tok(T_BITNOT); break;
             default:  die("unknown character in source");
         }
         next: ;
@@ -593,8 +681,9 @@ static Node *parse_unary(void) {
         else n->lhs = parse_unary();
         return n;
     }
-    if (eat(T_MINUS)) { Node *n = new_node(N_UNARY); n->op = T_MINUS; n->lhs = parse_unary(); return n; }
-    if (eat(T_NOT))   { Node *n = new_node(N_UNARY); n->op = T_NOT;   n->lhs = parse_unary(); return n; }
+    if (eat(T_MINUS)) { Node *n = new_node(N_UNARY); n->op = T_MINUS;  n->lhs = parse_unary(); return n; }
+    if (eat(T_NOT))   { Node *n = new_node(N_UNARY); n->op = T_NOT;    n->lhs = parse_unary(); return n; }
+    if (eat(T_BITNOT)){ Node *n = new_node(N_UNARY); n->op = T_BITNOT; n->lhs = parse_unary(); return n; }
     if (eat(T_STAR))  { Node *n = new_node(N_DEREF); n->lhs = parse_unary(); return n; }
     if (eat(T_AMP))   { Node *n = new_node(N_ADDR);  n->lhs = parse_unary(); return n; }
     if (at(T_INC) || at(T_DEC)) {            // prefix ++x / --x
@@ -616,9 +705,15 @@ static Node *parse_add(void) {
     while (at(T_PLUS) || at(T_MINUS)) { int op = cur()->kind; P++; n = bin(op, n, parse_mul()); }
     return n;
 }
-static Node *parse_rel(void) {
+// C precedence:  <<  >>  bind tighter than the relational operators.
+static Node *parse_shift(void) {
     Node *n = parse_add();
-    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { int op = cur()->kind; P++; n = bin(op, n, parse_add()); }
+    while (at(T_SHL) || at(T_SHR)) { int op = cur()->kind; P++; n = bin(op, n, parse_add()); }
+    return n;
+}
+static Node *parse_rel(void) {
+    Node *n = parse_shift();
+    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { int op = cur()->kind; P++; n = bin(op, n, parse_shift()); }
     return n;
 }
 static Node *parse_eq(void) {
@@ -626,9 +721,25 @@ static Node *parse_eq(void) {
     while (at(T_EQ) || at(T_NE)) { int op = cur()->kind; P++; n = bin(op, n, parse_rel()); }
     return n;
 }
-static Node *parse_land(void) {
+// Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
+static Node *parse_band(void) {
     Node *n = parse_eq();
-    while (eat(T_ANDAND)) { Node *a = new_node(N_LOGAND); a->lhs = n; a->rhs = parse_eq(); n = a; }
+    while (at(T_AMP)) { P++; n = bin(T_AMP, n, parse_eq()); }
+    return n;
+}
+static Node *parse_bxor(void) {
+    Node *n = parse_band();
+    while (at(T_BITXOR)) { P++; n = bin(T_BITXOR, n, parse_band()); }
+    return n;
+}
+static Node *parse_bor(void) {
+    Node *n = parse_bxor();
+    while (at(T_BITOR)) { P++; n = bin(T_BITOR, n, parse_bxor()); }
+    return n;
+}
+static Node *parse_land(void) {
+    Node *n = parse_bor();
+    while (eat(T_ANDAND)) { Node *a = new_node(N_LOGAND); a->lhs = n; a->rhs = parse_bor(); n = a; }
     return n;
 }
 static Node *parse_lor(void) {
@@ -784,6 +895,7 @@ static void parse_toplevel(void) {
             if (!eat(T_COMMA)) break;
         }
         expect(T_RP);
+        if (eat(T_SEMI)) return;                       // prototype / extern decl — no body to emit
         fn->body = parse_block();
         if (!funcs) funcs = funcs_tail = fn; else { funcs_tail->next = fn; funcs_tail = fn; }
         return;
@@ -993,7 +1105,8 @@ static Type *gen_expr(Node *n) {
     }
     case N_UNARY:
         gen_expr(n->lhs);
-        if (n->op == T_MINUS) emit("    neg rax");
+        if      (n->op == T_MINUS)  emit("    neg rax");
+        else if (n->op == T_BITNOT) emit("    not rax");
         else { emit("    test rax, rax"); emit("    sete al"); emit("    movzx rax, al"); }
         return ty_long();
     case N_LOGAND: {
@@ -1037,6 +1150,11 @@ static Type *gen_expr(Node *n) {
         case T_STAR:    emit("    imul rax, rcx"); break;
         case T_SLASH:   emit("    cqo"); emit("    idiv rcx"); break;
         case T_PERCENT: emit("    cqo"); emit("    idiv rcx"); emit("    mov rax, rdx"); break;
+        case T_AMP:     emit("    and rax, rcx"); break;
+        case T_BITOR:   emit("    or rax, rcx");  break;
+        case T_BITXOR:  emit("    xor rax, rcx"); break;
+        case T_SHL:     emit("    shl rax, cl");  break;   // count in cl (low byte of rcx)
+        case T_SHR:     emit("    sar rax, cl");  break;   // arithmetic shift right
         case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
             emit("    cmp rax, rcx");
             const char *cc = op==T_LT?"setl":op==T_GT?"setg":op==T_LE?"setle":
