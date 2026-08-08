@@ -316,6 +316,7 @@ enum {
     T_KIF, T_KELSE, T_KWHILE, T_KRETURN, T_KASM,
     T_KFOR, T_KDO, T_KBREAK, T_KCONTINUE,
     T_KSTRUCT, T_KUNION, T_KSIZEOF,
+    T_KSWITCH, T_KCASE, T_KDEFAULT,
     T_EOF
 };
 
@@ -390,6 +391,9 @@ static void lex(void) {
             else if (!strcmp(buf, "struct"))   k = T_KSTRUCT;
             else if (!strcmp(buf, "union"))    k = T_KUNION;
             else if (!strcmp(buf, "sizeof"))   k = T_KSIZEOF;
+            else if (!strcmp(buf, "switch"))   k = T_KSWITCH;
+            else if (!strcmp(buf, "case"))     k = T_KCASE;
+            else if (!strcmp(buf, "default"))  k = T_KDEFAULT;
             else if (!strcmp(buf, "__asm__") || !strcmp(buf, "asm")) k = T_KASM;
             else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
                      !strcmp(buf, "signed") || !strcmp(buf, "static") ||
@@ -507,7 +511,8 @@ enum {
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
-    N_MEMBER, N_SIZEOF
+    N_MEMBER, N_SIZEOF,
+    N_SWITCH, N_CASE, N_DEFAULT
 };
 
 typedef struct Node Node;
@@ -524,7 +529,7 @@ struct Node {
     char *asmtext;                // N_ASM decoded text
 };
 
-static Node *new_node(int k) { Node *n = calloc(1, sizeof(Node)); n->kind = k; return n; }
+static Node *new_node(int k) { Node *n = calloc(1, sizeof(Node)); n->kind = k; n->ival = -1; return n; }
 
 // ---- symbols ----
 typedef struct Sym { char name[256]; Type *type; int is_global; int offset; struct Sym *next; } Sym;
@@ -832,6 +837,23 @@ static Node *parse_stmt(void) {
         Node *n = new_node(N_WHILE);
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_stmt();
+        return n;
+    }
+    if (eat(T_KSWITCH)) {
+        Node *n = new_node(N_SWITCH);
+        expect(T_LP); n->cond = parse_expr(); expect(T_RP);
+        n->lhs = parse_stmt();
+        return n;
+    }
+    if (eat(T_KCASE)) {
+        Node *n = new_node(N_CASE);
+        n->lhs = parse_expr();
+        expect(T_COLON);
+        return n;
+    }
+    if (eat(T_KDEFAULT)) {
+        Node *n = new_node(N_DEFAULT);
+        expect(T_COLON);
         return n;
     }
     if (eat(T_KFOR)) {
@@ -1220,6 +1242,65 @@ static int brk_lbl[64], cont_lbl[64], loop_sp = 0;
 static void loop_push(int b, int c) { brk_lbl[loop_sp] = b; cont_lbl[loop_sp] = c; loop_sp++; }
 static void loop_pop(void) { loop_sp--; }
 
+// ---- switch/case helpers ----
+// A switch body is walked three times: to hand each case/default its own label,
+// to find the default label, and to emit the compare-and-jump dispatch. All
+// three stop at a nested N_SWITCH so an inner switch keeps its own cases.
+static void assign_case_labels(Node *n) {
+    if (!n) return;
+    if (n->kind == N_SWITCH) return;
+    if (n->kind == N_CASE || n->kind == N_DEFAULT) { n->ival = label_id++; return; }
+    if (n->kind == N_BLOCK) {
+        for (int i = 0; i < n->nbody; i++) assign_case_labels(n->body[i]);
+    } else if (n->kind == N_IF) {
+        assign_case_labels(n->lhs); assign_case_labels(n->els);
+    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
+        assign_case_labels(n->lhs);
+    }
+}
+
+static int find_default_label(Node *n) {
+    if (!n) return -1;
+    if (n->kind == N_SWITCH) return -1;
+    if (n->kind == N_DEFAULT) return (int)n->ival;
+    if (n->kind == N_BLOCK) {
+        for (int i = 0; i < n->nbody; i++) {
+            int d = find_default_label(n->body[i]);
+            if (d != -1) return d;
+        }
+    } else if (n->kind == N_IF) {
+        int d = find_default_label(n->lhs);
+        if (d != -1) return d;
+        return find_default_label(n->els);
+    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
+        return find_default_label(n->lhs);
+    }
+    return -1;
+}
+
+// Emit "if (switch_value == case_value) goto case_label" for every case.
+// The switch value is saved on the stack at [rsp] by the caller; gen_expr is
+// stack-balanced, so we peek it (not pop) after evaluating each case value —
+// that keeps it available for every comparison, not just the first.
+static void emit_case_jumps(Node *n) {
+    if (!n) return;
+    if (n->kind == N_SWITCH) return;
+    if (n->kind == N_CASE) {
+        gen_expr(n->lhs);              // rax = this case's value
+        emit("    mov rcx, [rsp]");    // rcx = the switch value (still on the stack)
+        emit("    cmp rax, rcx");
+        emit("    je .L%ld", n->ival);
+        return;
+    }
+    if (n->kind == N_BLOCK) {
+        for (int i = 0; i < n->nbody; i++) emit_case_jumps(n->body[i]);
+    } else if (n->kind == N_IF) {
+        emit_case_jumps(n->lhs); emit_case_jumps(n->els);
+    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
+        emit_case_jumps(n->lhs);
+    }
+}
+
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (int i = 0; i < n->nbody; i++) gen_stmt(n->body[i]); break;
@@ -1278,12 +1359,38 @@ static void gen_stmt(Node *n) {
         break;
     }
     case N_BREAK:
-        if (loop_sp == 0) die("break outside loop");
+        if (loop_sp == 0) die("break outside loop or switch");
         emit("    jmp .L%d", brk_lbl[loop_sp-1]);
         break;
     case N_CONTINUE:
-        if (loop_sp == 0) die("continue outside loop");
+        // switch pushes cont_lbl == -1, so continue inside a bare switch is an error
+        if (loop_sp == 0 || cont_lbl[loop_sp-1] == -1) die("continue outside loop");
         emit("    jmp .L%d", cont_lbl[loop_sp-1]);
+        break;
+    case N_SWITCH: {
+        int end = label_id++;
+        assign_case_labels(n->lhs);
+        int def = find_default_label(n->lhs);
+
+        gen_expr(n->cond);              // switch value in rax
+        emit("    push rax");           // keep it on the stack for every comparison
+        emit_case_jumps(n->lhs);        // jump to the matching case label
+        emit("    add rsp, 8");         // discard the saved switch value
+        if (def != -1) emit("    jmp .L%d", def);   // no match -> default
+        else           emit("    jmp .L%d", end);   // no match, no default -> done
+
+        // break exits the switch; continue passes through to the enclosing loop
+        int current_cont = (loop_sp > 0) ? cont_lbl[loop_sp-1] : -1;
+        loop_push(end, current_cont);
+        gen_stmt(n->lhs);               // the body places the case labels inline
+        loop_pop();
+
+        emit(".L%d:", end);
+        break;
+    }
+    case N_CASE:
+    case N_DEFAULT:
+        if (n->ival != -1) emit(".L%ld:", n->ival);
         break;
     case N_ASM: gen_asm(n); break;
     default: gen_expr(n); break;                    // expression used as statement
