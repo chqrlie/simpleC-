@@ -26,15 +26,249 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdbool.h>
+
+#if (defined(__GNUC__) || defined(__TINYC__))
+#define attr_printf(a, b)  __attribute__((format(printf, a, b)))
+#else
+#define attr_printf(a, b)
+#endif
+
+#if 1
+#else
+// stdarg.h
+#define va_list         long
+#define va_start(ap, l) __builtin_va_start(ap)
+#define va_arg(ap, t)   __builtin_va_arg(ap)
+#define va_end(ap)      __builtin_va_end(ap)
+
+// stdbool.h (should make these keywords)
+typedef unsigned char bool;
+#define true 1
+#define false 0
+
+// stddef.h
+typedef unsigned long size_t;
+
+// stdio.h
+typedef struct FILE FILE;
+struct FILE {
+    int dummy;
+};
+extern FILE stdin[1];
+extern FILE stdout[1];
+extern FILE stderr[1];
+#define NULL  ((void*)0)
+#define EOF   (-1)
+int fclose(FILE *stream);
+FILE *fopen(const char *filename, const char *mode);
+int fprintf(FILE *stream, const char *format, ...);
+int printf(const char *format, ...);
+int vfprintf(FILE *srtream, const char *format, va_list arg);
+int fgetc(FILE *stream);
+int fputc(int c, FILE *stream);
+int fputs(const char *s, FILE *stream);
+void perror(const char *s);
+
+// ctype.h
+int isalnum(int c);
+int isalpha(int c);
+int isdigit(int c);
+int isspace(int c);
+int isxdigit(int c);
+int tolower(int c);
+
+// stdlib.h
+void *calloc(size_t nmemb, size_t size);
+void *malloc(size_t size);
+void *realloc(void *p, size_t size);
+void free(void *p);
+#define _Noreturn
+_Noreturn void exit(int status);
+
+// string.h
+void *memcpy(void *s1, const void *s2, size_t n);
+int memcmp(void *s1, const void *s2, size_t n);
+int strcmp(const char *s1, const char *s2);
+char *strchr(const char *s, int c);
+char *strcpy(char *s1, const char *s2);
+size_t strlen(const char *s);
+#endif
 
 // ---------------------------------------------------------------------
-// Output / errors
+// Output / errors / allocation
 // ---------------------------------------------------------------------
+static const char *progname;
+static const char *filename;
+static int lineno;
+static int optimize;
+static bool verbose;
 static FILE *fout;
-static void die(const char *m) { fprintf(stderr, "nano_cc: error: %s\n", m); exit(1); }
+static void err_message(int pos, const char *kind, const char *fmt, va_list ap) {
+    if (filename && pos) fprintf(stderr, "%s:%d: %s: ", filename, pos, kind);
+    else fprintf(stderr, "%s: %s: ", progname, kind);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+}
+static void die(const char *fmt, ...) attr_printf(1,2);
+static void die(const char *fmt, ...) {
+    va_list a; va_start(a, fmt); err_message(lineno, "error", fmt, a); va_end(a);
+    exit(1);
+}
+static void warning(int pos, const char *fmt, ...) attr_printf(2,3);
+static void warning(int pos, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); err_message(pos, "warning", fmt, a); va_end(a);
+}
+static void emit(const char *fmt, ...) attr_printf(1,2);
 static void emit(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(fout, fmt, a); va_end(a);
     fputc('\n', fout);
+}
+static int xdigit(int d) { return (d <= '9') ? d - '0' : tolower(d) - 'a' + 10; }
+static int skip_blanks(const char *s) {
+    int i = 0;
+    while (s[i] == ' ' || s[i] == '\t') i++;
+    return i;
+}
+static int trim_len(const char *s) {
+    int i = strlen(s);
+    while (i && (s[i - 1] == ' ' || s[i - 1] == '\t')) i--;
+    return i;
+}
+static int skip_word(const char *s) {
+    int i = 0;
+    while (isalnum((unsigned char)s[i]) || s[i] == '_') i++;
+    return i;
+}
+static int pstrcpy(char *dest, int size, const char *src) {
+    if (size) {
+        for (int i = 0; i < size; i++) if ((dest[i] = src[i]) == 0) return i;
+        dest[size - 1] = 0;
+    }
+    return size;
+}
+
+static void *alloc(size_t nelems, size_t size) {
+    void *ptr = malloc(nelems * size);
+    if (!ptr) die("out of memory");
+    return ptr;
+}
+static void *allocz(size_t nelems, size_t size) {
+    void *ptr = calloc(nelems, size);
+    if (!ptr) die("out of memory");
+    return ptr;
+}
+static void *reallocate(void *ptr, size_t *nelems, size_t size) {
+    size_t new_nelems = *nelems + (*nelems >> 1);
+#if 1    // XXX use realloc if available
+    void *new_ptr = realloc(ptr, new_nelems * size);
+    if (!new_ptr) die("out of memory");
+#else
+    void *new_ptr = alloc(new_nelems, size);
+    if (ptr) { memcpy(new_ptr, ptr, *nelems * size); free(ptr); }
+#endif
+    *nelems = new_nelems;
+    return new_ptr;
+}
+
+// =====================================================================
+// 0.1. ATOM TABLE -> convert names and strings to single atoms
+// =====================================================================
+
+typedef unsigned int atom_t;
+#define ATOM_MACRO 1
+#define ATOM_USED  2
+typedef struct Atom { atom_t next; int len; char flags; char str[7]; } Atom;
+static Atom **atoms;
+static size_t natoms, atoms_cap;
+#define ATOM_HASH_LEN  1023
+static atom_t atom_hash[ATOM_HASH_LEN];
+
+const char *atom_str(atom_t i) { return atoms[i]->str; }
+int atom_len(atom_t i) { return atoms[i]->len; }
+#define atom_flags(i)  atoms[i]->flags
+atom_t new_atom_len(const char *str, int len) {
+    if (!atoms) {
+        atoms = alloc(atoms_cap = 1024, sizeof(Atom*));
+        atoms[0] = allocz(1, sizeof(Atom)); natoms = 1;
+    }
+    if (!len) { return 0; } // special case the empty string
+    unsigned int hash = 0;
+    for (int i = 0; i < len; i++) hash = hash * 37 + str[i];
+    hash %= ATOM_HASH_LEN;
+    atom_t a = atom_hash[hash];
+    while (a) {
+        Atom *ap = atoms[a];
+        if (ap->len == len && !memcmp(ap->str, str, len)) return a;
+        a = ap->next;
+    }
+    if (natoms >= atoms_cap)
+        atoms = reallocate(atoms, &atoms_cap, sizeof(Atom*));
+    Atom *ap = alloc(1, sizeof(Atom) - 7 + len + 1);
+    memcpy(ap->str, str, len);
+    ap->str[len] = 0;
+    ap->len = len;
+    ap->next = atom_hash[hash];
+    a = natoms++;
+    atom_hash[hash] = a;
+    atoms[a] = ap;
+    return a;
+}
+atom_t new_atom(const char *str) { return new_atom_len(str, strlen(str)); }
+
+// =====================================================================
+// 0.2. PREDEFINED ATOMS
+// =====================================================================
+enum {
+    T_EMPTY, T_EOF, T_NUM, T_ID, T_STR, T_CHAR,
+    T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
+    T_BITOR, T_AMP, T_BITXOR, T_SHL, T_SHR,
+    T_EQ, T_NE, T_LT, T_GT, T_LE, T_GE,
+    T_ANDAND, T_OROR, T_NOT, T_BITNOT, T_INC, T_DEC,
+    T_ASSIGN,
+    // combined assignment operators must be in the same order as operators
+    T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
+    T_OREQ, T_ANDEQ, T_XOREQ, T_SHLEQ, T_SHREQ,
+    T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
+    T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW, T_ELLIPSIS,
+
+    K_INT, K_LONG, K_CHAR, K_VOID,
+    K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
+    K_FOR, K_DO, K_BREAK, K_CONTINUE, K_STRUCT, K_UNION, K_SIZEOF,
+    K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_TYPEDEF, K_ENUM,
+
+    K_CONST, K_UNSIGNED, K_SIGNED, K_STATIC, K_INLINE,
+    K_REGISTER, K_VOLATILE, K_EXTERN,
+
+    K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF, K_INCLUDE,
+    ID__BUILTIN_VA_START, ID__BUILTIN_VA_ARG, ID__BUILTIN_VA_END,
+    ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
+    T_count
+};
+static const char *token_name[T_count] = {
+    "", "<EOF>", "number", "identifier", "string", "char const",
+    "+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>",
+    "==", "!=", "<", ">", "<=", ">=",
+    "&&", "||", "!", "~", "++", "--",
+    "=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=",
+    "(", ")", "[", "]", "{", "}",
+    ";", ",", "?", ":", ".", "->", "...",
+    "int", "long", "char", "void",
+    "if", "else", "while", "return", "asm", "__asm__",
+    "for", "do", "break", "continue", "struct", "union", "sizeof",
+    "switch", "case", "default", "goto", "typedef", "enum",
+    "const", "unsigned", "signed", "static", "inline",
+    "register", "volatile", "extern",
+    "ifdef", "ifndef", "elif", "endif", "define", "undef", "include",
+    "__builtin_va_start", "__builtin_va_arg", "__builtin_va_end",
+    "main", "printf", "puts", "strlen", "strcpy", "memcpy",
+};
+
+static void lex_init(void) {
+    for (atom_t i = 0; i < T_count; i++) {
+        if (new_atom(token_name[i]) != i)
+            die("atom definition failure for '%s'", token_name[i]);
+    }
 }
 
 // =====================================================================
@@ -42,32 +276,42 @@ static void emit(const char *fmt, ...) {
 // =====================================================================
 #define MAX_SRC   400000
 static char SRC[MAX_SRC];
-static int  SRC_LEN = 0;
+static int  SRC_LEN;
 
 // A macro is either object-like (#define PI 3) or function-like
 // (#define MAX(a,b) ((a)>(b)?(a):(b))).  For function-like macros we keep
 // the parameter names so expand_line() can substitute call arguments.
 typedef struct {
-    char name[64]; char value[512];
-    int  is_func; char params[8][64]; int nparams;
+    atom_t name; int nparams; atom_t params[8]; char value[512];
 } Macro;
 #define MAX_MACROS 1024
 static Macro macros[MAX_MACROS];
-static int   macro_cnt = 0;
+static int   macro_cnt;
 
-static Macro *macro_find(const char *name) {
-    for (int i = 0; i < macro_cnt; i++)
-        if (!strcmp(macros[i].name, name)) return &macros[i];
+static Macro *macro_find(atom_t name) {
+    if (atom_flags(name) & ATOM_MACRO) {
+        for (int i = 0; i < macro_cnt; i++)
+            if (macros[i].name == name) return &macros[i];
+    }
     return NULL;
 }
 // Find-or-create a macro slot, reset to a clean object-like state.
-static Macro *macro_intern(const char *name) {
+static Macro *macro_intern(atom_t name) {
     Macro *m = macro_find(name);
     if (!m) { m = &macros[macro_cnt++]; }
-    snprintf(m->name, sizeof(m->name), "%s", name);
-    m->value[0] = 0; m->is_func = 0; m->nparams = 0;
+    atom_flags(name) |= ATOM_MACRO;
+    m->name = name;
+    m->value[0] = 0; m->nparams = -1;
     return m;
 }
+static void macro_undef(atom_t name) {
+    Macro *m = macro_find(name);
+    if (m) {
+        atom_flags(name) &= ~ATOM_MACRO;
+        m->name = 0;
+    }
+}
+
 static void src_putc(char c) {
     if (SRC_LEN >= MAX_SRC - 1) die("source too large");
     SRC[SRC_LEN++] = c;
@@ -80,19 +324,19 @@ static void src_puts(const char *s) { while (*s) src_putc(*s++); }
 static int subst_macro_body(const Macro *m, char argv[8][512], int argc,
                             char *out, int j, int cap) {
     #define PUT(ch) do { if (j < cap - 1) out[j++] = (ch); } while (0)
-    for (int vi = 0; m->value[vi]; ) {
-        char vc = m->value[vi];
+    const char *p = m->value;
+    while (*p) {
+        char vc = *p;
         if (isalpha((unsigned char)vc) || vc == '_') {
-            char w[64]; int k = 0;
-            while (m->value[vi] && (isalnum((unsigned char)m->value[vi]) || m->value[vi] == '_') && k < 63)
-                w[k++] = m->value[vi++];
-            w[k] = 0;
+            int k = skip_word(p);
+            atom_t w = new_atom_len(p, k);
             int pi = -1;
-            for (int a = 0; a < m->nparams; a++) if (!strcmp(w, m->params[a])) { pi = a; break; }
+            for (int a = 0; a < m->nparams; a++) if (w == m->params[a]) { pi = a; break; }
             if (pi >= 0 && pi < argc) { for (const char *s = argv[pi]; *s; s++) PUT(*s); }
-            else                      { for (int t = 0; w[t]; t++) PUT(w[t]); }
+            else                      { for (int i = 0; i < k; i++) PUT(p[i]); }
+            p += k;
         } else {
-            PUT(vc); vi++;
+            PUT(vc); p++;
         }
     }
     #undef PUT
@@ -102,31 +346,31 @@ static int subst_macro_body(const Macro *m, char argv[8][512], int argc,
 // Expand object-like and simple function-like macros in one logical line.
 static void expand_line(const char *in) {
     char work[8192];
-    snprintf(work, sizeof(work), "%s", in);
+    pstrcpy(work, sizeof(work), in);
     for (int pass = 0; pass < 8; pass++) {
         char out[8192]; int j = 0, changed = 0;
         #define OPUT(ch) do { if (j < (int)sizeof(out) - 1) out[j++] = (ch); } while (0)
         for (int i = 0; work[i]; ) {
             char c = work[i];
             if (c == '"' || c == '\'') {          // copy string/char literal verbatim
-                char q = c; OPUT(work[i++]);
+                char q = c; OPUT(c); i++;
                 while (work[i] && work[i] != q) {
-                    if (work[i] == '\\' && work[i+1]) OPUT(work[i++]);
-                    OPUT(work[i++]);
+                    if (work[i] == '\\' && work[i+1]) { OPUT(work[i]); i++; }
+                    OPUT(work[i]); i++;
                 }
-                if (work[i]) OPUT(work[i++]);
+                if (work[i]) { OPUT(work[i]); i++; }
             } else if (isalpha((unsigned char)c) || c == '_') {
-                char word[64]; int k = 0;
-                while (work[i] && (isalnum((unsigned char)work[i]) || work[i] == '_') && k < 63)
-                    word[k++] = work[i++];
-                word[k] = 0;
+                int k = i; i += skip_word(work + i);
+                atom_t word = new_atom_len(&work[k], i - k);
                 Macro *m = macro_find(word);
-                if (m && m->is_func) {
-                    int t = i; while (work[t] == ' ' || work[t] == '\t') t++;
+                if (m && m->nparams >= 0) { // is_func
+                    int t = i; t += skip_blanks(work + t);
                     if (work[t] == '(') {          // it's a macro invocation
                         t++;                       // past '('
+                        // XXX: This does not work if macro arguments span multiple lines
                         char argv[8][512]; int argc = 0, ci = 0; argv[0][0] = 0;
                         int depth = 1;
+                        // XXX: this does not work if macro argument is a string or char constant
                         while (work[t] && depth > 0) {
                             char cc = work[t];
                             if (cc == '(') { depth++; if (argc < 8 && ci < 511) argv[argc][ci++] = cc; t++; }
@@ -137,10 +381,11 @@ static void expand_line(const char *in) {
                         if (argc < 8) { argv[argc][ci] = 0; argc++; }
                         // trim leading/trailing whitespace on each argument
                         for (int a = 0; a < argc; a++) {
-                            char *s = argv[a]; int st = 0, en = (int)strlen(s);
-                            while (s[st] == ' ' || s[st] == '\t') st++;
-                            while (en > st && (s[en-1] == ' ' || s[en-1] == '\t')) en--;
-                            memmove(s, s + st, en - st); s[en - st] = 0;
+                            char *s = argv[a];
+                            int st = skip_blanks(s);
+                            int len = trim_len(s + st);
+                            if (st) { for (int i = 0; i < len; i++) s[i] = s[st + i]; }
+                            s[len] = 0;
                         }
                         // empty call MACRO()  ->  zero arguments
                         if (argc == 1 && argv[0][0] == 0 && m->nparams == 0) argc = 0;
@@ -148,16 +393,16 @@ static void expand_line(const char *in) {
                         i = t;                     // consume through ')'
                         changed = 1;
                     } else {                       // name not followed by '(' -> literal
-                        for (int q = 0; word[q]; q++) OPUT(word[q]);
+                        while (k < i) { OPUT(work[k]); k++; }
                     }
                 } else if (m) {                    // object-like macro
                     for (const char *p = m->value; *p; p++) OPUT(*p);
                     changed = 1;
                 } else {
-                    for (int t = 0; word[t]; t++) OPUT(word[t]);
+                    while (k < i) { OPUT(work[k]); k++; }
                 }
             } else {
-                OPUT(work[i++]);
+                OPUT(work[i]); i++;
             }
             if (j >= (int)sizeof(out) - 2) break;
         }
@@ -170,7 +415,8 @@ static void expand_line(const char *in) {
 }
 
 // Strip // and /* */ comments (string/char aware) into `dst`.
-static void strip_comments(const char *s, char *dst) {
+static char *strip_comments(const char *s, int len) {
+    char *dst = alloc(len + 1, 1);
     int j = 0;
     for (int i = 0; s[i]; ) {
         if (s[i] == '"' || s[i] == '\'') {
@@ -184,324 +430,392 @@ static void strip_comments(const char *s, char *dst) {
             while (s[i] && s[i] != '\n') i++;
         } else if (s[i] == '/' && s[i+1] == '*') {
             i += 2;
-            while (s[i] && !(s[i] == '*' && s[i+1] == '/')) i++;
+            while (s[i] && !(s[i] == '*' && s[i+1] == '/')) if (s[i++] == '\n') dst[j++] = '\n';
             if (s[i]) i += 2;
-            dst[j++] = ' ';
+            if (j && !isspace(dst[j-1])) dst[j++] = ' ';
         } else {
             dst[j++] = s[i++];
         }
     }
     dst[j] = 0;
+    if (verbose) printf("Stripped: %d bytes\n", j);
+    return dst;
 }
 
 static void preprocess(const char *path);   // fwd
 
-static int cond_all_active(const int *cond, int sp) {
-    for (int i = 0; i < sp; i++) if (!cond[i]) return 0;
-    return 1;
-}
-
 // Process already-comment-stripped text of one file.
 // NB: iterate lines manually (no strtok) so nested #include recursion is safe.
 static void process_text(const char *text) {
-    int cond[64]; int cond_sp = 0;
-    #define ACTIVE() cond_all_active(cond, cond_sp)
+    int cond_sp = 0, skip = 0, seen_else = 0;
 
+    lineno = 1;
     const char *cursor = text;
     while (*cursor) {
         char line[8192]; int li = 0;
-        while (*cursor && *cursor != '\n' && li < 8191) line[li++] = *cursor++;
+        while (*cursor && *cursor != '\r' && *cursor != '\n') {
+            if (li >= (int)sizeof(line)) die("line too long");
+            line[li++] = *cursor++;
+        }
         line[li] = 0;
+        if (*cursor == '\r') cursor++;
         if (*cursor == '\n') cursor++;
 
-        // find first non-space
-        const char *p = line; while (*p == ' ' || *p == '\t') p++;
+        const char *p = line; p += skip_blanks(p);
         if (*p == '#') {
             p++;
-            while (*p == ' ' || *p == '\t') p++;
-            char dir[32]; int di = 0;
-            while (*p && (isalpha((unsigned char)*p)) && di < 31) dir[di++] = *p++;
-            dir[di] = 0;
-            while (*p == ' ' || *p == '\t') p++;
-            if (!strcmp(dir, "ifndef") || !strcmp(dir, "ifdef")) {
-                char nm[64]; int k = 0;
-                while (*p && (isalnum((unsigned char)*p) || *p == '_') && k < 63) nm[k++] = *p++;
-                nm[k] = 0;
-                int defined = macro_find(nm) != NULL;
-                int take = (dir[2] == 'n') ? !defined : defined;   // ifndef vs ifdef
-                int active_now = ACTIVE();
-                cond[cond_sp++] = active_now ? take : 0;
-            } else if (!strcmp(dir, "if")) {
-                cond[cond_sp++] = 0;                 // unsupported #if -> skip body
-            } else if (!strcmp(dir, "else")) {
-                if (cond_sp > 0) cond[cond_sp-1] = !cond[cond_sp-1];
-            } else if (!strcmp(dir, "endif")) {
-                if (cond_sp > 0) cond_sp--;
-            } else if (!strcmp(dir, "define")) {
-                if (ACTIVE()) {
-                    char nm[64]; int k = 0;
-                    while (*p && (isalnum((unsigned char)*p) || *p == '_') && k < 63) nm[k++] = *p++;
-                    nm[k] = 0;
+            p += skip_blanks(p);
+            int di = skip_word(p);
+            atom_t dir = new_atom_len(p, di);
+            p += di;
+            p += skip_blanks(p);
+            switch (dir) {
+            case K_IFNDEF: case K_IFDEF:
+                cond_sp++;
+                skip += skip;
+                seen_else += seen_else;
+                if (!skip) {
+                    int k = skip_word(p);
+                    if (!k) die("expected macro name after '#%s'", atom_str(dir));
+                    atom_t nm = new_atom_len(p, k);
+                    int defined = macro_find(nm) != NULL;
+                    skip |= (dir == K_IFDEF) ? !defined : defined;
+                    p += k;
+                }
+                break;
+            case K_IF:  // unsupported #if -> skip body
+                cond_sp++;
+                skip += skip + 1;
+                seen_else += seen_else;
+                break;
+            case K_ELIF: // unsupported #if -> skip body
+                if (!cond_sp) die("'#%s' without a '#if'", atom_str(dir));
+                if (seen_else & 1) die("'#%s' after '#else'", atom_str(dir));
+                skip |= 1;
+                break;
+            case K_ELSE:
+                if (!cond_sp) die("'#%s' without a '#if'", atom_str(dir));
+                if (seen_else & 1) die("'#%s' after '#else'", atom_str(dir));
+                skip ^= 1; seen_else |= 1;
+                break;
+            case K_ENDIF:
+                if (!cond_sp) die("'#%s' without a '#if'", atom_str(dir));
+                cond_sp--;
+                skip >>= 1; seen_else >>= 1;
+                break;
+            case K_DEFINE:
+                if (!skip) {
+                    int k = skip_word(p);
+                    if (!k) die("expected macro name after '#%s'", atom_str(dir));
+                    atom_t nm = new_atom_len(p, k);
                     Macro *m = macro_intern(nm);
+                    p += k;
                     // function-like macro: '(' immediately after name (no space)
                     if (*p == '(') {
-                        m->is_func = 1; p++;
-                        while (*p && *p != ')') {
-                            while (*p == ' ' || *p == '\t' || *p == ',') p++;
-                            int ai = 0;
-                            while (isalnum((unsigned char)*p) || *p == '_') {
-                                if (ai < 63 && m->nparams < 8) m->params[m->nparams][ai++] = *p;
+                        m->nparams = 0; p++;
+                        p += skip_blanks(p);
+                        if (*p && *p != ')') {
+                            for (;;) {
+                                int ai = skip_word(p);
+                                if (!ai) die("expected parameter name for macro '%s'", atom_str(nm));
+                                if (m->nparams >= 8) die("too many macro parameters for '%s'", atom_str(nm));
+                                m->params[m->nparams++] = new_atom_len(p, ai);
+                                p += ai;
+                                p += skip_blanks(p);
+                                if (*p == ')') break;
+                                if (*p != ',') die("expected ',' or ')' after macro parameter name");
                                 p++;
+                                p += skip_blanks(p);
                             }
-                            if (ai > 0) { if (m->nparams < 8) { m->params[m->nparams][ai] = 0; m->nparams++; } }
-                            else if (*p && *p != ')' && *p != ' ' && *p != '\t' && *p != ',') p++; // progress guard
                         }
-                        if (*p == ')') p++;
+                        if (*p != ')') die("expected ')' after parameters of macro '%s'", atom_str(nm));
+                        p++;
                     }
-                    while (*p == ' ' || *p == '\t') p++;
-                    char val[512]; int v = 0;
-                    while (*p && v < 511) val[v++] = *p++;
-                    while (v > 0 && (val[v-1] == ' ' || val[v-1] == '\t' || val[v-1] == '\r')) v--;
-                    val[v] = 0;
-                    snprintf(m->value, sizeof(m->value), "%s", val);
+                    p += skip_blanks(p);
+                    int len = trim_len(p);
+                    if (len >= (int)sizeof(m->value)) { die("macro '%s' definition too long (max=%d)",
+                                                            atom_str(nm), (int)sizeof(m->value) - 1); }
+                    memcpy(m->value, p, len);
+                    m->value[len] = 0;
+                    p += len;
                 }
-            } else if (!strcmp(dir, "undef")) {
-                // leave defined (rare); no-op is safe for our inputs
-            } else if (!strcmp(dir, "include")) {
-                if (ACTIVE() && *p == '"') {
-                    p++;
-                    char fn[256]; int k = 0;
-                    while (*p && *p != '"' && k < 255) fn[k++] = *p++;
-                    fn[k] = 0;
-                    preprocess(fn);
+                break;
+            case K_UNDEF:
+                if (!skip) {
+                    int k = skip_word(p);
+                    atom_t nm = new_atom_len(p, k);
+                    macro_undef(nm);
+                    p += k;
                 }
-                // <...> system includes are ignored (freestanding)
+                break;
+            case K_INCLUDE:
+                if (!skip) {
+                    if (*p == '"') {
+                        p++;
+                        char fn[256]; int k = 0;
+                        while (*p && *p != '"' && k < 255) fn[k++] = *p++;
+                        fn[k] = 0;
+                        preprocess(fn);
+                    } else {
+                        // <...> system includes are ignored (freestanding)
+                    }
+                }
+                break;
+            default:
+                // ignore other preprocessing directives
+                break;
             }
         } else {
-            if (ACTIVE()) { expand_line(line); src_putc('\n'); }
+            if (!skip) expand_line(line);
         }
+        src_putc('\n'); lineno++; // preserve line numbers
     }
-    #undef ACTIVE
+    if (cond_sp) warning(lineno, "missing '#endif'");
+    SRC[SRC_LEN] = 0;
 }
 
 static void preprocess(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "nano_cc: cannot open %s\n", path); exit(1); }
-    char *raw   = malloc(MAX_SRC);
-    char *nocmt = malloc(MAX_SRC);
-    if (!raw || !nocmt) die("out of memory");
-    int n = 0, c;
-    while ((c = fgetc(f)) != EOF && n < MAX_SRC - 1) raw[n++] = (char)c;
+    if (!f) { die("%s: cannot open %s\n", progname, path); }
+    size_t raw_cap = 64 * 1024;
+    char *raw = alloc(raw_cap, 1);
+    int c; size_t n = 0;
+    while ((c = fgetc(f)) != EOF) {
+        if (n + 2 > raw_cap) { raw = reallocate(raw, &raw_cap, 1); }
+        raw[n++] = (char)c;
+    }
     raw[n] = 0;
+    if (verbose) printf("Read %s: %d bytes\n", path, (int)n);
     fclose(f);
-    strip_comments(raw, nocmt);          // reads raw -> writes nocmt
-    process_text(nocmt);                  // may recurse (with its own buffers)
+    const char *save_filename = filename; int save_lineno = lineno;
+    filename = path; lineno = 0;
+    char *nocmt = strip_comments(raw, n);
+    process_text(nocmt);                 // may recurse (with its own buffers)
+    filename = save_filename; lineno = save_lineno;
     free(raw); free(nocmt);
+    if (verbose) printf("Preprocessed: %d bytes\n", SRC_LEN);
 }
 
 // =====================================================================
 // 2. LEXER
 // =====================================================================
-enum {
-    T_NUM, T_ID, T_STR, T_CHAR,
-    T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
-    T_ASSIGN, T_EQ, T_NE, T_LT, T_GT, T_LE, T_GE,
-    T_ANDAND, T_OROR, T_NOT, T_AMP,
-    T_BITOR, T_BITXOR, T_BITNOT, T_SHL, T_SHR,
-    T_INC, T_DEC,
-    T_PLUSEQ, T_MINUSEQ, T_STAREQ, T_SLASHEQ, T_PERCENTEQ,
-    T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
-    T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW, T_ELLIPSIS,
-    T_KINT, T_KLONG, T_KCHAR, T_KVOID,
-    T_KIF, T_KELSE, T_KWHILE, T_KRETURN, T_KASM,
-    T_KFOR, T_KDO, T_KBREAK, T_KCONTINUE,
-    T_KSTRUCT, T_KUNION, T_KSIZEOF,
-    T_KSWITCH, T_KCASE, T_KDEFAULT,
-    T_EOF
-};
 
 typedef struct {
     int   kind;
+    int   lineno;
     long  ival;          // T_NUM / T_CHAR
-    char  text[256];     // T_ID
-    char *str;           // T_STR (decoded bytes)
-    int   slen;          // T_STR length
+    atom_t text;         // T_ID, T_STR (decoded bytes)
 } Token;
 
 #define MAX_TOK 60000
 static Token toks[MAX_TOK];
-static int   ntok = 0;
+static int   ntok;
 
-static void add_tok(int kind) { toks[ntok].kind = kind; ntok++; }
+static void add_tok(int kind) { toks[ntok].kind = kind; toks[ntok].lineno = lineno; ntok++; }
+static const char *token_str(Token *t) {
+    return atom_str(t->kind == T_ID ? t->text : t->kind);
+}
 
-static int  sp = 0;                       // scan position in SRC
-static void skip_space(void) { while (sp < SRC_LEN && isspace((unsigned char)SRC[sp])) sp++; }
+#define sp SRC_INDEX        // avoid problem with generated assembly '[rip+sp]' considered invalid
+static int  sp;                       // scan position in SRC
+static void skip_space(void) { while (isspace((unsigned char)SRC[sp])) if (SRC[sp++] == '\n') lineno++; }
 
 static int read_escape(void) {            // SRC[sp] points just past a backslash
-    char c = SRC[sp++];
+    int c = (unsigned char)SRC[sp++];
     switch (c) {
-        case 'n': return '\n';  case 't': return '\t';  case 'r': return '\r';
-        case '0': return '\0';  case '\\': return '\\'; case '\'': return '\'';
-        case '"': return '"';   case 'b': return '\b';  case 'f': return '\f';
-        case 'v': return '\v';  default:  return c;
+    case 0: sp--; return 0;
+    case 'n': return '\n';  case 't': return '\t';  case 'r': return '\r';
+    case 'b': return '\b';  case 'f': return '\f';  case 'v': return '\v';
+    case '\\': case '\'': case '"': return c;
+    case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7':
+        c -= '0';
+        if (SRC[sp] >= '0' && SRC[sp] <= '7') {
+            c = (c << 3) + (SRC[sp++] - '0');
+            if (SRC[sp] >= '0' && SRC[sp] <= '7') {
+                c = (c << 3) + (SRC[sp++] - '0');
+            }
+        }
+        return c;
+    case 'x':
+        c = 0;
+        while (isxdigit((unsigned char)SRC[sp])) c = c * 16 + xdigit((unsigned char)SRC[sp]);
+        return c;
+    default:
+        warning(lineno, "invalid escape sequence '\\%c'", c);
+        return c;
     }
 }
 
-static char strpool[200000];
-static int  strpool_len = 0;
+static char const ops[] = {
+#define ____ 0
+    '(', T_LP,       ____,      ____,         ____,
+    ')', T_RP,       ____,      ____,         ____,
+    '[', T_LBRK,     ____,      ____,         ____,
+    ']', T_RBRK,     ____,      ____,         ____,
+    '{', T_LBRACE,   ____,      ____,         ____,
+    '}', T_RBRACE,   ____,      ____,         ____,
+    ';', T_SEMI,     ____,      ____,         ____,
+    ',', T_COMMA,    ____,      ____,         ____,
+    '<', T_LT,       T_SHL,     T_LE,         T_SHLEQ,
+    '=', T_ASSIGN,   T_EQ,      ____,         ____,
+    '>', T_GT,       T_SHR,     T_GE,         T_SHREQ,
+    '+', T_PLUS,     T_INC,     T_PLUSEQ,     ____,
+    '-', T_MINUS,    T_DEC,     T_MINUSEQ,    ____,
+    '*', T_STAR,     ____,      T_STAREQ,     ____,
+    '/', T_SLASH,    ____,      T_SLASHEQ,    ____,
+    '%', T_PERCENT,  ____,      T_PERCENTEQ,  ____,
+    '!', T_NOT,      ____,      T_NE,         ____,
+    '~', T_BITNOT,   ____,      ____,         ____,
+    '?', T_QUESTION, ____,      ____,         ____,
+    ':', T_COLON,    ____,      ____,         ____,
+    '&', T_AMP,      T_ANDAND,  T_ANDEQ,      ____,
+    '|', T_BITOR,    T_OROR,    T_OREQ,       ____,
+    '^', T_BITXOR,   ____,      T_XOREQ,      ____,
+    0,
+#undef ____
+};
 
 static void lex(void) {
     for (;;) {
         skip_space();
-        if (sp >= SRC_LEN) { add_tok(T_EOF); return; }
         char c = SRC[sp];
+        if (c == 0) { add_tok(T_EOF); break; }
 
         if (isdigit((unsigned char)c)) {
             long v = 0;
-            if (c == '0' && sp + 1 < SRC_LEN && (SRC[sp+1] == 'x' || SRC[sp+1] == 'X')) {
-                sp += 2;
-                while (sp < SRC_LEN && isxdigit((unsigned char)SRC[sp])) {
-                    char d = SRC[sp++];
-                    int dv = (d <= '9') ? d - '0' : (tolower(d) - 'a' + 10);
-                    v = v * 16 + dv;
+            if (c == '0') {
+                if (SRC[sp+1] == 'x' || SRC[sp+1] == 'X') {
+                    sp += 2;
+                    while (isxdigit((unsigned char)SRC[sp])) {
+                        v = v * 16 + xdigit(SRC[sp++]);
+                    }
+                } else {
+                    while (SRC[sp] >= '0' && SRC[sp] <= '7') v = v * 8 + (SRC[sp++] - '0');
                 }
             } else {
-                while (sp < SRC_LEN && isdigit((unsigned char)SRC[sp])) v = v * 10 + (SRC[sp++] - '0');
+                while (isdigit((unsigned char)SRC[sp])) v = v * 10 + (SRC[sp++] - '0');
             }
+            if (c == '.' || c == 'E' || c == 'e') die("floating point not supported");
+            if (isalnum((unsigned char)SRC[sp])) die("invalid integer literal");
             toks[ntok].ival = v; add_tok(T_NUM); continue;
         }
         if (isalpha((unsigned char)c) || c == '_') {
-            char buf[256]; int i = 0;
-            while (sp < SRC_LEN && (isalnum((unsigned char)SRC[sp]) || SRC[sp] == '_') && i < 255)
-                buf[i++] = SRC[sp++];
-            buf[i] = 0;
-            int k = T_ID;
-            if      (!strcmp(buf, "int"))      k = T_KINT;
-            else if (!strcmp(buf, "long"))     k = T_KLONG;
-            else if (!strcmp(buf, "char"))     k = T_KCHAR;
-            else if (!strcmp(buf, "void"))     k = T_KVOID;
-            else if (!strcmp(buf, "if"))       k = T_KIF;
-            else if (!strcmp(buf, "else"))     k = T_KELSE;
-            else if (!strcmp(buf, "while"))    k = T_KWHILE;
-            else if (!strcmp(buf, "return"))   k = T_KRETURN;
-            else if (!strcmp(buf, "for"))      k = T_KFOR;
-            else if (!strcmp(buf, "do"))       k = T_KDO;
-            else if (!strcmp(buf, "break"))    k = T_KBREAK;
-            else if (!strcmp(buf, "continue")) k = T_KCONTINUE;
-            else if (!strcmp(buf, "struct"))   k = T_KSTRUCT;
-            else if (!strcmp(buf, "union"))    k = T_KUNION;
-            else if (!strcmp(buf, "sizeof"))   k = T_KSIZEOF;
-            else if (!strcmp(buf, "switch"))   k = T_KSWITCH;
-            else if (!strcmp(buf, "case"))     k = T_KCASE;
-            else if (!strcmp(buf, "default"))  k = T_KDEFAULT;
-            else if (!strcmp(buf, "__asm__") || !strcmp(buf, "asm")) k = T_KASM;
-            else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
-                     !strcmp(buf, "signed") || !strcmp(buf, "static") ||
-                     !strcmp(buf, "inline") || !strcmp(buf, "register") ||
-                     !strcmp(buf, "volatile") || !strcmp(buf, "extern")) continue;   // qualifier: drop
-            if (k == T_ID) snprintf(toks[ntok].text, sizeof(toks[ntok].text), "%s", buf);
-            add_tok(k); continue;
+            int i = sp; sp += skip_word(&SRC[sp]);
+            atom_t name = new_atom_len(SRC + i, sp - i);
+            if (name >= K_INT) {
+                if (name <= K_ENUM) { add_tok(name); continue; }
+                if (name <= K_EXTERN) continue;   // drop qualifiers
+            }
+            toks[ntok].text = name; add_tok(T_ID); continue;
         }
         if (c == '"') {                              // string literal (+ adjacent concat)
-            char *start = &strpool[strpool_len]; int len = 0;
+            char buf[8192]; size_t len = 0;
             for (;;) {
                 sp++;                                 // skip opening quote
-                while (sp < SRC_LEN && SRC[sp] != '"') {
-                    int ch;
-                    if (SRC[sp] == '\\') { sp++; ch = read_escape(); }
-                    else ch = SRC[sp++];
-                    strpool[strpool_len++] = (char)ch; len++;
+                while (SRC[sp] && SRC[sp] != '"' && SRC[sp] != '\n') {
+                    int ch = SRC[sp++];
+                    if (ch == '\\') ch = read_escape();
+                    if (len >= sizeof(buf)) die("string too long");
+                    buf[len++] = (char)ch;
                 }
-                if (sp < SRC_LEN) sp++;               // skip closing quote
+                if (SRC[sp] != '"') die("unterminated string");
+                sp++;               // skip closing quote
                 skip_space();
-                if (sp < SRC_LEN && SRC[sp] == '"') continue;   // concatenate
-                break;
+                if (SRC[sp] != '"') break;   // concatenate
             }
-            strpool[strpool_len++] = 0;
-            toks[ntok].str = start; toks[ntok].slen = len; add_tok(T_STR); continue;
+            toks[ntok].text = new_atom_len(buf, len); add_tok(T_STR); continue;
         }
         if (c == '\'') {
             sp++;
-            int ch;
-            if (SRC[sp] == '\\') { sp++; ch = read_escape(); }
-            else ch = SRC[sp++];
-            if (sp < SRC_LEN && SRC[sp] == '\'') sp++;
+            int ch = SRC[sp];
+            if (ch == '\\' && SRC[sp+1]) { sp++; ch = read_escape(); }
+            else if (ch) sp++;
+            if (SRC[sp] == '\'') sp++;
+            else die("malformed character constant");
             toks[ntok].ival = ch; add_tok(T_CHAR); continue;
         }
-
-        char c2 = (sp + 1 < SRC_LEN) ? SRC[sp+1] : 0;
-        if (c == '.' && c2 == '.' && sp + 2 < SRC_LEN && SRC[sp+2] == '.') {
-            sp += 3; add_tok(T_ELLIPSIS); continue;      // '...' varargs marker
+        if (c == '.') {
+            if (isdigit((unsigned char)SRC[sp+1])) { die("floating point not supported"); }
+            if (SRC[sp+1] == '.' && SRC[sp+2] == '.') {
+                sp += 3; add_tok(T_ELLIPSIS); continue;
+            }
+            sp += 1; add_tok(T_DOT); continue;
         }
-        #define TWO(a,b,K)  if (c==a && c2==b) { sp += 2; add_tok(K); goto next; }
-        TWO('=','=',T_EQ) TWO('!','=',T_NE) TWO('<','=',T_LE) TWO('>','=',T_GE)
-        TWO('&','&',T_ANDAND) TWO('|','|',T_OROR)
-        TWO('<','<',T_SHL) TWO('>','>',T_SHR)
-        TWO('+','+',T_INC) TWO('-','-',T_DEC) TWO('-','>',T_ARROW)
-        TWO('+','=',T_PLUSEQ) TWO('-','=',T_MINUSEQ) TWO('*','=',T_STAREQ)
-        TWO('/','=',T_SLASHEQ) TWO('%','=',T_PERCENTEQ)
-        #undef TWO
-        sp++;
-        switch (c) {
-            case '+': add_tok(T_PLUS);   break;  case '-': add_tok(T_MINUS);  break;
-            case '*': add_tok(T_STAR);   break;  case '/': add_tok(T_SLASH);  break;
-            case '%': add_tok(T_PERCENT);break;  case '=': add_tok(T_ASSIGN); break;
-            case '<': add_tok(T_LT);     break;  case '>': add_tok(T_GT);     break;
-            case '!': add_tok(T_NOT);    break;  case '&': add_tok(T_AMP);    break;
-            case '(': add_tok(T_LP);     break;  case ')': add_tok(T_RP);     break;
-            case '[': add_tok(T_LBRK);   break;  case ']': add_tok(T_RBRK);   break;
-            case '{': add_tok(T_LBRACE); break;  case '}': add_tok(T_RBRACE); break;
-            case ';': add_tok(T_SEMI);   break;  case ',': add_tok(T_COMMA);  break;
-            case '?': add_tok(T_QUESTION);break; case ':': add_tok(T_COLON);  break;
-            case '.': add_tok(T_DOT);    break;
-            case '|': add_tok(T_BITOR);  break;  case '^': add_tok(T_BITXOR); break;
-            case '~': add_tok(T_BITNOT); break;
-            default:  die("unknown character in source");
+        if (c == '-' && SRC[sp+1] == '>') { sp += 2; add_tok(T_ARROW); continue; }
+        const char *p = ops;
+        while (p < ops + sizeof(ops) && *p && *p != c) p += 5;
+        if (*p) {
+            if (p[2] && SRC[sp+1] == c) {
+                if (p[4] && SRC[sp+2] == '=') { sp += 3; add_tok(p[4]); continue; }
+                else { sp += 2; add_tok(p[2]); continue; }
+            }
+            if (p[3] && SRC[sp+1] == '=') { sp += 2; add_tok(p[3]); continue; }
+            else { sp += 1; add_tok(p[1]); continue; }
         }
-        next: ;
+        warning(lineno, "unknown character '%c' in source", c);
+        sp += 1;
+        continue;
     }
+    if (verbose) printf("Tokenized: %d tokens\n", ntok);
 }
 
 // =====================================================================
 // 3. TYPES
 // =====================================================================
-enum { TY_INT, TY_CHAR, TY_LONG, TY_VOID, TY_PTR, TY_STRUCT };
+enum { TY_INT, TY_CHAR, TY_LONG, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM };
 typedef struct Type Type;
-typedef struct Member { char name[256]; Type *type; int offset; struct Member *next; } Member;
+typedef struct Member { atom_t name; Type *type; int offset, align, pad; struct Node *init; struct Member *next; } Member;
 struct Type {
-    int kind; Type *ptr; int is_array; int arr_len;
-    Member *members; int struct_size; char tag[256];  // TY_STRUCT
+    char kind, align; int arr_len; Type *ptr; struct Node *arr_len_expr;
+    Member *members; int struct_size; atom_t tag;  // TY_STRUCT / TY_UNION
 };
 
-static Type *ty_int(void)  { static Type t = { TY_INT,  0, 0, 0, 0, 0, {0} }; return &t; }
-static Type *ty_char(void) { static Type t = { TY_CHAR, 0, 0, 0, 0, 0, {0} }; return &t; }
-static Type *ty_long(void) { static Type t = { TY_LONG, 0, 0, 0, 0, 0, {0} }; return &t; }
-static Type *ty_void(void) { static Type t = { TY_VOID, 0, 0, 0, 0, 0, {0} }; return &t; }
+static Type ty_int_s  = { TY_INT,  8, 0, 0, 0, 0, 0, 0 };
+static Type ty_char_s = { TY_CHAR, 1, 0, 0, 0, 0, 0, 0 };
+static Type ty_long_s = { TY_LONG, 8, 0, 0, 0, 0, 0, 0 };
+static Type ty_void_s = { TY_VOID, 1, 0, 0, 0, 0, 0, 0 };
+
+static Type *ty_int(void)  { return &ty_int_s; }
+static Type *ty_char(void) { return &ty_char_s; }
+static Type *ty_long(void) { return &ty_long_s; }
+static Type *ty_void(void) { return &ty_void_s; }
 
 static Type *ptr_to(Type *base) {
-    Type *t = calloc(1, sizeof(Type)); t->kind = TY_PTR; t->ptr = base; return t;
+    Type *t = allocz(1, sizeof(Type)); t->kind = TY_PTR; t->ptr = base; return t;
 }
 static int ty_size(Type *t) {
-    if (t->is_array) return t->arr_len * ty_size(t->ptr);
     switch (t->kind) {
+        case TY_ARRAY:  return t->arr_len * ty_size(t->ptr);
         case TY_CHAR:   return 1;
         case TY_VOID:   return 0;
-        case TY_STRUCT: return t->struct_size;
+        case TY_STRUCT: case TY_UNION: return t->struct_size;
         default:        return 8;
     }
 }
-static Member *find_member(Type *st, const char *name) {
+static int ty_align(Type *t) { return t->align; }
+static Member *find_member(Type *st, atom_t name) {
     if (st->kind == TY_PTR) st = st->ptr;
-    for (Member *m = st->members; m; m = m->next) if (!strcmp(m->name, name)) return m;
+    for (Member *m = st->members; m; m = m->next) if (m->name == name) return m;
     return NULL;
 }
 // element size for pointer/array arithmetic (bytes per step); 0 if not a pointer
 static int elem_size(Type *t) {
-    if (t->is_array) return ty_size(t->ptr);
+    if (t->kind == TY_ARRAY) return ty_size(t->ptr);
     if (t->kind == TY_PTR) { int s = ty_size(t->ptr); return s ? s : 1; }
     return 0;
 }
-static int is_ptrish(Type *t) { return t->is_array || t->kind == TY_PTR; }
+static int is_ptrish(Type *t) { return t->kind == TY_ARRAY || t->kind == TY_PTR; }
+static bool same_type(Type *t1, Type *t2) {
+    if (t1 && t2) {
+        if (t1->kind != t2->kind) return false;
+        switch (t1->kind) {
+        case TY_ARRAY: return t1->arr_len == t2->arr_len && same_type(t1->ptr, t2->ptr);
+        case TY_PTR:   return same_type(t1->ptr, t2->ptr);
+        case TY_STRUCT: case TY_UNION: case TY_ENUM: return t1->tag == t2->tag;
+        }
+    }
+    return t1 == t2;
+}
 
 // =====================================================================
 // 4. AST
@@ -512,69 +826,120 @@ enum {
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
     N_MEMBER, N_SIZEOF,
-    N_SWITCH, N_CASE, N_DEFAULT
+    N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
 };
 
+#define HAS_BREAK     1     // bits in n->ival
+#define HAS_CONTINUE  2
 typedef struct Node Node;
 struct Node {
     int   kind;
-    int   op;               // token kind for N_BIN / N_POST (T_INC/T_DEC)
-    long  ival;             // N_NUM
-    char *str; int slen;    // N_STR
-    char  name[256];        // N_VAR / N_CALL / N_DECL
+    char  op;               // token kind for N_BIN / N_POST (T_INC/T_DEC)
+    bool  unused;           // N_ASSIGN: is assigned value used
+    long  ival;             // N_NUM, N_CASE, N_DEFAULT, N_LABEL, N_FOR, N_DO, N_WHILE, N_SWITCH
+    atom_t str;             // N_STR, N_ASM decoded text
+    atom_t name;            // N_VAR / N_CALL / N_DECL
+    int   lineno;
     Type *type;             // result / declared type
-    Node *lhs, *rhs, *cond, *els, *init;
+    Node *lhs, *rhs, *cond, *init, *cases;
     Node *args[8]; int nargs;
     Node *body[512]; int nbody;   // N_BLOCK statements
-    char *asmtext;                // N_ASM decoded text
 };
 
-static Node *new_node(int k) { Node *n = calloc(1, sizeof(Node)); n->kind = k; n->ival = -1; return n; }
+static Token *cur(void);
+static Node *new_node(int k) {
+    Node *n = allocz(1, sizeof(Node));
+    n->kind = k; n->lineno = cur()->lineno; n->op = cur()->kind;
+    return n;
+}
+static Node *new_node1(int k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
+static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
+static Node *new_num_node(long ival, Type *t) { Node *n = new_node(N_NUM); n->ival = ival; n->type = t; return n; }
+static void error(Node *n, const char *fmt, ...) attr_printf(2,3);
+static void error(Node *n, const char *fmt, ...) {
+    int pos = n ? n->lineno : cur()->lineno;
+    va_list a; va_start(a, fmt); err_message(pos, "error", fmt, a); va_end(a);
+    exit(1);
+}
+static Type *array_of(Type *base, Node *len_expr) {
+    Type *arr = allocz(1, sizeof(Type)); arr->kind = TY_ARRAY; arr->ptr = base;
+    arr->arr_len = -1;
+    arr->arr_len_expr = len_expr;
+    if (len_expr && len_expr->kind == N_NUM) arr->arr_len = len_expr->ival;
+    return arr;
+}
 
 // ---- symbols ----
-typedef struct Sym { char name[256]; Type *type; int is_global; int offset; struct Sym *next; } Sym;
-static Sym *globals = NULL;
+typedef struct Sym { atom_t name; int pos; Type *type; bool is_global, is_constant; int offset;
+                     struct Node *init; long ival; struct Sym *next; } Sym;
+static Sym *globals, *globals_tail;
 
 // per-function local table (params + locals), built during offset pass
-static Sym *locals = NULL;
-static int  frame_size = 0;
+static Sym *locals;
+static int  frame_size;
 
-static Sym *sym_find(Sym *list, const char *name) {
-    for (; list; list = list->next) if (!strcmp(list->name, name)) return list;
+static Sym *sym_find(Sym *list, atom_t name) {
+    for (; list; list = list->next) if (list->name == name) return list;
     return NULL;
 }
-static Sym *add_global(const char *name, Type *t) {
-    Sym *s = calloc(1, sizeof(Sym)); snprintf(s->name, sizeof(s->name), "%s", name);
-    s->type = t; s->is_global = 1; s->next = globals; globals = s; return s;
+static Sym *add_global(atom_t name, int pos, Type *t) {
+    Sym *s = allocz(1, sizeof(Sym)); s->name = name; s->pos = pos;
+    s->type = t; s->is_global = 1;
+    if (globals) globals_tail->next = s; else globals = s;
+    return globals_tail = s;
+}
+
+static int ntypedefs;
+static Node *typedefs[256];
+static void add_typedef(Node *n) {
+    if (ntypedefs >= 256) die("too many typedefs");
+    typedefs[ntypedefs++] = n;
+}
+static Type *find_typedef(atom_t name) {
+    for (int i = 0; i < ntypedefs; i++) {
+        if (typedefs[i]->name == name) return typedefs[i]->type;
+    }
+    return NULL;
 }
 
 // =====================================================================
 // 5. PARSER
 // =====================================================================
-static int  P = 0;                       // token cursor
+static int  P;                       // token cursor
 static Token *cur(void) { return &toks[P]; }
 static int  at(int k)   { return toks[P].kind == k; }
 static int  eat(int k)  { if (toks[P].kind == k) { P++; return 1; } return 0; }
-static void expect(int k) { if (!eat(k)) { fprintf(stderr, "nano_cc: parse error near token %d (kind %d)\n", P, toks[P].kind); exit(1); } }
+static void expect(int k) { if (!eat(k)) { error(NULL, "expected '%s', got '%s'", token_name[k], token_str(cur())); } }
 
-static int is_type_start(int k) {
-    return k == T_KINT || k == T_KLONG || k == T_KCHAR || k == T_KVOID ||
-           k == T_KSTRUCT || k == T_KUNION;
+static atom_t getid(void) {
+    if (toks[P].kind == T_ID) return toks[P++].text;
+    expect(T_ID); return 0;
+}
+
+static bool is_type_start(Token *t) {
+    int k = t->kind;
+    if (k == K_INT || k == K_LONG || k == K_CHAR || k == K_VOID ||
+        k == K_ENUM || k == K_STRUCT || k == K_UNION) return true;
+    if (k == T_ID && find_typedef(t->text)) return true;
+    return false;
 }
 
 // ---- struct/union tag table ----
-typedef struct Tag { char name[256]; Type *type; struct Tag *next; } Tag;
-static Tag *tags = NULL;
-static Type *tag_find(const char *name) {
-    for (Tag *t = tags; t; t = t->next) if (!strcmp(t->name, name)) return t->type;
-    return NULL;
-}
-static Type *tag_get(const char *name) {          // find or forward-declare
-    Type *t = tag_find(name);
-    if (t) return t;
-    t = calloc(1, sizeof(Type)); t->kind = TY_STRUCT; snprintf(t->tag, sizeof(t->tag), "%s", name);
-    Tag *e = calloc(1, sizeof(Tag)); snprintf(e->name, sizeof(e->name), "%s", name);
-    e->type = t; e->next = tags; tags = e;
+// XXX: these should be global/local based
+typedef struct Tag { atom_t name; Type *type; int kind; struct Tag *next; } Tag;
+static Tag *tags;
+static Type *tag_get(atom_t name, int kind) { // find or forward-declare
+    if (name) {
+        for (Tag *e = tags; e; e = e->next) {
+            if (e->name == name && e->kind == kind) return e->type;
+        }
+    }
+    Type *t = allocz(1, sizeof(Type)); t->kind = kind; t->tag = name;
+    if (name) {
+        Tag *e = allocz(1, sizeof(Tag));
+        e->name = name; e->kind = kind; e->type = t;
+        e->next = tags; tags = e;
+    }
     return t;
 }
 
@@ -583,42 +948,99 @@ static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(void);
 
+static int  label_num;
+static Node *this_switch;
+static Node *this_loop;
+static struct Label *add_label(atom_t name, int num);
+static struct Label *find_label(atom_t name);
+static Node *parse_const_expr(void);
+static Node *parse_init(void);
+static bool eval_expr(Node *n, long *vp);
+
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
-static Type *parse_struct_specifier(void) {
-    int is_union = eat(T_KUNION); if (!is_union) expect(T_KSTRUCT);
-    char tag[256] = {0};
-    if (at(T_ID)) { snprintf(tag, sizeof(tag), "%s", cur()->text); P++; }
-    Type *st;
-    if (tag[0]) st = tag_get(tag);
-    else { st = calloc(1, sizeof(Type)); st->kind = TY_STRUCT; }
+static Type *parse_struct(int kind) {
+    atom_t tag = at(T_ID) ? getid() : 0;
+    Type *st = tag_get(tag, kind);
     if (eat(T_LBRACE)) {                           // definition
+        if (st->members) error(NULL, "%s already has a definition", atom_str(kind));
         Member *head = NULL, *tail = NULL;
         int off = 0, maxsz = 0;
+        st->align = 1;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             Type *mbase = parse_type_base_only();
             for (;;) {
                 Type *mt = mbase;
                 while (eat(T_STAR)) mt = ptr_to(mt);
-                char mnm[256]; snprintf(mnm, sizeof(mnm), "%s", cur()->text); expect(T_ID);
-                if (eat(T_LBRK)) {                 // array member
-                    long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-                    Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = mt;
-                    arr->is_array = 1; arr->arr_len = (int)len; mt = arr;
+                atom_t mnm = getid();
+                while (eat(T_LBRK)) {                 // array member
+                    Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+                    mt = array_of(mt, len_expr);
+                    expect(T_RBRK);
                 }
                 int msz = ty_size(mt);
-                int align = msz < 8 ? (msz ? msz : 1) : 8;
-                Member *m = calloc(1, sizeof(Member));
-                snprintf(m->name, sizeof(m->name), "%s", mnm); m->type = mt;
-                if (is_union) { m->offset = 0; if (msz > maxsz) maxsz = msz; }
-                else { off = (off + align - 1) & ~(align - 1); m->offset = off; off += msz; }
-                if (!head) head = tail = m; else { tail->next = m; tail = m; }
+                int align = ty_align(mt);
+                if (align > st->align) st->align = align;
+                Member *m = allocz(1, sizeof(Member));
+                m->name = mnm; m->type = mt;
+                if (tail) { // set padding bytes in previous element
+                    int off0 = off;
+                    off = (off + align - 1) & ~(align - 1);
+                    tail->pad = off - off0;
+                    tail->next = m;
+                } else {
+                    head = m;
+                }
+                tail = m;
+                if (kind == TY_UNION) {
+                    if (msz > maxsz) maxsz = msz;
+                } else {
+                    m->offset = off; off += msz;
+                }
                 if (!eat(T_COMMA)) break;
             }
             expect(T_SEMI);
         }
         expect(T_RBRACE);
         st->members = head;
-        st->struct_size = is_union ? ((maxsz + 7) & ~7) : ((off + 7) & ~7);
+        if (kind == TY_UNION) {
+            st->struct_size = (maxsz + st->align - 1) & ~(st->align - 1);
+            for (Member *m = head; m; m = m->next) m->pad = st->struct_size - ty_size(m->type);
+        } else {
+            st->struct_size = (off + st->align - 1) & ~(st->align - 1);
+            if (tail) tail->pad = st->struct_size - off;
+        }
+    }
+    return st;
+}
+
+// enum specifier:  enum [tag] [ { members [= value], } ]
+static Type *parse_enum(void) {
+    atom_t tag = at(T_ID) ? getid() : 0;
+    Type *st = tag_get(tag, TY_ENUM);
+    if (eat(T_LBRACE)) {                           // definition
+        Member **tailp = &st->members;
+        long off = 0;
+        while (!at(T_RBRACE) && !at(T_EOF)) {
+            int pos = toks[P].lineno;
+            atom_t name = getid();
+            Member *m = allocz(1, sizeof(Member));
+            m->name = name;
+            if (eat(T_ASSIGN)) {
+                m->init = parse_const_expr();
+                if (!eval_expr(m->init, &off))
+                    error(m->init, "expression is not constant");
+            }
+            m->offset = off++;
+            *tailp = m;
+            tailp = &m->next;
+            Sym *s = add_global(name, pos, st);
+            s->is_global = 1;
+            s->is_constant = 1;
+            s->ival = off;
+            s->init = m->init;
+            if (!eat(T_COMMA)) break;
+        }
+        expect(T_RBRACE);
     }
     return st;
 }
@@ -633,7 +1055,7 @@ static Type *parse_type(void) {
 static Node *parse_primary(void) {
     if (eat(T_LP)) {
         // cast?  ( type ) unary
-        if (is_type_start(cur()->kind)) {
+        if (is_type_start(cur())) {
             Type *t = parse_type();
             expect(T_RP);
             Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_assign();
@@ -641,147 +1063,151 @@ static Node *parse_primary(void) {
         }
         Node *n = parse_expr(); expect(T_RP); return n;
     }
-    if (at(T_NUM))  { Node *n = new_node(N_NUM);  n->ival = cur()->ival; n->type = ty_long(); P++; return n; }
-    if (at(T_CHAR)) { Node *n = new_node(N_NUM);  n->ival = cur()->ival; n->type = ty_int();  P++; return n; }
-    if (at(T_STR))  { Node *n = new_node(N_STR);  n->str  = cur()->str;  n->slen = cur()->slen;
+    if (at(T_NUM))  { Node *n = new_num_node(cur()->ival, ty_long()); P++; return n; }
+    if (at(T_CHAR)) { Node *n = new_num_node(cur()->ival, ty_int());  P++; return n; }
+    if (at(T_STR))  { Node *n = new_node(N_STR); n->str = cur()->text;
                       n->type = ptr_to(ty_char()); P++; return n; }
     if (at(T_ID)) {
-        char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); P++;
-        if (eat(T_LP)) {                       // function call
-            Node *n = new_node(N_CALL); snprintf(n->name, sizeof(n->name), "%s", nm);
+        atom_t nm = getid();
+        if (at(T_LP)) {                       // function call
+            Node *n = new_node(N_CALL); P++; n->name = nm;
             while (!at(T_RP)) {
                 n->args[n->nargs++] = parse_assign();
                 if (!eat(T_COMMA)) break;
             }
-            expect(T_RP); n->type = ty_long(); return n;
+            expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
         }
-        Node *n = new_node(N_VAR); snprintf(n->name, sizeof(n->name), "%s", nm); return n;
+        P--; Node *n = new_node(N_VAR); P++; n->name = nm; return n;
     }
-    die("expression expected"); return 0;
+    error(NULL, "expected expression, got '%s'", token_str(cur())); return 0;
 }
 
 // postfix: primary ( [expr] | ++ | -- )*
 static Node *parse_postfix(void) {
     Node *n = parse_primary();
     for (;;) {
-        if (eat(T_LBRK)) {                     // a[i]  ->  *(a + i)
-            Node *idx = parse_expr(); expect(T_RBRK);
-            Node *add = new_node(N_BIN); add->op = T_PLUS; add->lhs = n; add->rhs = idx;
-            Node *d = new_node(N_DEREF); d->lhs = add; n = d;
-        } else if (eat(T_DOT)) {               // a.field
-            Node *m = new_node(N_MEMBER); m->lhs = n;
-            snprintf(m->name, sizeof(m->name), "%s", cur()->text); expect(T_ID); n = m;
-        } else if (eat(T_ARROW)) {             // p->field  ==  (*p).field
-            Node *d = new_node(N_DEREF); d->lhs = n;
-            Node *m = new_node(N_MEMBER); m->lhs = d;
-            snprintf(m->name, sizeof(m->name), "%s", cur()->text); expect(T_ID); n = m;
-        } else if (at(T_INC) || at(T_DEC)) {
-            Node *p = new_node(N_POST); p->op = cur()->kind; p->lhs = n; P++; n = p;
-        } else break;
+        switch (toks[P].kind) {
+        case T_LBRK:              // a[i]  ->  *(a + i)
+            n = new_bin_node(n); n->op = T_PLUS;
+            n = new_node1(N_DEREF, n); P++;
+            n->lhs->rhs = parse_expr();
+            expect(T_RBRK);
+            break;
+        case T_DOT:               // a.field
+            n = new_node1(N_MEMBER, n); P++;
+            n->name = getid();
+            break;
+        case T_ARROW:             // p->field  ==  (*p).field
+            n = new_node1(N_DEREF, n);
+            n = new_node1(N_MEMBER, n); P++;
+            n->name = getid();
+            break;
+        case T_INC: case T_DEC:
+            n = new_node1(N_POST, n); P++;
+            break;
+        default:
+            return n;
+        }
     }
-    return n;
 }
 
 static Node *parse_unary(void) {
-    if (eat(T_KSIZEOF)) {
-        Node *n = new_node(N_SIZEOF);
-        if (at(T_LP) && is_type_start(toks[P+1].kind)) { P++; n->type = parse_type(); expect(T_RP); }
+    switch (toks[P].kind) {
+    case K_SIZEOF: {
+        Node *n = new_node(N_SIZEOF); P++;
+        if (at(T_LP) && is_type_start(&toks[P+1])) { P++; n->type = parse_type(); expect(T_RP); }
         else n->lhs = parse_unary();
         return n;
     }
-    if (eat(T_MINUS)) { Node *n = new_node(N_UNARY); n->op = T_MINUS;  n->lhs = parse_unary(); return n; }
-    if (eat(T_NOT))   { Node *n = new_node(N_UNARY); n->op = T_NOT;    n->lhs = parse_unary(); return n; }
-    if (eat(T_BITNOT)){ Node *n = new_node(N_UNARY); n->op = T_BITNOT; n->lhs = parse_unary(); return n; }
-    if (eat(T_STAR))  { Node *n = new_node(N_DEREF); n->lhs = parse_unary(); return n; }
-    if (eat(T_AMP))   { Node *n = new_node(N_ADDR);  n->lhs = parse_unary(); return n; }
-    if (at(T_INC) || at(T_DEC)) {            // prefix ++x / --x
-        Node *n = new_node(N_PRE); n->op = cur()->kind; P++; n->lhs = parse_unary(); return n;
+    case T_MINUS:
+    case T_NOT:
+    case T_BITNOT: { Node *n = new_node(N_UNARY); P++; n->lhs = parse_unary(); return n; }
+    case T_STAR:   { Node *n = new_node(N_DEREF); P++; n->lhs = parse_unary(); return n; }
+    case T_AMP:    { Node *n = new_node(N_ADDR);  P++; n->lhs = parse_unary(); return n; }
+    case T_INC:
+    case T_DEC:    { Node *n = new_node(N_PRE); P++; n->lhs = parse_unary(); return n; }
     }
     return parse_postfix();
 }
 
-static Node *bin(int op, Node *l, Node *r) {
-    Node *n = new_node(N_BIN); n->op = op; n->lhs = l; n->rhs = r; return n;
-}
 static Node *parse_mul(void) {
     Node *n = parse_unary();
-    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { int op = cur()->kind; P++; n = bin(op, n, parse_unary()); }
+    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { n = new_bin_node(n); P++; n->rhs = parse_unary(); }
     return n;
 }
 static Node *parse_add(void) {
     Node *n = parse_mul();
-    while (at(T_PLUS) || at(T_MINUS)) { int op = cur()->kind; P++; n = bin(op, n, parse_mul()); }
+    while (at(T_PLUS) || at(T_MINUS)) { n = new_bin_node(n); P++; n->rhs = parse_mul(); }
     return n;
 }
 // C precedence:  <<  >>  bind tighter than the relational operators.
 static Node *parse_shift(void) {
     Node *n = parse_add();
-    while (at(T_SHL) || at(T_SHR)) { int op = cur()->kind; P++; n = bin(op, n, parse_add()); }
+    while (at(T_SHL) || at(T_SHR)) { n = new_bin_node(n); P++; n->rhs = parse_add(); }
     return n;
 }
 static Node *parse_rel(void) {
     Node *n = parse_shift();
-    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { int op = cur()->kind; P++; n = bin(op, n, parse_shift()); }
+    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_bin_node(n); P++; n->rhs = parse_shift(); }
     return n;
 }
 static Node *parse_eq(void) {
     Node *n = parse_rel();
-    while (at(T_EQ) || at(T_NE)) { int op = cur()->kind; P++; n = bin(op, n, parse_rel()); }
+    while (at(T_EQ) || at(T_NE)) { n = new_bin_node(n); P++; n->rhs = parse_rel(); }
     return n;
 }
 // Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
 static Node *parse_band(void) {
     Node *n = parse_eq();
-    while (at(T_AMP)) { P++; n = bin(T_AMP, n, parse_eq()); }
+    while (at(T_AMP)) { n = new_bin_node(n); P++; n->rhs = parse_eq(); }
     return n;
 }
 static Node *parse_bxor(void) {
     Node *n = parse_band();
-    while (at(T_BITXOR)) { P++; n = bin(T_BITXOR, n, parse_band()); }
+    while (at(T_BITXOR)) { n = new_bin_node(n); P++; n->rhs = parse_band(); }
     return n;
 }
 static Node *parse_bor(void) {
     Node *n = parse_bxor();
-    while (at(T_BITOR)) { P++; n = bin(T_BITOR, n, parse_bxor()); }
+    while (at(T_BITOR)) { n = new_bin_node(n); P++; n->rhs = parse_bxor(); }
     return n;
 }
 static Node *parse_land(void) {
     Node *n = parse_bor();
-    while (eat(T_ANDAND)) { Node *a = new_node(N_LOGAND); a->lhs = n; a->rhs = parse_bor(); n = a; }
+    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); }
     return n;
 }
 static Node *parse_lor(void) {
     Node *n = parse_land();
-    while (eat(T_OROR)) { Node *a = new_node(N_LOGOR); a->lhs = n; a->rhs = parse_land(); n = a; }
+    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); }
     return n;
 }
 static Node *parse_ternary(void) {
     Node *n = parse_lor();
-    if (eat(T_QUESTION)) {
-        Node *t = new_node(N_TERNARY);
+    if (at(T_QUESTION)) {
+        Node *t = new_node(N_TERNARY); P++;
         t->cond = n; t->lhs = parse_expr(); expect(T_COLON); t->rhs = parse_ternary();
         return t;
     }
     return n;
 }
+static Node *parse_const_expr(void) { return parse_ternary(); }
 static Node *parse_assign(void) {
     Node *n = parse_ternary();
-    if (eat(T_ASSIGN)) {
-        Node *a = new_node(N_ASSIGN); a->lhs = n; a->rhs = parse_assign(); return a;
-    }
-    // compound assignment  x op= y  ->  x = x op y   (lhs reused; safe for our inputs)
-    int op = 0;
-    if      (eat(T_PLUSEQ))    op = T_PLUS;
-    else if (eat(T_MINUSEQ))   op = T_MINUS;
-    else if (eat(T_STAREQ))    op = T_STAR;
-    else if (eat(T_SLASHEQ))   op = T_SLASH;
-    else if (eat(T_PERCENTEQ)) op = T_PERCENT;
-    if (op) {
-        Node *a = new_node(N_ASSIGN); a->lhs = n; a->rhs = bin(op, n, parse_assign()); return a;
+    switch (toks[P].kind) {
+    case T_ASSIGN:  case T_PLUSEQ:  case T_MINUSEQ:  case T_STAREQ:
+    case T_SLASHEQ:  case T_PERCENTEQ:  case T_OREQ:  case T_ANDEQ:
+    case T_XOREQ:  case T_SHLEQ:  case T_SHREQ:
+        n = new_node1(N_ASSIGN, n); P++; n->rhs = parse_assign();
+        break;
     }
     return n;
 }
-static Node *parse_expr(void) { return parse_assign(); }
+static Node *parse_expr(void) {
+    Node *n = parse_assign();
+    while (at(T_COMMA)) { n = new_bin_node(n); P++; n->rhs = parse_assign(); }
+    return n;
+}
 
 // a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
 static Node *parse_decl_stmt(void) {
@@ -791,14 +1217,19 @@ static Node *parse_decl_stmt(void) {
     for (;;) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
-        char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
-        if (eat(T_LBRK)) {                          // array: char buf[24];
-            long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-            Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = t;
-            arr->is_array = 1; arr->arr_len = (int)len; t = arr;
+        atom_t nm = getid();
+        while (eat(T_LBRK)) {                          // array: char buf[24];
+            Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+            t = array_of(t, len_expr);
+            expect(T_RBRK);
         }
-        Node *d = new_node(N_DECL); snprintf(d->name, sizeof(d->name), "%s", nm); d->type = t;
-        if (eat(T_ASSIGN)) d->init = parse_assign();
+        Node *d = new_node(N_DECL); d->name = nm; d->type = t;
+        if (eat(T_ASSIGN)) {
+            d->init = parse_init();
+            if (t->kind == TY_ARRAY && t->arr_len < 0 && d->init->kind == N_BLOCK) {
+                t->arr_len = d->init->nbody;
+            }
+        }
         blk->body[blk->nbody++] = d;
         if (!eat(T_COMMA)) break;
     }
@@ -807,17 +1238,54 @@ static Node *parse_decl_stmt(void) {
 }
 // parse just the base type (no trailing stars) — stars belong to each declarator
 static Type *parse_type_base_only(void) {
-    if (at(T_KSTRUCT) || at(T_KUNION)) return parse_struct_specifier();
-    if      (eat(T_KINT))  return ty_int();
-    if      (eat(T_KLONG)) return ty_long();
-    if      (eat(T_KCHAR)) return ty_char();
-    if      (eat(T_KVOID)) return ty_void();
-    die("type expected"); return 0;
+    if (eat(K_STRUCT)) return parse_struct(TY_STRUCT);
+    if (eat(K_UNION))  return parse_struct(TY_UNION);
+    if (eat(K_ENUM))   return parse_enum();
+    if (eat(K_INT))    return ty_int();
+    if (eat(K_LONG))   return ty_long();
+    if (eat(K_CHAR))   return ty_char();
+    if (eat(K_VOID))   return ty_void();
+    if (at(T_ID)) {
+        Type *type = find_typedef(toks[P].text);
+        if (type) { P++; return type; }
+    }
+    error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
+}
+static Node *parse_typedef(void) {
+    P++;    // skip 'typedef'
+    Node *n = parse_decl_stmt();
+    n->op = K_TYPEDEF;
+    return n;
+}
+
+static Node *parse_init(void) {
+    if (at(T_LBRACE)) {
+        Node *n = new_node(N_BLOCK); P++;
+        while (!at(T_RBRACE) && !at(T_EOF)) {
+            n->body[n->nbody++] = parse_init();
+            if (!eat(T_COMMA)) break;
+        }
+        expect(T_RBRACE);
+        return n;
+    } else {
+        return parse_assign();
+    }
+}
+
+static Node *parse_loop_body(Node *n) {
+    Node *save_this_loop = this_loop;
+    Node *save_this_switch = this_switch;
+    this_loop = n;
+    this_switch = NULL;
+    Node *lhs = parse_stmt();
+    this_loop = save_this_loop;
+    this_switch = save_this_switch;
+    return lhs;
 }
 
 static Node *parse_block(void) {
-    expect(T_LBRACE);
-    Node *n = new_node(N_BLOCK);
+    if (!at(T_LBRACE)) expect(T_LBRACE);
+    Node *n = new_node(N_BLOCK); P++;
     while (!at(T_RBRACE) && !at(T_EOF)) n->body[n->nbody++] = parse_stmt();
     expect(T_RBRACE);
     return n;
@@ -825,118 +1293,313 @@ static Node *parse_block(void) {
 
 static Node *parse_stmt(void) {
     if (at(T_LBRACE)) return parse_block();
-    if (eat(T_SEMI))  return new_node(N_EMPTY);
-    if (eat(T_KIF)) {
-        Node *n = new_node(N_IF);
+    if (at(T_SEMI))  { Node *n = new_node(N_EMPTY); P++; return n; }
+    if (at(K_IF)) {
+        Node *n = new_node(N_IF); P++;
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_stmt();
-        if (eat(T_KELSE)) n->els = parse_stmt();
+        if (eat(K_ELSE)) n->rhs = parse_stmt();
         return n;
     }
-    if (eat(T_KWHILE)) {
-        Node *n = new_node(N_WHILE);
+    if (at(K_WHILE)) {
+        Node *n = new_node(N_WHILE); P++;
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
-        n->lhs = parse_stmt();
+        n->lhs = parse_loop_body(n);
         return n;
     }
-    if (eat(T_KSWITCH)) {
-        Node *n = new_node(N_SWITCH);
+    if (at(K_SWITCH)) {
+        Node *n = new_node(N_SWITCH); P++;
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
-        n->lhs = parse_stmt();
+        Node *save_this_switch = this_switch;
+        this_switch = n;
+        n->lhs = parse_block();
+        this_switch = save_this_switch;
         return n;
     }
-    if (eat(T_KCASE)) {
-        Node *n = new_node(N_CASE);
-        n->lhs = parse_expr();
+    if (at(K_CASE)) {
+        if (!this_switch) error(NULL, "'case' outside a 'switch' statement");
+        Node *n = new_node(N_CASE); P++;
+        n->ival = ++label_num;
+        n->cond = parse_const_expr();
+        if (this_switch) {  // append node to case list (quadratic but small n)
+            Node **casep = &this_switch->cases;
+            while (*casep) { casep = &(*casep)->lhs; } *casep = n;
+        }
         expect(T_COLON);
         return n;
     }
-    if (eat(T_KDEFAULT)) {
-        Node *n = new_node(N_DEFAULT);
+    if (at(K_DEFAULT))  {
+        if (!this_switch) error(NULL, "'default' outside a 'switch' statement");
+        else if (this_switch->rhs) error(NULL, "duplicate 'default' in 'switch' statement");
+        Node *n = new_node(N_DEFAULT); P++;
+        n->ival = ++label_num;
+        if (this_switch) this_switch->rhs = n;
         expect(T_COLON);
         return n;
     }
-    if (eat(T_KFOR)) {
-        Node *n = new_node(N_FOR);
+    if (at(K_GOTO)) {
+        Node *n = new_node(N_GOTO); P++;
+        n->name = getid();
+        expect(T_SEMI);
+        return n;
+    }
+    if (at(K_FOR)) {
+        Node *n = new_node(N_FOR); P++;
         expect(T_LP);
-        if (is_type_start(cur()->kind)) n->init = parse_decl_stmt();      // consumes ';'
-        else if (!at(T_SEMI)) { Node *e = new_node(N_EXPR); e->lhs = parse_expr(); n->init = e; expect(T_SEMI); }
-        else expect(T_SEMI);
+        if (is_type_start(cur())) n->init = parse_decl_stmt();      // consumes ';'
+        else {
+            if (!at(T_SEMI)) { n->init = new_node(N_EXPR); n->init->lhs = parse_expr(); }
+            expect(T_SEMI);
+        }
         if (!at(T_SEMI)) n->cond = parse_expr();
         expect(T_SEMI);
-        if (!at(T_RP)) n->rhs = parse_expr();                             // step
+        // XXX should accept comma expression
+        if (!at(T_RP)) n->rhs = parse_expr(); // step
         expect(T_RP);
-        n->lhs = parse_stmt();                                            // body
+        n->lhs = parse_loop_body(n);
         return n;
     }
-    if (eat(T_KDO)) {
-        Node *n = new_node(N_DOWHILE);
-        n->lhs = parse_stmt();
-        expect(T_KWHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP); expect(T_SEMI);
+    if (at(K_DO)) {
+        Node *n = new_node(N_DOWHILE); P++;
+        n->lhs = parse_loop_body(n);
+        expect(K_WHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP); expect(T_SEMI);
         return n;
     }
-    if (eat(T_KBREAK))    { expect(T_SEMI); return new_node(N_BREAK); }
-    if (eat(T_KCONTINUE)) { expect(T_SEMI); return new_node(N_CONTINUE); }
-    if (eat(T_KRETURN)) {
-        Node *n = new_node(N_RETURN);
+    if (at(K_BREAK)) {
+        if (this_loop) { this_loop->ival |= HAS_BREAK; }
+        else if (this_switch) { this_switch->ival |= HAS_BREAK; }
+        else { error(NULL, "'break' outside a loop or 'switch' statement"); }
+        Node *n = new_node(N_BREAK); P++; expect(T_SEMI); return n;
+    }
+    if (at(K_CONTINUE)) {
+        if (this_loop) { this_loop->ival |= HAS_CONTINUE; }
+        else error(NULL, "'continue' outside a loop statement");
+        Node *n = new_node(N_CONTINUE); P++; expect(T_SEMI); return n;
+    }
+    if (at(K_RETURN)) {
+        Node *n = new_node(N_RETURN); P++;
         if (!at(T_SEMI)) n->lhs = parse_expr();
         expect(T_SEMI);
         return n;
     }
-    if (at(T_KASM)) {
-        P++;
+    if (at(K_TYPEDEF)) {
+        // XXX: should be handled like a local decl
+        Node *n = parse_typedef();
+        return n;
+    }
+    if (at(K_ASM) || at(K__ASM__)) {
+        Node *n = new_node(N_ASM); P++;
         expect(T_LP);
-        if (!at(T_STR)) die("string expected in __asm__");
-        Node *n = new_node(N_ASM); n->asmtext = cur()->str; P++;
+        if (!at(T_STR)) expect(T_STR);
+        n->str = cur()->text; P++;
         expect(T_RP); expect(T_SEMI);
         return n;
     }
-    if (is_type_start(cur()->kind)) return parse_decl_stmt();
+    if (at(T_ID) && toks[P+1].kind == T_COLON) {
+        Node *n = new_node(N_LABEL);
+        atom_t name = getid();
+        if (find_label(name)) warning(n->lineno, "duplicate label '%s'", atom_str(name));
+        n->name = name;
+        n->ival = ++label_num;
+        add_label(name, (int)n->ival);
+        expect(T_COLON);
+        return n;
+    }
+    if (is_type_start(cur())) return parse_decl_stmt();
     Node *n = new_node(N_EXPR); n->lhs = parse_expr(); expect(T_SEMI);
     return n;
 }
 
+// 5.1 Constant expression evaluator
+
+static Sym *lookup(atom_t name);
+static Type *static_typeof(Node *n);
+
+static bool eval_expr(Node *n, long *vp) {
+    long v1, v2;
+    switch (n->kind) {
+    case N_EXPR: return eval_expr(n->lhs, vp);
+    case N_NUM:  *vp = n->ival; return true;
+    case N_VAR: {
+        Sym *s = lookup(n->name);
+        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
+        if (!s->is_constant) {
+            s->is_constant = eval_expr(s->init, &s->ival);
+            if (!s->is_constant) error(n, "symbol is not constant: '%s'", atom_str(n->name));
+        }
+        *vp = s->ival; return true;
+    }
+    case N_SIZEOF: {
+        Type *t = n->type ? n->type : static_typeof(n->lhs);
+        *vp = ty_size(t);
+        return true;
+    }
+    case N_CAST:
+        if (!eval_expr(n->lhs, vp)) return false;
+        // XXX: should apply cast
+        return true;
+    case N_TERNARY:
+        if (!eval_expr(n->cond, &v1)) return false;
+        return eval_expr(v1 ? n->lhs : n->rhs, vp);
+    case N_UNARY:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        switch (n->op) {
+        case T_MINUS: *vp = -v1; return true;
+        case T_PLUS: *vp = v1; return true;
+        case T_BITNOT: *vp = ~v1; return true;
+        default: break;
+        }
+        break;
+    case N_LOGAND:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        if (v1 && !eval_expr(n->rhs, &v1)) return false;
+        *vp = (v1 != 0);
+        return true;
+    case N_LOGOR:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        if (!v1 && !eval_expr(n->rhs, &v1)) return false;
+        *vp = (v1 != 0);
+        return true;
+    case N_BIN:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        if (!eval_expr(n->rhs, &v2)) return false;
+        switch (n->op) {
+        case T_PLUS:    *vp = v1 + v2;  return true;
+        case T_MINUS:   *vp = v1 - v2;  return true;
+        case T_STAR:    *vp = v1 * v2;  return true;
+        case T_SLASH:   *vp = v1 / v2;  return true;   // XXX: check overflow
+        case T_PERCENT: *vp = v1 % v2;  return true;   // XXX: check overflow
+        case T_AMP:     *vp = v1 & v2;  return true;
+        case T_BITOR:   *vp = v1 | v2;  return true;
+        case T_BITXOR:  *vp = v1 ^ v2;  return true;
+        case T_SHL:     *vp = v1 << v2; return true;
+        case T_SHR:     *vp = v1 >> v2; return true;
+        case T_LT:      *vp = v1 < v2;  return true;
+        case T_GT:      *vp = v1 > v2;  return true;
+        case T_LE:      *vp = v1 <= v2; return true;
+        case T_GE:      *vp = v1 >= v2; return true;
+        case T_EQ:      *vp = v1 == v2; return true;
+        case T_NE:      *vp = v1 != v2; return true;
+        case T_COMMA:   *vp = v2; return true;
+        default:
+            error(n, "bad binary operator '%s'", token_name[n->op]);
+            break;
+        }
+        break;
+    }
+    return false;
+}
+
 // ---- top level ----
-typedef struct Func { char name[256]; Node *params[8]; int nparams; Type *ptype[8];
-                      int is_variadic; Node *body; struct Func *next; } Func;
-static Func *funcs = NULL, *funcs_tail = NULL;
+typedef struct Func { atom_t name; Node *params[8]; int nparams; Type *ptype[8];
+                      bool is_variadic, used; Node *body; Type *rtype; struct Label *labels; struct Func *next; } Func;
+static Func *funcs, **funcs_tail;
+static Func *this_fn;
+
+typedef struct Label Label;
+struct Label { atom_t name; int num; bool used, found; struct Label *next; };
+static Label *add_label(atom_t name, int num) {
+    Label *lab = allocz(1, sizeof(Label));
+    lab->name = name;
+    lab->num = num;
+    lab->next = this_fn->labels;
+    return this_fn->labels = lab;
+}
+static Label *find_label(atom_t name) {
+    for (Label *lab = this_fn->labels; lab; lab = lab->next) {
+        if (lab->name == name) return lab;
+    }
+    return NULL;
+}
+
+static Func *find_func(atom_t name) {
+    for (Func *fn = funcs; fn; fn = fn->next) {
+        if (fn->name == name) return fn;
+    }
+    return NULL;
+}
 
 static void parse_toplevel(void) {
+    if (at(K_TYPEDEF)) {
+        // XXX: should be handled like a decl
+        Node *n = parse_typedef();
+        for (int i = 0; i < n->nbody; i++) { add_typedef(n->body[i]); }
+        return;
+    }
     Type *base = parse_type_base_only();
     if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
     Type *t = base;
     while (eat(T_STAR)) t = ptr_to(t);
-    char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
+    atom_t nm = getid();
 
+    // XXX: parse function pointers and such
     if (eat(T_LP)) {                                   // function definition
-        Func *fn = calloc(1, sizeof(Func)); snprintf(fn->name, sizeof(fn->name), "%s", nm);
+        bool has_prototype = false;
+        Func *fn = find_func(nm);
+        if (fn) {
+            has_prototype = true;
+            if (!same_type(fn->rtype, t))
+                warning(cur()->lineno, "return type mismatch with '%s' function prototype", atom_str(nm));
+        } else {
+            fn = allocz(1, sizeof(Func));
+            fn->name = nm;
+            fn->rtype = t;
+            if (!funcs_tail) funcs_tail = &funcs; *funcs_tail = fn; funcs_tail = &fn->next;
+        }
+        int nparams = 0;
+        bool is_variadic = false;
         while (!at(T_RP)) {
-            if (eat(T_ELLIPSIS)) { fn->is_variadic = 1; break; }   // printf(char *fmt, ...)
+            if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
             Type *pt = parse_type_base_only();
             while (eat(T_STAR)) pt = ptr_to(pt);
             if (pt->kind == TY_VOID && !at(T_ID)) break;   // (void)
             Node *pv = new_node(N_DECL);
-            snprintf(pv->name, sizeof(pv->name), "%s", cur()->text); expect(T_ID);
+            if (at(T_ID)) pv->name = getid();   // argument name is optional
+            while (eat(T_LBRK)) {                 // array member
+                // XXX: handle fake array specification -> pointer
+                Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+                pt = array_of(pt, len_expr);
+                expect(T_RBRK);
+            }
             pv->type = pt;
-            fn->params[fn->nparams] = pv; fn->ptype[fn->nparams] = pt; fn->nparams++;
+            if (has_prototype && fn->ptype[nparams] && !same_type(fn->ptype[nparams], pt))
+                warning(cur()->lineno, "type mismatch with prototype on argument %d", nparams + 1);
+            fn->params[nparams] = pv; fn->ptype[nparams] = pt; nparams++;
             if (!eat(T_COMMA)) break;
         }
         expect(T_RP);
-        if (eat(T_SEMI)) return;                       // prototype / extern decl — no body to emit
-        fn->body = parse_block();
-        if (!funcs) funcs = funcs_tail = fn; else { funcs_tail->next = fn; funcs_tail = fn; }
+        if (has_prototype && (fn->nparams != nparams || fn->is_variadic != is_variadic))
+            warning(cur()->lineno, "argument count mismatch with prototype");
+        fn->is_variadic = is_variadic;
+        fn->nparams = nparams;
+        if (!eat(T_SEMI)) {
+            if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
+            this_fn = fn;
+            fn->body = parse_block(); // prototype / extern decl — no body to emit
+            this_fn = NULL;
+        }
+        if (verbose) printf("-> %s\n", atom_str(nm));
         return;
     }
     // global variable(s):  type name [= ...] (, ...) ;   (initialisers ignored -> .bss)
     for (;;) {
-        if (eat(T_LBRK)) { long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-            Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = t;
-            arr->is_array = 1; arr->arr_len = (int)len; add_global(nm, arr); }
-        else add_global(nm, t);
-        if (eat(T_ASSIGN)) parse_assign();             // parsed & discarded (zero-init in bss)
+        int pos = toks[P].lineno;
+        while (eat(T_LBRK)) {
+            Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+            t = array_of(t, len_expr);
+            expect(T_RBRK);
+        }
+        Sym *sym = add_global(nm, pos, t);
+        if (eat(T_ASSIGN)) {
+            sym->init = parse_init();
+            if (t->kind == TY_ARRAY && t->arr_len < 0 && sym->init->kind == N_BLOCK) {
+                t->arr_len = sym->init->nbody;
+            }
+        }
+        if (verbose) printf("-> %s\n", atom_str(nm));
         if (!eat(T_COMMA)) break;
         t = base; while (eat(T_STAR)) t = ptr_to(t);
-        snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
+        nm = getid();
     }
     expect(T_SEMI);
 }
@@ -944,8 +1607,9 @@ static void parse_toplevel(void) {
 // =====================================================================
 // 6. OFFSET ASSIGNMENT (per function)
 // =====================================================================
-static Sym *add_local(const char *name, Type *t) {
-    Sym *s = calloc(1, sizeof(Sym)); snprintf(s->name, sizeof(s->name), "%s", name);
+// This seems broken: it does not allow the same name to be used in different blocks
+static Sym *add_local(atom_t name, int pos, Type *t) {
+    Sym *s = allocz(1, sizeof(Sym)); s->name = name; s->pos = pos;
     s->type = t; s->is_global = 0;
     int sz = ty_size(t); if (sz < 8) sz = 8; sz = (sz + 7) & ~7;
     frame_size += sz; s->offset = frame_size;
@@ -957,39 +1621,118 @@ static void collect_locals(Node *n) {
     switch (n->kind) {
         case N_BLOCK: for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]); break;
         case N_DECL:
-            if (!sym_find(locals, n->name)) add_local(n->name, n->type);
+            if (!sym_find(locals, n->name)) add_local(n->name, n->lineno, n->type);
             if (n->init) collect_locals(n->init);
             break;
         case N_IF: case N_TERNARY:
-                      collect_locals(n->cond); collect_locals(n->lhs); collect_locals(n->rhs); collect_locals(n->els); break;
+            collect_locals(n->cond); collect_locals(n->lhs); collect_locals(n->rhs); break;
         case N_WHILE: case N_DOWHILE:
-                      collect_locals(n->lhs); collect_locals(n->cond); break;
-        case N_FOR:   collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs); collect_locals(n->lhs); break;
-        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR: case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
-                      collect_locals(n->lhs); break;
+            collect_locals(n->lhs); collect_locals(n->cond); break;
+        case N_FOR:
+            collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs);
+            collect_locals(n->lhs); break;
+        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
+        case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
+            collect_locals(n->lhs); break;
         case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
-                      collect_locals(n->lhs); collect_locals(n->rhs); break;
+            collect_locals(n->lhs); collect_locals(n->rhs); break;
         case N_CALL:  for (int i = 0; i < n->nargs; i++) collect_locals(n->args[i]); break;
+        case N_SWITCH: collect_locals(n->cond); collect_locals(n->lhs); break;
         default: break;
+    }
+}
+
+static bool check_optimize_call(Node *n) {
+    if (!optimize) return false;
+    // optimize some function calls
+    if (n->name == ID_PRINTF) {
+        if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
+        const char *fmt = atom_str(n->args[0]->str);
+        if (!*fmt) { n->kind = N_NUM; n->ival = 0; n->type = ty_long(); return true; }
+        size_t len = strlen(fmt);
+        if (strchr(fmt, '%') || fmt[len-1] != '\n') return false;
+        n->name = ID_PUTS;
+        n->args[0]->str = new_atom_len(fmt, len - 1);
+        return true;
+    }
+    if (n->name == ID_STRLEN) {
+        if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
+        const char *s = atom_str(n->args[0]->str);
+        size_t len = strlen(s); // do not use atom len to allow embedded nuls
+        n->kind = N_NUM; n->ival = strlen(s); n->type = ty_long();
+        return true;
+    }
+    if (n->name == ID_STRCPY) {
+        if (n->nargs != 2 || n->args[1]->kind != N_STR) return false;
+        const char *s = atom_str(n->args[1]->str);
+        size_t len = strlen(s); // do not use atom len to allow embedded nuls
+        n->name = ID_MEMCPY; n->ival = strlen(s); n->type = ty_long();
+        n->args[2] = new_num_node(len + 1, ty_long());
+        n->args[2]->lineno = n->args[1]->lineno;
+        n->nargs = 3;
+        return true;
+    }
+    return false;
+}
+
+static void check_used(Node *n);
+static void check_used_func(atom_t name) {
+    Func *fn = find_func(name);
+    if (fn && !fn->used) {
+        fn->used = true;
+        check_used(fn->body);
+    }
+}
+
+static void check_used(Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+        case N_BLOCK:
+            // XXX: should handle scoping
+            for (int i = 0; i < n->nbody; i++) check_used(n->body[i]); break;
+        case N_DECL: check_used(n->init); break; // XXX: should handle scoping
+        case N_IF: case N_TERNARY:
+            check_used(n->cond); check_used(n->lhs); check_used(n->rhs); break;
+        case N_WHILE: case N_DOWHILE:
+            check_used(n->lhs); check_used(n->cond); break;
+        case N_FOR:
+            // XXX: should handle scoping
+            check_used(n->init); check_used(n->cond); check_used(n->rhs);
+            check_used(n->lhs); break;
+        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
+        case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
+            check_used(n->lhs); break;
+        case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
+            check_used(n->lhs); check_used(n->rhs); break;
+        case N_CALL:
+            if (check_optimize_call(n)) { check_used(n); break; }
+            check_used_func(n->name);
+            for (int i = 0; i < n->nargs; i++) check_used(n->args[i]);
+            break;
+        case N_SWITCH: check_used(n->cond); check_used(n->lhs); break;
+        case N_VAR: break; // XXX: should look up symbol and set used bit
     }
 }
 
 // =====================================================================
 // 7. CODE GENERATION
 // =====================================================================
-static int label_id = 0;
+static int label_id;
 static const char *ARGREG[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
-static int cur_va_off = 0, cur_named = 0;
+static int cur_va_off, cur_named;
 
 static Type *gen_expr(Node *n);       // fwd
 static void  gen_stmt(Node *n);
 
-static Sym *lookup(const char *name) {
+static Sym *lookup(atom_t name) {
     Sym *s = sym_find(locals, name);
     if (!s) s = sym_find(globals, name);
     return s;
+}
+static void promote_rax(int size) {
+    if (size == 1) emit("    movsx rax, al");
 }
 static void load_rax(int size) {                 // rax = *rax (size-aware, signed char)
     if (size == 1) emit("    movsx rax, byte ptr [rax]");
@@ -1004,9 +1747,9 @@ static void store_rcx_rax(int size) {            // *rcx = rax
 static Type *gen_addr(Node *n) {
     if (n->kind == N_VAR) {
         Sym *s = lookup(n->name);
-        if (!s) die("undeclared identifier");
-        if (s->is_global) emit("    lea rax, [rip + %s]", n->name);
-        else              emit("    lea rax, [rbp - %d]", s->offset);
+        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
+        if (s->is_global) emit("    lea rax, [rip + %s]", atom_str(n->name));
+        else              emit("    lea rax, [rbp - %d]  # %s", s->offset, atom_str(n->name));
         return s->type;
     }
     if (n->kind == N_DEREF) {                      // &*p  ==  p
@@ -1016,11 +1759,11 @@ static Type *gen_addr(Node *n) {
     if (n->kind == N_MEMBER) {                      // &(s.field)
         Type *st = gen_addr(n->lhs);               // rax = &struct
         Member *m = find_member(st, n->name);
-        if (!m) die("no such struct member");
-        if (m->offset) emit("    add rax, %d", m->offset);
+        if (!m) error(n, "no such struct member: %s", atom_str(n->name));
+        if (m->offset) emit("    add rax, %d  # %s", m->offset, atom_str(n->name));
         return m->type;
     }
-    die("not an lvalue"); return 0;
+    error(n, "not an lvalue"); return 0;
 }
 
 // best-effort static type inference (used only by sizeof(expr))
@@ -1038,22 +1781,86 @@ static Type *static_typeof(Node *n) {
     }
 }
 
-static void gen_string(Node *n) {
-    int id = label_id++;
-    emit("    .section .rodata");
-    fprintf(fout, ".LC%d: .string \"", id);
-    for (int i = 0; i < n->slen; i++) {
-        unsigned char ch = (unsigned char)n->str[i];
+static int gen_quoted_string(char *buf, size_t size, const char *str, int slen, unsigned char sep) {
+    size_t j = 0;
+    for (int i = 0; i < slen; i++) {
+        unsigned char ch = str[i];
         switch (ch) {
-            case '\n': fputs("\\n", fout); break;  case '\t': fputs("\\t", fout); break;
-            case '\r': fputs("\\r", fout); break;  case '"':  fputs("\\\"", fout); break;
-            case '\\': fputs("\\\\", fout); break;
-            default: if (ch < 32 || ch > 126) fprintf(fout, "\\%03o", ch); else fputc(ch, fout);
+        case '\n': ch = 'n'; goto escape;
+        case '\t': ch = 'n'; goto escape;
+        case '\r': ch = 'r'; goto escape;
+        case '"': case '\'': if (ch == sep) goto escape; else goto normal;
+        case '\\':
+        escape:
+            if (j + 2 >= size) break;
+            buf[j++] = '\\'; buf[j++] = ch;
+            continue;
+        default:
+        normal:
+            if (ch >= 32 && ch <= 126) {
+                if (j + 1 >= size) break;
+                buf[j++] = ch;
+                continue;
+            }
+            if (j + 4 >= size) break;
+            buf[j++] = '\\';
+            int has_digit = isdigit((unsigned char)str[i+1]);
+            if (ch >= 64 || has_digit) buf[j++] = '0' + (ch >> 6);
+            if (ch >= 8  || has_digit) buf[j++] = '0' + ((ch >> 3) & 7);
+            buf[j++] = '0' + (ch & 7);
+            continue;
         }
+        break;
     }
-    fputs("\"\n", fout);
-    emit("    .section .text");
-    emit("    lea rax, [rip + .LC%d]", id);
+    if (j < size) buf[j] = 0;
+    return j;
+}
+
+static void gen_string_def(atom_t id) {
+    char buf[8192];
+    gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+    emit(".LC%d: .string \"%s\"", id, buf);
+}
+
+static void gen_string(Node *n) {
+    char buf[36];
+    atom_t id = n->str;
+    int len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+    if (len > 32) strcpy(buf + 32, "...");
+    emit("    lea rax, [rip + .LC%d]  # \"%s\"", id, buf);
+    atom_flags(id) |= ATOM_USED;
+}
+
+static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
+    // rax = left, rcx = right
+    switch (op) {
+    case T_PLUS:
+    case T_MINUS:
+        if (is_ptrish(lt) && !is_ptrish(rt)) {
+            int s = elem_size(lt); if (s > 1) emit("    imul rcx, %d", s);
+        } else if (!is_ptrish(lt) && is_ptrish(rt) && op == T_PLUS) {
+            int s = elem_size(rt); if (s > 1) emit("    imul rax, %d", s);
+        }
+        emit(op == T_PLUS ? "    add rax, rcx" : "    sub rax, rcx");
+        return is_ptrish(lt) ? lt : (is_ptrish(rt) ? rt : ty_long());
+    case T_STAR:    emit("    imul rax, rcx"); break;
+    case T_SLASH:   emit("    cqo"); emit("    idiv rcx"); break;
+    case T_PERCENT: emit("    cqo"); emit("    idiv rcx"); emit("    mov rax, rdx"); break;
+    case T_AMP:     emit("    and rax, rcx"); break;
+    case T_BITOR:   emit("    or rax, rcx");  break;
+    case T_BITXOR:  emit("    xor rax, rcx"); break;
+    case T_SHL:     emit("    shl rax, cl");  break;   // count in cl (low byte of rcx)
+    case T_SHR:     emit("    sar rax, cl");  break;   // arithmetic shift right
+    case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
+        emit("    cmp rax, rcx");
+        const char *cc = op==T_LT?"setl":op==T_GT?"setg":op==T_LE?"setle":
+        op==T_GE?"setge":op==T_EQ?"sete":"setne";
+        emit("    %s al", cc); emit("    movzx rax, al");
+        break;
+    }
+    default: error(n, "bad binary operator '%s'", token_name[op]);
+    }
+    return ty_long();
 }
 
 static Type *gen_expr(Node *n) {
@@ -1062,15 +1869,16 @@ static Type *gen_expr(Node *n) {
     case N_STR:  gen_string(n); return n->type;
     case N_VAR: {
         Sym *s = lookup(n->name);
-        if (!s) die("undeclared identifier");
+        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
+        if (s->is_constant) { emit("    mov rax, %ld", s->ival); return ty_long(); }
         // arrays and structs are used by-address (decay); scalars are loaded
-        if (s->type->is_array || s->type->kind == TY_STRUCT) { gen_addr(n); return s->type; }
+        if (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT || s->type->kind == TY_UNION) { gen_addr(n); return s->type; }
         gen_addr(n); load_rax(ty_size(s->type));
         return s->type;
     }
     case N_MEMBER: {
         Type *mt = gen_addr(n);                    // rax = &member
-        if (mt->is_array || mt->kind == TY_STRUCT) return mt;   // decay
+        if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) return mt;   // decay
         load_rax(ty_size(mt));
         return mt;
     }
@@ -1091,11 +1899,19 @@ static Type *gen_expr(Node *n) {
         return ptr_to(t);
     }
     case N_ASSIGN: {
-        Type *lt = gen_addr(n->lhs);
-        emit("    push rax");
-        gen_expr(n->rhs);
+        Type *lt = gen_addr(n->lhs); emit("    push rax");
+        int size = ty_size(lt);
+        if (n->op == T_ASSIGN) {
+            gen_expr(n->rhs);
+        } else {
+            load_rax(size); emit("    push rax");
+            Type *rt = gen_expr(n->rhs);
+            emit("    mov rcx, rax"); emit("    pop rax");
+            gen_bin(n, n->op - T_PLUSEQ + T_PLUS, lt, rt);
+        }
         emit("    pop rcx");
-        store_rcx_rax(ty_size(lt));
+        store_rcx_rax(size);
+        if (!n->unused) promote_rax(size);
         return lt;
     }
     case N_POST: {                                 // x++ / x--  (returns old value)
@@ -1157,14 +1973,14 @@ static Type *gen_expr(Node *n) {
     }
     case N_CALL: {
         // ---- variadic built-ins (handled inline, not real calls) ----
-        if (!strcmp(n->name, "__builtin_va_start")) {
+        if (n->name == ID__BUILTIN_VA_START) {
             gen_addr(n->args[0]);                  // rax = &ap
             emit("    mov rcx, rax");
             emit("    lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
             emit("    mov [rcx], rax");            // ap = first vararg slot
             return ty_long();
         }
-        if (!strcmp(n->name, "__builtin_va_arg")) {
+        if (n->name == ID__BUILTIN_VA_ARG) {
             gen_addr(n->args[0]);                  // rax = &ap
             emit("    mov rcx, rax");              // rcx = &ap
             emit("    mov rax, [rcx]");            // rax = ap
@@ -1174,62 +1990,44 @@ static Type *gen_expr(Node *n) {
             emit("    mov rax, rdx");
             return ty_long();
         }
-        if (!strcmp(n->name, "__builtin_va_end")) return ty_long();   // no-op
+        if (n->name == ID__BUILTIN_VA_END) return ty_long();   // no-op
 
+        // XXX: should look up symbol instead of global function to handle function pointers
+        Func *fn = find_func(n->name);
+        if (fn && fn->nparams != n->nargs && (!fn->is_variadic || fn->nparams > n->nargs)) {
+            warning(n->lineno, "argument count mismatch '%s' expects %d, got %d",
+                    atom_str(n->name), fn->nparams, n->nargs);
+        }
+        // XXX: should check and convert arguments according to prototype
+        // XXX: here we could support default argument values
         for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("    push rax"); }
         for (int i = n->nargs - 1; i >= 0; i--) emit("    pop %s", ARGREG[i]);
-        emit("    xor eax, eax");                  // variadic-safe; harmless otherwise
-        emit("    call %s", n->name);
+        if (!fn || fn->is_variadic) emit("    xor eax, eax"); // variadic-safe; harmless otherwise
+        emit("    call %s", atom_str(n->name));
+        if (fn) return fn->rtype;
+        warning(n->lineno, "function not found '%s'", atom_str(n->name));
         return ty_long();
     }
     case N_BIN: {
+        if (n->op == T_COMMA) { n->lhs->unused = true; gen_expr(n->lhs); return gen_expr(n->rhs); }
         Type *lt = gen_expr(n->lhs); emit("    push rax");
         Type *rt = gen_expr(n->rhs); emit("    mov rcx, rax"); emit("    pop rax");
-        // rax = left, rcx = right
-        int op = n->op;
-        if (op == T_PLUS || op == T_MINUS) {
-            if (is_ptrish(lt) && !is_ptrish(rt)) {
-                int s = elem_size(lt); if (s > 1) emit("    imul rcx, %d", s);
-            } else if (!is_ptrish(lt) && is_ptrish(rt) && op == T_PLUS) {
-                int s = elem_size(rt); if (s > 1) emit("    imul rax, %d", s);
-            }
-            emit(op == T_PLUS ? "    add rax, rcx" : "    sub rax, rcx");
-            return is_ptrish(lt) ? lt : (is_ptrish(rt) ? rt : ty_long());
-        }
-        switch (op) {
-        case T_STAR:    emit("    imul rax, rcx"); break;
-        case T_SLASH:   emit("    cqo"); emit("    idiv rcx"); break;
-        case T_PERCENT: emit("    cqo"); emit("    idiv rcx"); emit("    mov rax, rdx"); break;
-        case T_AMP:     emit("    and rax, rcx"); break;
-        case T_BITOR:   emit("    or rax, rcx");  break;
-        case T_BITXOR:  emit("    xor rax, rcx"); break;
-        case T_SHL:     emit("    shl rax, cl");  break;   // count in cl (low byte of rcx)
-        case T_SHR:     emit("    sar rax, cl");  break;   // arithmetic shift right
-        case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
-            emit("    cmp rax, rcx");
-            const char *cc = op==T_LT?"setl":op==T_GT?"setg":op==T_LE?"setle":
-                             op==T_GE?"setge":op==T_EQ?"sete":"setne";
-            emit("    %s al", cc); emit("    movzx rax, al");
-            break;
-        }
-        default: die("bad binary operator");
-        }
-        return ty_long();
+        return gen_bin(n, n->op, lt, rt);
     }
-    default: die("cannot generate expression"); return 0;
+    default: error(n, "cannot generate expression"); return 0;
     }
 }
 
 static void gen_asm(Node *n) {
     // split decoded asm text on newlines and ';' — emit each instruction line
-    const char *p = n->asmtext;
+    const char *p = atom_str(n->str);
     char line[512]; int i = 0;
     for (;; p++) {
         char c = *p;
         if (c == '\n' || c == ';' || c == 0) {
             line[i] = 0;
             // trim leading spaces
-            char *q = line; while (*q == ' ' || *q == '\t') q++;
+            char *q = line; q += skip_blanks(q);
             if (*q) emit("    %s", q);
             i = 0;
             if (c == 0) break;
@@ -1238,68 +2036,9 @@ static void gen_asm(Node *n) {
 }
 
 // break/continue target stack
-static int brk_lbl[64], cont_lbl[64], loop_sp = 0;
+static int brk_lbl[64], cont_lbl[64], loop_sp;
 static void loop_push(int b, int c) { brk_lbl[loop_sp] = b; cont_lbl[loop_sp] = c; loop_sp++; }
 static void loop_pop(void) { loop_sp--; }
-
-// ---- switch/case helpers ----
-// A switch body is walked three times: to hand each case/default its own label,
-// to find the default label, and to emit the compare-and-jump dispatch. All
-// three stop at a nested N_SWITCH so an inner switch keeps its own cases.
-static void assign_case_labels(Node *n) {
-    if (!n) return;
-    if (n->kind == N_SWITCH) return;
-    if (n->kind == N_CASE || n->kind == N_DEFAULT) { n->ival = label_id++; return; }
-    if (n->kind == N_BLOCK) {
-        for (int i = 0; i < n->nbody; i++) assign_case_labels(n->body[i]);
-    } else if (n->kind == N_IF) {
-        assign_case_labels(n->lhs); assign_case_labels(n->els);
-    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
-        assign_case_labels(n->lhs);
-    }
-}
-
-static int find_default_label(Node *n) {
-    if (!n) return -1;
-    if (n->kind == N_SWITCH) return -1;
-    if (n->kind == N_DEFAULT) return (int)n->ival;
-    if (n->kind == N_BLOCK) {
-        for (int i = 0; i < n->nbody; i++) {
-            int d = find_default_label(n->body[i]);
-            if (d != -1) return d;
-        }
-    } else if (n->kind == N_IF) {
-        int d = find_default_label(n->lhs);
-        if (d != -1) return d;
-        return find_default_label(n->els);
-    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
-        return find_default_label(n->lhs);
-    }
-    return -1;
-}
-
-// Emit "if (switch_value == case_value) goto case_label" for every case.
-// The switch value is saved on the stack at [rsp] by the caller; gen_expr is
-// stack-balanced, so we peek it (not pop) after evaluating each case value —
-// that keeps it available for every comparison, not just the first.
-static void emit_case_jumps(Node *n) {
-    if (!n) return;
-    if (n->kind == N_SWITCH) return;
-    if (n->kind == N_CASE) {
-        gen_expr(n->lhs);              // rax = this case's value
-        emit("    mov rcx, [rsp]");    // rcx = the switch value (still on the stack)
-        emit("    cmp rax, rcx");
-        emit("    je .L%ld", n->ival);
-        return;
-    }
-    if (n->kind == N_BLOCK) {
-        for (int i = 0; i < n->nbody; i++) emit_case_jumps(n->body[i]);
-    } else if (n->kind == N_IF) {
-        emit_case_jumps(n->lhs); emit_case_jumps(n->els);
-    } else if (n->kind == N_WHILE || n->kind == N_FOR || n->kind == N_DOWHILE) {
-        emit_case_jumps(n->lhs);
-    }
-}
 
 static void gen_stmt(Node *n) {
     switch (n->kind) {
@@ -1308,6 +2047,7 @@ static void gen_stmt(Node *n) {
     case N_DECL:
         if (n->init) {
             Sym *s = lookup(n->name);
+            if (!s) error(n, "symbol not found '%s'", atom_str(n->name));
             emit("    lea rax, [rbp - %d]", s->offset);
             emit("    push rax");
             gen_expr(n->init);
@@ -1315,7 +2055,7 @@ static void gen_stmt(Node *n) {
             store_rcx_rax(ty_size(s->type));
         }
         break;
-    case N_EXPR: gen_expr(n->lhs); break;
+    case N_EXPR: n->lhs->unused = true; gen_expr(n->lhs); break;
     case N_RETURN:
         if (n->lhs) gen_expr(n->lhs);
         emit("    leave"); emit("    ret");
@@ -1324,7 +2064,7 @@ static void gen_stmt(Node *n) {
         int els = label_id++, end = label_id++;
         gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", els);
         gen_stmt(n->lhs);  emit("    jmp .L%d", end);
-        emit(".L%d:", els); if (n->els) gen_stmt(n->els);
+        emit(".L%d:", els); if (n->rhs) gen_stmt(n->rhs);
         emit(".L%d:", end);
         break;
     }
@@ -1353,30 +2093,33 @@ static void gen_stmt(Node *n) {
         if (n->cond) { gen_expr(n->cond); emit("    test rax, rax"); emit("    jz .L%d", end); }
         loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
         emit(".L%d:", cont);
-        if (n->rhs) gen_expr(n->rhs);                 // step
+        if (n->rhs) { n->rhs->unused = true; gen_expr(n->rhs); }  // step
         emit("    jmp .L%d", top);
         emit(".L%d:", end);
         break;
     }
     case N_BREAK:
-        if (loop_sp == 0) die("break outside loop or switch");
+        if (loop_sp == 0) error(n, "'break' outside loop or switch");
         emit("    jmp .L%d", brk_lbl[loop_sp-1]);
         break;
     case N_CONTINUE:
-        // switch pushes cont_lbl == -1, so continue inside a bare switch is an error
-        if (loop_sp == 0 || cont_lbl[loop_sp-1] == -1) die("continue outside loop");
+        if (loop_sp == 0) error(n, "'continue' outside loop");
         emit("    jmp .L%d", cont_lbl[loop_sp-1]);
         break;
     case N_SWITCH: {
         int end = label_id++;
-        assign_case_labels(n->lhs);
-        int def = find_default_label(n->lhs);
+        int def = n->rhs ? (int)n->rhs->ival : -1;
 
-        gen_expr(n->cond);              // switch value in rax
-        emit("    push rax");           // keep it on the stack for every comparison
-        emit_case_jumps(n->lhs);        // jump to the matching case label
-        emit("    add rsp, 8");         // discard the saved switch value
-        if (def != -1) emit("    jmp .L%d", def);   // no match -> default
+        gen_expr(n->cond);
+        // Emit "if (switch_value == case_value) goto case_label" for every case.
+        // XXX: should check for duplicates
+        for (Node *e = n->cases; e; e = e->lhs) {
+            long val;
+            if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
+            emit("    cmp rax, %ld", val);
+            emit("    jz .S%d", (int)e->ival);
+        }
+        if (def != -1) emit("    jmp .S%d", def);   // no match -> default
         else           emit("    jmp .L%d", end);   // no match, no default -> done
 
         // break exits the switch; continue passes through to the enclosing loop
@@ -1390,17 +2133,30 @@ static void gen_stmt(Node *n) {
     }
     case N_CASE:
     case N_DEFAULT:
-        if (n->ival != -1) emit(".L%ld:", n->ival);
+    case N_LABEL:
+        emit(".S%d:", (int)n->ival);
         break;
+    case N_GOTO: {
+        Label *lab = find_label(n->name);
+        if (!lab) {
+            error(n, "label '%s' not found", atom_str(n->name));
+            break;
+        }
+        lab->used = true;
+        emit("    jmp .S%d", lab->num);
+        break;
+    }
     case N_ASM: gen_asm(n); break;
     default: gen_expr(n); break;                    // expression used as statement
     }
 }
 
 static void gen_func(Func *fn) {
+    if (!fn->body) return;  // external function prototype
+    this_fn = fn;
     locals = NULL; frame_size = 0;
     // params first (so they get the lowest offsets, in declared order)
-    for (int i = 0; i < fn->nparams; i++) add_local(fn->params[i]->name, fn->ptype[i]);
+    for (int i = 0; i < fn->nparams; i++) add_local(fn->params[i]->name, fn->params[i]->lineno, fn->ptype[i]);
     collect_locals(fn->body);
     // reserve a 48-byte register save area for variadic functions
     int va_off = 0;
@@ -1408,7 +2164,7 @@ static void gen_func(Func *fn) {
     cur_va_off = va_off; cur_named = fn->nparams;
     int fs = (frame_size + 15) & ~15;
 
-    emit("%s:", fn->name);
+    emit("%s:", atom_str(fn->name));
     emit("    push rbp");
     emit("    mov rbp, rsp");
     if (fs > 0) emit("    sub rsp, %d", fs);
@@ -1421,46 +2177,184 @@ static void gen_func(Func *fn) {
     }
     if (fn->is_variadic) {
         // spill all six integer arg registers so va_arg can walk them
-        const char *r[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
-        for (int i = 0; i < 6; i++) emit("    mov [rbp - %d], %s", va_off - i * 8, r[i]);
+        //const char *r[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+        for (int i = 0; i < 6; i++) emit("    mov [rbp - %d], %s", va_off - i * 8, ARGREG[i]);
     }
     gen_stmt(fn->body);
     emit("    leave"); emit("    ret");             // safety epilogue
 }
 
+static void emit_init(Type *t, atom_t name, Node *init) {
+    if (init) {
+        long ival;
+        switch (t->kind) {
+        case TY_VOID:
+            break;
+        case TY_INT:
+        case TY_LONG:
+        case TY_ENUM:
+            if (eval_expr(init, &ival)) {
+                if (name) emit("%s:", atom_str(name));
+                emit("    dq %ld", ival);
+                return;
+            }
+            break;
+        case TY_CHAR:
+            if (eval_expr(init, &ival)) {
+                if (name) emit("%s:", atom_str(name));
+                emit("    db %d", (unsigned char)ival);
+                return;
+            }
+            break;
+        case TY_PTR:
+            if (t->ptr->kind == TY_CHAR) {
+                if (init->kind == N_STR) {
+                    atom_flags(init->str) |= ATOM_USED;
+                    if (name) emit("%s:", atom_str(name));
+                    emit("    dq .LC%d", init->str);
+                    return;
+                }
+            }
+            if (init->kind == N_NUM) {
+                if (eval_expr(init, &ival)) {
+                    if (name) emit("%s:", atom_str(name));
+                    emit("    dq %ld", ival);
+                    return;
+                }
+            }
+            // XXX: support other initializers
+            break;
+        case TY_ARRAY:
+            if (init->kind != N_BLOCK) break;
+            if (name) emit("%s:", atom_str(name));
+            for (int i = 0; i < t->arr_len; i++) {
+                emit_init(t->ptr, 0, init->body[i]);
+            }
+            return;
+        case TY_STRUCT:
+        case TY_UNION:
+            if (init->kind != N_BLOCK) break;
+            if (name) emit("%s:", atom_str(name));
+            int i = 0;
+            for (Member *m = t->members; m; m = m->next, i++) {
+                int pad = m->pad;
+                emit_init(m->type, 0, init->body[i]);
+                if (pad) emit("    .zero %d", pad);
+                if (t->kind == TY_UNION) break;
+            }
+            return;
+        }
+        if (name) { warning(init->lineno, "unsupported initializer for '%s'", atom_str(name)); }
+        else { warning(init->lineno, "unsupported initializer"); }
+    }
+    int sz = ty_size(t); if (sz < 1) sz = 8;
+    if (name) emit("%s: .zero %d", atom_str(name), sz);
+    else emit("    .zero %d", sz);
+}
+
+int output_tokens(FILE *fp, Token *t, int n) {
+    // XXX: should pretty-print with auto indent
+    char buf[8192];
+    char c;
+    int line = 1;
+    for (int i = 0; i < n; i++, t++) {
+        while (line < t->lineno) { fprintf(fp, "\n"); line++; }
+        switch (t->kind) {
+        case T_EOF:   break;
+        case T_NUM:   fprintf(fp, " %ld", t->ival); break;
+        case T_ID:    fprintf(fp, " %s", atom_str(t->text)); break;
+        case T_STR:
+            gen_quoted_string(buf, sizeof(buf), atom_str(t->text), atom_len(t->text), '"');
+            fprintf(fp, " \"%s\"", buf);
+            break;
+        case T_CHAR:
+            c = (char)t->ival;
+            gen_quoted_string(buf, sizeof(buf), &c, 1, '\'');
+            fprintf(fp, " '%s'", buf);
+            break;
+        default:    fprintf(fp, " %s", atom_str(t->kind)); break;
+        }
+    }
+    return 0;
+}
+
 // =====================================================================
 // 8. MAIN
 // =====================================================================
+
+void usage(const char *msg, const char *arg) {
+    if (msg) { fprintf(stderr, "%s: %s%s\n", progname, msg, arg); }
+    fprintf(stderr, "Usage: %s [OPTIONS] <input.c> [<output.s]\n", progname);
+    if (!msg) {
+        fprintf(stderr,
+                "  --kernel       kernel mode (no bss, no _start)\n"
+                "  --libc         hosted mode (no _start, link to the C library\n"
+                "  -E             output preprocessed tokens\n"
+                "  -O             perform optimizations\n"
+                "  -o <output>    set the output filename\n"
+                "  -v  --verbose  output progress messages\n");
+    }
+    exit(1);
+}
+
 int main(int argc, char **argv) {
     // Optional flags may precede the file names.  --kernel suppresses the
     // Linux _start/exit stub so a bare-metal boot stub can provide the entry
     // point and simply call main() (no Linux syscalls exist in a kernel).
-    int kernel_mode = 0;
+    progname = argv[0];
+    if (argc == 1) usage(NULL, NULL);
+    bool kernel_mode = false, preprocess_mode = false, libc_mode = false;
     const char *inpath = NULL, *outpath = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
-        else if (!inpath)  inpath  = argv[i];
-        else if (!outpath) outpath = argv[i];
+        char *arg = argv[i];
+        if (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
+        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(NULL, NULL);
+        else if (!strcmp(arg, "--libc")) libc_mode = true;
+        else if (!strcmp(arg, "-E")) preprocess_mode = true;
+        else if (!strcmp(arg, "-O")) optimize++;
+        else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
+        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) usage("missing output filename", ""); outpath = argv[++i]; }
+        else if (*arg == '-') usage("invalid option: ", arg);
+        else if (!inpath)  inpath  = arg;
+        else if (!outpath) outpath = arg;
+        else usage("too many arguments", "");
     }
-    if (!inpath || !outpath) {
-        fprintf(stderr, "Usage: %s [--kernel] <input.c> <output.s>\n", argv[0]);
-        return 1;
-    }
+    if (!inpath) usage("missing filename", "");
 
+    lex_init();
+    filename = inpath;
+    lineno = 1;
     preprocess(inpath);
-    SRC[SRC_LEN] = 0;
     lex();
 
-    while (!at(T_EOF)) parse_toplevel();
+    if (!preprocess_mode) { while (!at(T_EOF)) parse_toplevel(); }
+    if (!outpath) {
+        if (preprocess_mode) { fout = stdout; }
+        else {
+            int len = strlen(inpath);
+            if (len > 2 && !memcmp(inpath + len - 2, ".c", 2)) len -= 2;
+            char *p = alloc(len + 3, 1);
+            memcpy(p, inpath, len); strcpy(p + len, ".s"); outpath = p;
+        }
+    }
+    if (!fout) {
+        if (!strcmp(outpath, "-")) fout = stdout;
+        else fout = fopen(outpath, "w");
+        if (!fout) { perror("fopen"); return 1; }
+    }
+    if (preprocess_mode) {
+        int status = output_tokens(fout, toks, ntok);
+        if (fout != stdout) fclose(fout);
+        return status;
+    }
 
-    fout = fopen(outpath, "w");
-    if (!fout) { perror("fopen"); return 1; }
+    check_used_func(ID_MAIN);
 
     emit(".intel_syntax noprefix");
     emit("    .section .text");
     emit("    .globl main");
 
-    if (!kernel_mode) {
+    if (!kernel_mode && !libc_mode) {
         // hosted freestanding entry point: run main, then exit(rax)
         emit("    .globl _start");
         emit("_start:");
@@ -1470,20 +2364,37 @@ int main(int argc, char **argv) {
         emit("    syscall");
     }
 
-    for (Func *f = funcs; f; f = f->next) gen_func(f);
+    for (Func *f = funcs; f; f = f->next) if (f->used) gen_func(f);
 
     // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
     // mode uses .data so the zero bytes are emitted into the object and survive
     // an objcopy to a flat binary — the bare-metal image needs no separate
     // .bss zero-fill step.
-    emit(kernel_mode ? "    .section .data" : "    .section .bss");
+    // XXX: should output global data in order:
+    // - initialized data in .data and .rodata sections
+    // - strings in .rodata sections
+    // - uninitialized data in .bss sections
+    emit("    .section .data");
     emit("    .align 8");
     for (Sym *g = globals; g; g = g->next) {
-        int sz = ty_size(g->type); if (sz < 1) sz = 8;
-        emit("%s: .zero %d", g->name, sz);
+        if (g->is_constant) continue;
+        if (!kernel_mode && !g->init) continue;
+        emit_init(g->type, g->name, g->init);
+    }
+    if (!kernel_mode) {
+        emit("    .section .bss");
+        emit("    .align 8");
+        for (Sym *g = globals; g; g = g->next) {
+            if (g->is_constant || g->init) continue;
+            emit_init(g->type, g->name, g->init);
+        }
+    }
+    emit("    .section .rodata");
+    for (atom_t s = 0; s < natoms; s++) {
+        if (atom_flags(s) & ATOM_USED) gen_string_def(s);
     }
 
     fclose(fout);
-    printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
+    if (verbose) printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     return 0;
 }
