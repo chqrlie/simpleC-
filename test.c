@@ -1,15 +1,15 @@
 #include "nano-nolibc.h"
 
 int main() {
-    puts("Hello from bare-metal nolibc!\n");
-    print_int(42 + 100);
-    puts("\n");
-    
+    _puts("Hello from bare-metal nolibc!\n");
+    _print_int(42 + 100);
+    _puts("\n");
+
     int fd = open("/dev/null", 0);
-    print_int(fd);
-    puts("\n");
+    _print_int(fd);
+    _puts("\n");
     close(fd);
-    
+
     exit(0);
     return 0;
 }

@@ -14,7 +14,7 @@
 #define IS_ODD(x)     ((x) & 1)
 
 static void show(char *label, long v) {
-    puts(label); print_int(v); puts("\n");
+    _puts(label); _print_int(v); _puts("\n");
 }
 
 int main() {

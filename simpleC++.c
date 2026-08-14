@@ -21,12 +21,13 @@
 // Use:    ./nano_cc input.c output.s
 // =====================================================================
 
+#include <ctype.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <stdarg.h>
-#include <stdbool.h>
 
 #if (defined(__GNUC__) || defined(__TINYC__))
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
@@ -34,7 +35,14 @@
 #define attr_printf(a, b)
 #endif
 
+//#define NO_REALLOC
+#define NO_LIBC
+
 #if 1
+#else
+#ifdef NO_LIBC
+#include "nano-nolibc.h"
+#include "nano-malloc.h"
 #else
 // stdarg.h
 #define va_list         long
@@ -68,7 +76,6 @@ int vfprintf(FILE *srtream, const char *format, va_list arg);
 int fgetc(FILE *stream);
 int fputc(int c, FILE *stream);
 int fputs(const char *s, FILE *stream);
-void perror(const char *s);
 
 // ctype.h
 int isalnum(int c);
@@ -93,6 +100,9 @@ int strcmp(const char *s1, const char *s2);
 char *strchr(const char *s, int c);
 char *strcpy(char *s1, const char *s2);
 size_t strlen(const char *s);
+extern int errno;
+const char *strerror(int errnum);
+#endif
 #endif
 
 // ---------------------------------------------------------------------
@@ -124,6 +134,12 @@ static void emit(const char *fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(fout, fmt, a); va_end(a);
     fputc('\n', fout);
 }
+static void emit2(const char *comment, const char *fmt, ...) attr_printf(1,3);
+static void emit2(const char *comment, const char *fmt, ...) {
+    va_list a; va_start(a, fmt); vfprintf(fout, fmt, a); va_end(a);
+    if (comment && *comment) fprintf(fout, "  # %s", comment);
+    fputc('\n', fout);
+}
 static int xdigit(int d) { return (d <= '9') ? d - '0' : tolower(d) - 'a' + 10; }
 static int skip_blanks(const char *s) {
     int i = 0;
@@ -140,12 +156,37 @@ static int skip_word(const char *s) {
     while (isalnum((unsigned char)s[i]) || s[i] == '_') i++;
     return i;
 }
+static int skip_string(const char *s, int *slen) {
+    char sep = *s;
+    for (int i = 1;; i++) {
+        if (!s[i]) { if (slen) *slen = 0; return i; }
+        if (s[i] == sep) { if (slen) *slen = 1; return i + 1; }
+        if (s[i] == '\\' && s[i+1]) i++;
+    }
+}
+// safe string copy with truncation and detection
 static int pstrcpy(char *dest, int size, const char *src) {
     if (size) {
         for (int i = 0; i < size; i++) if ((dest[i] = src[i]) == 0) return i;
         dest[size - 1] = 0;
     }
     return size;
+}
+// safe limited string copy with truncation and detection
+static int pstrncpy(char *dest, int size, const char *src, size_t n) {
+    if (size) {
+        int i;
+        for (i = 0; i < size && n; i++, n--) if ((dest[i] = src[i]) == 0) return i;
+        if (i < size) { dest[i] = 0; return i; }
+        dest[size - 1] = 0;
+    }
+    return size;
+}
+// safe fixed string copy with truncation and detection
+static int pmemcpy(char *dest, int size, const char *src, size_t n) {
+    int i = 0;
+    for (i = 0; i < size && n; i++, n--) dest[i] = src[i];
+    return i;
 }
 
 static void *alloc(size_t nelems, size_t size) {
@@ -160,7 +201,7 @@ static void *allocz(size_t nelems, size_t size) {
 }
 static void *reallocate(void *ptr, size_t *nelems, size_t size) {
     size_t new_nelems = *nelems + (*nelems >> 1);
-#if 1    // XXX use realloc if available
+#ifndef NO_REALLOC    // XXX use realloc if available
     void *new_ptr = realloc(ptr, new_nelems * size);
     if (!new_ptr) die("out of memory");
 #else
@@ -178,7 +219,7 @@ static void *reallocate(void *ptr, size_t *nelems, size_t size) {
 typedef unsigned int atom_t;
 #define ATOM_MACRO 1
 #define ATOM_USED  2
-typedef struct Atom { atom_t next; int len; char flags; char str[7]; } Atom;
+typedef struct Atom { atom_t next; int len; unsigned char flags; char str[7]; } Atom;
 static Atom **atoms;
 static size_t natoms, atoms_cap;
 #define ATOM_HASH_LEN  1023
@@ -194,8 +235,13 @@ atom_t new_atom_len(const char *str, int len) {
     }
     if (!len) { return 0; } // special case the empty string
     unsigned int hash = 0;
-    for (int i = 0; i < len; i++) hash = hash * 37 + str[i];
+    for (int i = 0; i < len; i++) hash = hash * 37 + (str[i] & 255);
     hash %= ATOM_HASH_LEN;
+#ifndef __GNUC__
+    // Achtung Minen! we must ensure that hash is not negative
+    // because we do not support unsigned arithmetics yet
+    if (hash < 0) hash += ATOM_HASH_LEN;
+#endif
     atom_t a = atom_hash[hash];
     while (a) {
         Atom *ap = atoms[a];
@@ -318,28 +364,39 @@ static void src_putc(char c) {
 }
 static void src_puts(const char *s) { while (*s) src_putc(*s++); }
 
+typedef struct MacroArguments {
+    const char *argv[8];
+    int len[8];
+    int argc;
+} MacroArguments;
+
+static int find_macro_param(const Macro *m, atom_t name) {
+    for (int i = 0; i < m->nparams; i++) if (m->params[i] == name) return i;
+    return -1;
+}
+
 // Substitute a function-like macro body: copy m->value into out[], replacing
-// each parameter name with the matching call argument text.  argv[k] holds the
-// (already whitespace-trimmed) text of the k-th argument.
-static int subst_macro_body(const Macro *m, char argv[8][512], int argc,
-                            char *out, int j, int cap) {
-    #define PUT(ch) do { if (j < cap - 1) out[j++] = (ch); } while (0)
+// each parameter name with the matching call argument text. ma->argv[k] holds the
+// (already whitespace-trimmed) text of the k-th argument of length ma->len[k].
+static int subst_macro_body(const Macro *m, MacroArguments *ma, char *out, int j, int cap) {
     const char *p = m->value;
-    while (*p) {
-        char vc = *p;
+    const char *q = p;
+    char vc;
+    while ((vc = *p) != 0) {
         if (isalpha((unsigned char)vc) || vc == '_') {
             int k = skip_word(p);
-            atom_t w = new_atom_len(p, k);
-            int pi = -1;
-            for (int a = 0; a < m->nparams; a++) if (w == m->params[a]) { pi = a; break; }
-            if (pi >= 0 && pi < argc) { for (const char *s = argv[pi]; *s; s++) PUT(*s); }
-            else                      { for (int i = 0; i < k; i++) PUT(p[i]); }
-            p += k;
-        } else {
-            PUT(vc); p++;
+            int pi = find_macro_param(m, new_atom_len(p, k));
+            if (pi >= 0) {
+                j += pmemcpy(out + j, cap - j, q, p - q);
+                j += pmemcpy(out + j, cap - j, ma->argv[pi], ma->len[pi]);
+                q = p += k;
+                continue;
+            }
         }
+        p++;
     }
-    #undef PUT
+    j += pmemcpy(out + j, cap - j, q, p - q);
+    if (j == cap && cap) out[cap - 1] = '\0';
     return j;
 }
 
@@ -348,67 +405,58 @@ static void expand_line(const char *in) {
     char work[8192];
     pstrcpy(work, sizeof(work), in);
     for (int pass = 0; pass < 8; pass++) {
-        char out[8192]; int j = 0, changed = 0;
-        #define OPUT(ch) do { if (j < (int)sizeof(out) - 1) out[j++] = (ch); } while (0)
-        for (int i = 0; work[i]; ) {
-            char c = work[i];
-            if (c == '"' || c == '\'') {          // copy string/char literal verbatim
-                char q = c; OPUT(c); i++;
-                while (work[i] && work[i] != q) {
-                    if (work[i] == '\\' && work[i+1]) { OPUT(work[i]); i++; }
-                    OPUT(work[i]); i++;
-                }
-                if (work[i]) { OPUT(work[i]); i++; }
-            } else if (isalpha((unsigned char)c) || c == '_') {
-                int k = i; i += skip_word(work + i);
-                atom_t word = new_atom_len(&work[k], i - k);
-                Macro *m = macro_find(word);
-                if (m && m->nparams >= 0) { // is_func
-                    int t = i; t += skip_blanks(work + t);
-                    if (work[t] == '(') {          // it's a macro invocation
-                        t++;                       // past '('
-                        // XXX: This does not work if macro arguments span multiple lines
-                        char argv[8][512]; int argc = 0, ci = 0; argv[0][0] = 0;
-                        int depth = 1;
-                        // XXX: this does not work if macro argument is a string or char constant
-                        while (work[t] && depth > 0) {
-                            char cc = work[t];
-                            if (cc == '(') { depth++; if (argc < 8 && ci < 511) argv[argc][ci++] = cc; t++; }
-                            else if (cc == ')') { depth--; if (depth > 0) { if (argc < 8 && ci < 511) argv[argc][ci++] = cc; } t++; }
-                            else if (cc == ',' && depth == 1) { if (argc < 8) { argv[argc][ci] = 0; argc++; } ci = 0; if (argc < 8) argv[argc][0] = 0; t++; }
-                            else { if (argc < 8 && ci < 511) argv[argc][ci++] = cc; t++; }
+        char out[8192]; size_t j = 0; bool changed = false;
+        char *p = work;
+        char *q = p;
+        char c;
+        while ((c = *p) != '\0') {
+            if (c == '"' || c == '\'') { p += skip_string(p, NULL); continue; }
+            if (isalpha((unsigned char)c) || c == '_') {
+                int k = skip_word(p);
+                Macro *m = macro_find(new_atom_len(p, k));
+                int b = skip_blanks(p + k);
+                if (!m || (m->nparams >= 0 && p[k+b] != '(')) { p += k+b; continue; }
+                j += pmemcpy(out + j, sizeof(out) - j, q, p - q);
+                q = p += k;
+                MacroArguments ma; ma.argc = 0;
+                if (m->nparams >= 0) {
+                    // XXX: This does not work if macro arguments span multiple lines
+                    int depth = 1;
+                    p += b + 1;   // past blanks and '('
+                    const char *e = q = p += skip_blanks(p);
+                    for (;;) {
+                        char cc = *p;
+                        if (cc == '\0') die("macro '%s' argument list spans multiple lines", atom_str(m->name));
+                        if ((cc == ')' && --depth == 0) || (cc == ',' && depth == 1)) { // end of argument
+                            if (ma.argc >= m->nparams) die("too many arguments for macro '%s'", atom_str(m->name));
+                            ma.argv[ma.argc] = q;
+                            ma.len[ma.argc] = e - q;
+                            ma.argc++;
+                            q = ++p;   // past ')' or ','
+                            if (cc == ')') {
+                                if (ma.argc != m->nparams) die("missing arguments for macro '%s'", atom_str(m->name));
+                                break;
+                            }
+                            e = q = p += skip_blanks(p);
+                        } else {
+                            if (cc == ' ' || cc == '\t') { p++; continue; }
+                            if (cc == '(') { depth++; }
+                            if (cc == '"' || cc == '\'') { p += skip_string(p, NULL); } else p++;
+                            e = p;
                         }
-                        if (argc < 8) { argv[argc][ci] = 0; argc++; }
-                        // trim leading/trailing whitespace on each argument
-                        for (int a = 0; a < argc; a++) {
-                            char *s = argv[a];
-                            int st = skip_blanks(s);
-                            int len = trim_len(s + st);
-                            if (st) { for (int i = 0; i < len; i++) s[i] = s[st + i]; }
-                            s[len] = 0;
-                        }
-                        // empty call MACRO()  ->  zero arguments
-                        if (argc == 1 && argv[0][0] == 0 && m->nparams == 0) argc = 0;
-                        j = subst_macro_body(m, argv, argc, out, j, (int)sizeof(out));
-                        i = t;                     // consume through ')'
-                        changed = 1;
-                    } else {                       // name not followed by '(' -> literal
-                        while (k < i) { OPUT(work[k]); k++; }
                     }
-                } else if (m) {                    // object-like macro
-                    for (const char *p = m->value; *p; p++) OPUT(*p);
-                    changed = 1;
-                } else {
-                    while (k < i) { OPUT(work[k]); k++; }
                 }
+                if (m->nparams > 0) j = subst_macro_body(m, &ma, out, j, (int)sizeof(out));
+                else j += pstrcpy(out + j, sizeof(out) - j, m->value);
+                changed = true;
             } else {
-                OPUT(work[i]); i++;
+                p++;
             }
-            if (j >= (int)sizeof(out) - 2) break;
         }
-        #undef OPUT
-        out[j] = 0;
-        memcpy(work, out, j + 1);
+        j += pmemcpy(out + j, sizeof(out) - j, q, p - q);
+        if (j >= sizeof(out)) die("macro expansion overflow");
+        memcpy(work, out, j);
+        work[j] = '\0';
         if (!changed) break;
     }
     src_puts(work);
@@ -416,29 +464,29 @@ static void expand_line(const char *in) {
 
 // Strip // and /* */ comments (string/char aware) into `dst`.
 static char *strip_comments(const char *s, int len) {
-    char *dst = alloc(len + 1, 1);
-    int j = 0;
-    for (int i = 0; s[i]; ) {
-        if (s[i] == '"' || s[i] == '\'') {
-            char q = s[i]; dst[j++] = s[i++];
-            while (s[i] && s[i] != q) {
-                if (s[i] == '\\' && s[i+1]) dst[j++] = s[i++];
-                dst[j++] = s[i++];
-            }
-            if (s[i]) dst[j++] = s[i++];
-        } else if (s[i] == '/' && s[i+1] == '/') {
-            while (s[i] && s[i] != '\n') i++;
-        } else if (s[i] == '/' && s[i+1] == '*') {
-            i += 2;
-            while (s[i] && !(s[i] == '*' && s[i+1] == '/')) if (s[i++] == '\n') dst[j++] = '\n';
-            if (s[i]) i += 2;
-            if (j && !isspace(dst[j-1])) dst[j++] = ' ';
+    char *dst = alloc(len + 1, 1), *out = dst;
+    const char *p = s, *q = p;
+    char c;
+    while ((c = *p) != '\0') {
+        if (c == '"' || c == '\'') {
+            p += skip_string(p, NULL);
+        } else if (c == '/' && p[1] == '/') {
+            memcpy(out, q, p - q); out += p - q;
+            while (*p && *p != '\n') p++; q = p;
+        } else if (c == '/' && p[1] == '*') {
+            memcpy(out, q, p - q); out += p - q;
+            p += 2;
+            while (*p && !(*p == '*' && p[1] == '/'))
+                if (*p++ == '\n') *out++ = '\n';    // preserve line numbers
+            if (*p) p += 2; q = p;
+            if (out > dst && !isspace(out[-1])) *out++ = ' ';
         } else {
-            dst[j++] = s[i++];
+            p++;
         }
     }
-    dst[j] = 0;
-    if (verbose) printf("Stripped: %d bytes\n", j);
+    memcpy(out, q, p - q + 1);
+    out += p - q;
+    if (verbose) printf("Stripped: %d bytes\n", (int)(out - dst));
     return dst;
 }
 
@@ -551,10 +599,10 @@ static void process_text(const char *text) {
             case K_INCLUDE:
                 if (!skip) {
                     if (*p == '"') {
-                        p++;
-                        char fn[256]; int k = 0;
-                        while (*p && *p != '"' && k < 255) fn[k++] = *p++;
-                        fn[k] = 0;
+                        char fn[256]; int slen; int k = skip_string(p, &slen);
+                        if (!slen) die("invalid filename");
+                        pstrncpy(fn, sizeof(fn), p + 1, k - 1 - slen);
+                        p += k;
                         preprocess(fn);
                     } else {
                         // <...> system includes are ignored (freestanding)
@@ -766,7 +814,7 @@ enum { TY_INT, TY_CHAR, TY_LONG, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION,
 typedef struct Type Type;
 typedef struct Member { atom_t name; Type *type; int offset, align, pad; struct Node *init; struct Member *next; } Member;
 struct Type {
-    char kind, align; int arr_len; Type *ptr; struct Node *arr_len_expr;
+    unsigned char kind, align; int arr_len; Type *ptr; struct Node *arr_len_expr;
     Member *members; int struct_size; atom_t tag;  // TY_STRUCT / TY_UNION
 };
 
@@ -781,7 +829,7 @@ static Type *ty_long(void) { return &ty_long_s; }
 static Type *ty_void(void) { return &ty_void_s; }
 
 static Type *ptr_to(Type *base) {
-    Type *t = allocz(1, sizeof(Type)); t->kind = TY_PTR; t->ptr = base; return t;
+    Type *t = allocz(1, sizeof(Type)); t->align = 8; t->kind = TY_PTR; t->ptr = base; return t;
 }
 static int ty_size(Type *t) {
     switch (t->kind) {
@@ -834,7 +882,7 @@ enum {
 typedef struct Node Node;
 struct Node {
     int   kind;
-    char  op;               // token kind for N_BIN / N_POST (T_INC/T_DEC)
+    unsigned char op;       // token kind for N_BIN / N_POST (T_INC/T_DEC)
     bool  unused;           // N_ASSIGN: is assigned value used
     long  ival;             // N_NUM, N_CASE, N_DEFAULT, N_LABEL, N_FOR, N_DO, N_WHILE, N_SWITCH
     atom_t str;             // N_STR, N_ASM decoded text
@@ -842,7 +890,8 @@ struct Node {
     int   lineno;
     Type *type;             // result / declared type
     Node *lhs, *rhs, *cond, *init, *cases;
-    Node *args[8]; int nargs;
+#define MAX_ARGS 6
+    Node *args[MAX_ARGS]; int nargs;
     Node *body[512]; int nbody;   // N_BLOCK statements
 };
 
@@ -862,7 +911,7 @@ static void error(Node *n, const char *fmt, ...) {
     exit(1);
 }
 static Type *array_of(Type *base, Node *len_expr) {
-    Type *arr = allocz(1, sizeof(Type)); arr->kind = TY_ARRAY; arr->ptr = base;
+    Type *arr = allocz(1, sizeof(Type)); arr->align = base->align; arr->kind = TY_ARRAY; arr->ptr = base;
     arr->arr_len = -1;
     arr->arr_len_expr = len_expr;
     if (len_expr && len_expr->kind == N_NUM) arr->arr_len = len_expr->ival;
@@ -957,6 +1006,13 @@ static Node *parse_const_expr(void);
 static Node *parse_init(void);
 static bool eval_expr(Node *n, long *vp);
 
+static Type *parse_array(Type *t) {
+    Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+    expect(T_RBRK);
+    if (eat(T_LBRK)) t = parse_array(t);
+    return array_of(t, len_expr);
+}
+
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
 static Type *parse_struct(int kind) {
     atom_t tag = at(T_ID) ? getid() : 0;
@@ -972,11 +1028,7 @@ static Type *parse_struct(int kind) {
                 Type *mt = mbase;
                 while (eat(T_STAR)) mt = ptr_to(mt);
                 atom_t mnm = getid();
-                while (eat(T_LBRK)) {                 // array member
-                    Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
-                    mt = array_of(mt, len_expr);
-                    expect(T_RBRK);
-                }
+                if (eat(T_LBRK)) mt = parse_array(mt);
                 int msz = ty_size(mt);
                 int align = ty_align(mt);
                 if (align > st->align) st->align = align;
@@ -1030,7 +1082,7 @@ static Type *parse_enum(void) {
                 if (!eval_expr(m->init, &off))
                     error(m->init, "expression is not constant");
             }
-            m->offset = off++;
+            m->offset = off;
             *tailp = m;
             tailp = &m->next;
             Sym *s = add_global(name, pos, st);
@@ -1038,6 +1090,7 @@ static Type *parse_enum(void) {
             s->is_constant = 1;
             s->ival = off;
             s->init = m->init;
+            off++;
             if (!eat(T_COMMA)) break;
         }
         expect(T_RBRACE);
@@ -1072,6 +1125,7 @@ static Node *parse_primary(void) {
         if (at(T_LP)) {                       // function call
             Node *n = new_node(N_CALL); P++; n->name = nm;
             while (!at(T_RP)) {
+                if (n->nargs >= MAX_ARGS) error(NULL, "too many function arguments");
                 n->args[n->nargs++] = parse_assign();
                 if (!eat(T_COMMA)) break;
             }
@@ -1218,11 +1272,7 @@ static Node *parse_decl_stmt(void) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
         atom_t nm = getid();
-        while (eat(T_LBRK)) {                          // array: char buf[24];
-            Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
-            t = array_of(t, len_expr);
-            expect(T_RBRK);
-        }
+        if (eat(T_LBRK)) t = parse_array(t);
         Node *d = new_node(N_DECL); d->name = nm; d->type = t;
         if (eat(T_ASSIGN)) {
             d->init = parse_init();
@@ -1550,16 +1600,16 @@ static void parse_toplevel(void) {
         bool is_variadic = false;
         while (!at(T_RP)) {
             if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
+            if (nparams >= MAX_ARGS) error(NULL, "too many function arguments");
             Type *pt = parse_type_base_only();
             while (eat(T_STAR)) pt = ptr_to(pt);
             if (pt->kind == TY_VOID && !at(T_ID)) break;   // (void)
             Node *pv = new_node(N_DECL);
             if (at(T_ID)) pv->name = getid();   // argument name is optional
-            while (eat(T_LBRK)) {                 // array member
-                // XXX: handle fake array specification -> pointer
-                Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
-                pt = array_of(pt, len_expr);
-                expect(T_RBRK);
+            if (eat(T_LBRK)) {
+                pt = parse_array(pt);   // pseudo array function parameter
+                pt->kind = TY_PTR;
+                pt->align = 8;
             }
             pv->type = pt;
             if (has_prototype && fn->ptype[nparams] && !same_type(fn->ptype[nparams], pt))
@@ -1584,11 +1634,7 @@ static void parse_toplevel(void) {
     // global variable(s):  type name [= ...] (, ...) ;   (initialisers ignored -> .bss)
     for (;;) {
         int pos = toks[P].lineno;
-        while (eat(T_LBRK)) {
-            Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
-            t = array_of(t, len_expr);
-            expect(T_RBRK);
-        }
+        if (eat(T_LBRK)) t = parse_array(t);
         Sym *sym = add_global(nm, pos, t);
         if (eat(T_ASSIGN)) {
             sym->init = parse_init();
@@ -1659,7 +1705,7 @@ static bool check_optimize_call(Node *n) {
         if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
         const char *s = atom_str(n->args[0]->str);
         size_t len = strlen(s); // do not use atom len to allow embedded nuls
-        n->kind = N_NUM; n->ival = strlen(s); n->type = ty_long();
+        n->kind = N_NUM; n->ival = len; n->type = ty_long();
         return true;
     }
     if (n->name == ID_STRCPY) {
@@ -1749,7 +1795,7 @@ static Type *gen_addr(Node *n) {
         Sym *s = lookup(n->name);
         if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
         if (s->is_global) emit("    lea rax, [rip + %s]", atom_str(n->name));
-        else              emit("    lea rax, [rbp - %d]  # %s", s->offset, atom_str(n->name));
+        else              emit2(atom_str(n->name), "    lea rax, [rbp - %d]", s->offset);
         return s->type;
     }
     if (n->kind == N_DEREF) {                      // &*p  ==  p
@@ -1760,7 +1806,7 @@ static Type *gen_addr(Node *n) {
         Type *st = gen_addr(n->lhs);               // rax = &struct
         Member *m = find_member(st, n->name);
         if (!m) error(n, "no such struct member: %s", atom_str(n->name));
-        if (m->offset) emit("    add rax, %d  # %s", m->offset, atom_str(n->name));
+        if (m->offset) emit2(atom_str(n->name), "    add rax, %d", m->offset);
         return m->type;
     }
     error(n, "not an lvalue"); return 0;
@@ -1783,13 +1829,14 @@ static Type *static_typeof(Node *n) {
 
 static int gen_quoted_string(char *buf, size_t size, const char *str, int slen, unsigned char sep) {
     size_t j = 0;
+    if (sep && j + 1 < size) buf[j++] = sep;
     for (int i = 0; i < slen; i++) {
         unsigned char ch = str[i];
         switch (ch) {
         case '\n': ch = 'n'; goto escape;
         case '\t': ch = 'n'; goto escape;
         case '\r': ch = 'r'; goto escape;
-        case '"': case '\'': if (ch == sep) goto escape; else goto normal;
+        case '"': case '\'': if (!sep || ch == sep) goto escape; else goto normal;
         case '\\':
         escape:
             if (j + 2 >= size) break;
@@ -1812,6 +1859,7 @@ static int gen_quoted_string(char *buf, size_t size, const char *str, int slen, 
         }
         break;
     }
+    if (sep && j + 1 < size) buf[j++] = sep;
     if (j < size) buf[j] = 0;
     return j;
 }
@@ -1819,15 +1867,15 @@ static int gen_quoted_string(char *buf, size_t size, const char *str, int slen, 
 static void gen_string_def(atom_t id) {
     char buf[8192];
     gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
-    emit(".LC%d: .string \"%s\"", id, buf);
+    emit(".LC%d: .string %s", id, buf);
 }
 
 static void gen_string(Node *n) {
-    char buf[36];
+    char buf[37];
     atom_t id = n->str;
     int len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
-    if (len > 32) strcpy(buf + 32, "...");
-    emit("    lea rax, [rip + .LC%d]  # \"%s\"", id, buf);
+    if (len > 32) strcpy(buf + 32, "...\"");
+    emit2(buf, "    lea rax, [rip + .LC%d]", id);
     atom_flags(id) |= ATOM_USED;
 }
 
@@ -2184,7 +2232,7 @@ static void gen_func(Func *fn) {
     emit("    leave"); emit("    ret");             // safety epilogue
 }
 
-static void emit_init(Type *t, atom_t name, Node *init) {
+static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
     if (init) {
         long ival;
         switch (t->kind) {
@@ -2195,14 +2243,14 @@ static void emit_init(Type *t, atom_t name, Node *init) {
         case TY_ENUM:
             if (eval_expr(init, &ival)) {
                 if (name) emit("%s:", atom_str(name));
-                emit("    dq %ld", ival);
+                emit2(mname, "    .quad %ld", ival);
                 return;
             }
             break;
         case TY_CHAR:
             if (eval_expr(init, &ival)) {
                 if (name) emit("%s:", atom_str(name));
-                emit("    db %d", (unsigned char)ival);
+                emit2(mname, "    .byte %d", (unsigned char)ival);
                 return;
             }
             break;
@@ -2211,14 +2259,14 @@ static void emit_init(Type *t, atom_t name, Node *init) {
                 if (init->kind == N_STR) {
                     atom_flags(init->str) |= ATOM_USED;
                     if (name) emit("%s:", atom_str(name));
-                    emit("    dq .LC%d", init->str);
+                    emit2(mname, "    .quad .LC%d", init->str);
                     return;
                 }
             }
             if (init->kind == N_NUM) {
                 if (eval_expr(init, &ival)) {
                     if (name) emit("%s:", atom_str(name));
-                    emit("    dq %ld", ival);
+                    emit2(mname, "    .quad %ld", ival);
                     return;
                 }
             }
@@ -2228,7 +2276,7 @@ static void emit_init(Type *t, atom_t name, Node *init) {
             if (init->kind != N_BLOCK) break;
             if (name) emit("%s:", atom_str(name));
             for (int i = 0; i < t->arr_len; i++) {
-                emit_init(t->ptr, 0, init->body[i]);
+                gen_init(t->ptr, 0, init->body[i], NULL);
             }
             return;
         case TY_STRUCT:
@@ -2237,19 +2285,19 @@ static void emit_init(Type *t, atom_t name, Node *init) {
             if (name) emit("%s:", atom_str(name));
             int i = 0;
             for (Member *m = t->members; m; m = m->next, i++) {
-                int pad = m->pad;
-                emit_init(m->type, 0, init->body[i]);
-                if (pad) emit("    .zero %d", pad);
+                gen_init(m->type, 0, init->body[i], atom_str(m->name));
+                if (m->pad) emit("    .zero %d", m->pad);
                 if (t->kind == TY_UNION) break;
             }
             return;
         }
         if (name) { warning(init->lineno, "unsupported initializer for '%s'", atom_str(name)); }
+        else if (mname) { warning(init->lineno, "unsupported initializer for member '%s'", mname); }
         else { warning(init->lineno, "unsupported initializer"); }
     }
     int sz = ty_size(t); if (sz < 1) sz = 8;
-    if (name) emit("%s: .zero %d", atom_str(name), sz);
-    else emit("    .zero %d", sz);
+    if (name) emit2(mname, "%s: .zero %d", atom_str(name), sz);
+    else emit2(mname, "    .zero %d", sz);
 }
 
 int output_tokens(FILE *fp, Token *t, int n) {
@@ -2258,21 +2306,25 @@ int output_tokens(FILE *fp, Token *t, int n) {
     char c;
     int line = 1;
     for (int i = 0; i < n; i++, t++) {
-        while (line < t->lineno) { fprintf(fp, "\n"); line++; }
+        if (line < t->lineno) {
+            while (line < t->lineno) { fputc('\n', fp); line++; }
+            // XXX: should auto-indent
+        }
+        if (t->kind == T_EOF) break;
+        fputc(' ', fp); // XXX: should space out properly
         switch (t->kind) {
-        case T_EOF:   break;
-        case T_NUM:   fprintf(fp, " %ld", t->ival); break;
-        case T_ID:    fprintf(fp, " %s", atom_str(t->text)); break;
+        case T_NUM:   fprintf(fp, "%ld", t->ival); break;
+        case T_ID:    fprintf(fp, "%s", atom_str(t->text)); break;
         case T_STR:
             gen_quoted_string(buf, sizeof(buf), atom_str(t->text), atom_len(t->text), '"');
-            fprintf(fp, " \"%s\"", buf);
+            fprintf(fp, "%s", buf);
             break;
         case T_CHAR:
             c = (char)t->ival;
             gen_quoted_string(buf, sizeof(buf), &c, 1, '\'');
-            fprintf(fp, " '%s'", buf);
+            fprintf(fp, "%s", buf);
             break;
-        default:    fprintf(fp, " %s", atom_str(t->kind)); break;
+        default:    fprintf(fp, "%s", atom_str(t->kind)); break;
         }
     }
     return 0;
@@ -2289,7 +2341,8 @@ void usage(const char *msg, const char *arg) {
         fprintf(stderr,
                 "  --kernel       kernel mode (no bss, no _start)\n"
                 "  --libc         hosted mode (no _start, link to the C library\n"
-                "  -E             output preprocessed tokens\n"
+                "  -E             output preprocessed test\n"
+                "  -ET            output preprocessed tokens\n"
                 "  -O             perform optimizations\n"
                 "  -o <output>    set the output filename\n"
                 "  -v  --verbose  output progress messages\n");
@@ -2303,14 +2356,16 @@ int main(int argc, char **argv) {
     // point and simply call main() (no Linux syscalls exist in a kernel).
     progname = argv[0];
     if (argc == 1) usage(NULL, NULL);
-    bool kernel_mode = false, preprocess_mode = false, libc_mode = false;
+    int preprocess_mode = 0;
+    bool kernel_mode = false, libc_mode = false;
     const char *inpath = NULL, *outpath = NULL;
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
         if (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
         else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(NULL, NULL);
         else if (!strcmp(arg, "--libc")) libc_mode = true;
-        else if (!strcmp(arg, "-E")) preprocess_mode = true;
+        else if (!strcmp(arg, "-E")) preprocess_mode = 1;
+        else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
         else if (!strcmp(arg, "-O")) optimize++;
         else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
         else if (!strcmp(arg, "-o")) { if (!argv[i+1]) usage("missing output filename", ""); outpath = argv[++i]; }
@@ -2325,6 +2380,7 @@ int main(int argc, char **argv) {
     filename = inpath;
     lineno = 1;
     preprocess(inpath);
+    if (preprocess_mode == 1) { fputs(SRC, stdout); return 0; }
     lex();
 
     if (!preprocess_mode) { while (!at(T_EOF)) parse_toplevel(); }
@@ -2340,7 +2396,7 @@ int main(int argc, char **argv) {
     if (!fout) {
         if (!strcmp(outpath, "-")) fout = stdout;
         else fout = fopen(outpath, "w");
-        if (!fout) { perror("fopen"); return 1; }
+        if (!fout) { die("cannot open %s: %s", outpath, strerror(errno)); }
     }
     if (preprocess_mode) {
         int status = output_tokens(fout, toks, ntok);
@@ -2358,9 +2414,13 @@ int main(int argc, char **argv) {
         // hosted freestanding entry point: run main, then exit(rax)
         emit("    .globl _start");
         emit("_start:");
+        emit("    xor rbp, rbp");
+        emit("    mov rdi, [rsp]");         // argc
+        emit("    lea rsi, [rsp+8]");       // argv
+        emit("    lea rdx, [rsi+8*rdi+8]"); // envp
         emit("    call main");
         emit("    mov rdi, rax");
-        emit("    mov rax, 60");
+        emit("    mov rax, 60");            // exit
         emit("    syscall");
     }
 
@@ -2379,14 +2439,14 @@ int main(int argc, char **argv) {
     for (Sym *g = globals; g; g = g->next) {
         if (g->is_constant) continue;
         if (!kernel_mode && !g->init) continue;
-        emit_init(g->type, g->name, g->init);
+        gen_init(g->type, g->name, g->init, NULL);
     }
     if (!kernel_mode) {
         emit("    .section .bss");
         emit("    .align 8");
         for (Sym *g = globals; g; g = g->next) {
             if (g->is_constant || g->init) continue;
-            emit_init(g->type, g->name, g->init);
+            gen_init(g->type, g->name, g->init, NULL);
         }
     }
     emit("    .section .rodata");

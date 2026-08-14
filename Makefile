@@ -22,79 +22,75 @@ FLAGS	  = -O
 
 ifneq (,$(NOAS))
 AS	= @\#
-RUN	= \#
+RUN	= @\#
 endif
 ifneq (,$(NORUN))
-RUN	= \#
+RUN	= @\#
 endif
 
 .PHONY: all run test demo structs bitwise printf switch clean nano
 
+INC = nano-malloc.h nano-nolibc.h
+
 all: $(BIN)
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(INC)
 	$(CC) $(CFLAGS) -o $@ '$(SRC)'
 
 # Compile a small program to assembly with the built compiler.
 run: $(BIN)
-	./$(BIN) $(FLAGS) sample.c sample.s
+	./$(BIN) $(FLAGS) sample.c
 	@echo "---- sample.s ----"
 	@cat sample.s
 
 # Full end-to-end demo: nano_cc compiles test.c, GNU as assembles it,
 # the linker produces a freestanding binary, and we run it.
 test: $(BIN)
-	./$(BIN) $(FLAGS) test.c test.s
+	./$(BIN) $(FLAGS) test.c
 	$(AS) -nostdlib test.s -o test_prog
-	@$(RUN) echo "---- ./test_prog output ----"
-	@$(RUN) ./test_prog
+	$(RUN) ./test_prog
 
 # Control-flow / operator feature demo (for, do/while, break, continue,
 # prefix ++/--, ternary).
 demo: $(BIN)
-	./$(BIN) $(FLAGS) features.c features.s
+	./$(BIN) $(FLAGS) features.c
 	$(AS) -nostdlib features.s -o features_prog
-	@$(RUN) echo "---- ./features_prog output ----"
-	@$(RUN) ./features_prog
+	$(RUN) ./features_prog
 
 # struct/union + member access + sizeof + string-return demo.
 structs: $(BIN)
-	./$(BIN) $(FLAGS) structs.c structs.s
+	./$(BIN) $(FLAGS) structs.c
 	$(AS) -nostdlib structs.s -o structs_prog
-	@$(RUN) echo "---- ./structs_prog output ----"
-	@$(RUN) ./structs_prog
+	$(RUN) ./structs_prog
 
 # bitwise operators + function-like macro demo.
 bitwise: $(BIN)
-	./$(BIN) $(FLAGS) bitwise.c bitwise.s
+	./$(BIN) $(FLAGS) bitwise.c
 	$(AS) -nostdlib bitwise.s -o bitwise_prog
-	@$(RUN) echo "---- ./bitwise_prog output ----"
-	@$(RUN) ./bitwise_prog
+	$(RUN) ./bitwise_prog
 
 # variadic functions -> a real printf() written in nano-nolibc.h.
 printf: $(BIN)
-	./$(BIN) $(FLAGS) printf.c printf.s
+	./$(BIN) $(FLAGS) printf.c
 	$(AS) -nostdlib printf.s -o printf_prog
-	@$(RUN) echo "---- ./printf_prog output ----"
-	@$(RUN) ./printf_prog
+	$(RUN) ./printf_prog
 
 # switch / case / default (dispatch, fall-through, break, nested, in a loop).
 switch: $(BIN)
-	./$(BIN) $(FLAGS) switch.c switch.s
+	./$(BIN) $(FLAGS) switch.c
 	$(AS) -nostdlib switch.s -o switch_prog
-	@$(RUN) echo "---- ./switch_prog output ----"
-	@$(RUN) ./switch_prog
-
-nano: $(BIN)
-	./$(BIN) $(FLAGS) --libc $(SRC) -o nano.s
-	$(AS) nano.s -o nano_prog
-	@$(RUN) echo "---- ./nano_prog output ----"
-	@$(RUN) ./nano_prog
+	$(RUN) ./switch_prog
 
 hello: $(BIN)
 	./$(BIN) $(FLAGS) hello.c
 	$(AS) -nostdlib hello.s -o hello_prog
 	$(RUN) ./hello_prog
+
+nano: $(BIN) Makefile
+	./$(BIN) $(FLAGS) $(SRC) -o nano.s
+	$(AS) -nostdlib nano.s -o nano_prog -g
+	$(RUN) ./nano_prog -O $(SRC) nano2.s
+	$(RUN) diff nano.s nano2.s
 
 test_all: test demo structs bitwise printf switch nano hello
 
@@ -102,4 +98,5 @@ clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
 	      bitwise.s bitwise_prog printf.s printf_prog \
-	      switch.s switch_prog nano.s nano_prog hello.s hello_prog
+	      switch.s switch_prog hello.s hello_prog \
+	      nano.s nano2.s nano_prog
