@@ -1,5 +1,6 @@
 // stdlib.h
-unsigned char arena[167772160]; // 16MB should suffice for everyone
+#define ARENA_LENGTH 64000000 // 64MB should suffice for everyone
+unsigned char arena[ARENA_LENGTH];
 size_t arena_top;
 size_t arena_last;
 void *malloc(size_t size) {

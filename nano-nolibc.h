@@ -13,7 +13,19 @@
 #undef stderr
 #undef NULL
 #undef EOF
+#undef islower
+#undef isupper
+#undef isalpha
+#undef isdigit
+#undef isxdigit
+#undef isalnum
+#undef isblank
+#undef isspace
+#undef tolower
+#undef toupper
 #endif
+
+#define _Noreturn
 
 // stdbool.h (should make these keywords)
 #ifndef true
@@ -33,7 +45,8 @@ typedef long ssize_t;
 #ifndef va_start
 #define va_list         long
 #define va_start(ap, l) __builtin_va_start(ap)
-#define va_arg(ap, t)   __builtin_va_arg(ap)
+#define va_arg(ap, t)   ((t)__builtin_va_arg(ap))
+#define va_copy(a1, a2) ((a1) = (a2))
 #define va_end(ap)      __builtin_va_end(ap)
 #endif
 
@@ -43,12 +56,51 @@ int islower(int c) { return c >= 'a' && c <= 'z'; }
 int isupper(int c) { return c >= 'A' && c <= 'Z'; }
 int isalpha(int c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
 int isdigit(int c) { return c >= '0' && c <= '9'; }
-int isxdigit(int c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'F'); }
+int isxdigit(int c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'); }
 int isalnum(int c) { return isdigit(c) || isalpha(c); }
 int isblank(int c) { return c == ' ' || c == '\t'; }
 int isspace(int c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 int tolower(int c) { return isupper(c) ? c + ('a' - 'A') : c; }
 int toupper(int c) { return islower(c) ? c - ('a' - 'A') : c; }
+
+// errno.h
+int errno;
+enum {
+    EPERM    = 1,  /* Operation not permitted */
+    ENOENT   = 2,  /* No such file or directory */
+    ESRCH    = 3,  /* No such process */
+    EINTR    = 4,  /* Interrupted system call */
+    EIO      = 5,  /* I/O error */
+    ENXIO    = 6,  /* No such device or address */
+    E2BIG    = 7,  /* Argument list too long */
+    ENOEXEC  = 8,  /* Exec format error */
+    EBADF    = 9,  /* Bad file number */
+    ECHILD  = 10,  /* No child processes */
+    EAGAIN  = 11,  /* Try again */
+    ENOMEM  = 12,  /* Out of memory */
+    EACCES  = 13,  /* Permission denied */
+    EFAULT  = 14,  /* Bad address */
+    ENOTBLK = 15,  /* Block device required */
+    EBUSY   = 16,  /* Device or resource busy */
+    EEXIST  = 17,  /* File exists */
+    EXDEV   = 18,  /* Cross-device link */
+    ENODEV  = 19,  /* No such device */
+    ENOTDIR = 20,  /* Not a directory */
+    EISDIR  = 21,  /* Is a directory */
+    EINVAL  = 22,  /* Invalid argument */
+    ENFILE  = 23,  /* File table overflow */
+    EMFILE  = 24,  /* Too many open files */
+    ENOTTY  = 25,  /* Not a typewriter */
+    ETXTBSY = 26,  /* Text file busy */
+    EFBIG   = 27,  /* File too large */
+    ENOSPC  = 28,  /* No space left on device */
+    ESPIPE  = 29,  /* Illegal seek */
+    EROFS   = 30,  /* Read-only file system */
+    EMLINK  = 31,  /* Too many links */
+    EPIPE   = 32,  /* Broken pipe */
+    EDOM    = 33,  /* Math argument out of domain of func */
+    ERANGE  = 34,  /* Math result not representable */
+};
 
 // string.h
 void *memcpy(void *d, const void *s, size_t n) {
@@ -75,47 +127,19 @@ int strcmp(const char *a, const char *b) {
 #include <unistd.h>
 #include <fcntl.h>
 #else
-int errno;
-// --- Syscall trampoline ---
-// All syscalls go through this one naked asm function.
-// Args are passed via globals to avoid needing extended asm syntax.
-long _a1, _a2, _a3, _a4, _a5, _a6, _n, _ret;
-
-void _do_syscall() {
-    // nano_cc passes the __asm__ body straight through to the assembler
-    // (GNU as, .intel_syntax noprefix). Globals are addressed RIP-relative.
-    __asm__(
-        "mov rax, [rip + _n]\n"
-        "mov rdi, [rip + _a1]\n"
-        "mov rsi, [rip + _a2]\n"
-        "mov rdx, [rip + _a3]\n"
-        "mov r10, [rip + _a4]\n"
-        "mov r8,  [rip + _a5]\n"
-        "mov r9,  [rip + _a6]\n"
-        "syscall\n"
-        "mov [rip + _ret], rax\n"
-    );
-    if (_ret < 0) { errno = -_ret; _ret = -1; }
-}
-
-static inline long syscall1(long n, long a1) {
-    _n = n; _a1 = a1; _do_syscall(); return _ret;
-}
-static inline long syscall2(long n, long a1, long a2) {
-    _n = n; _a1 = a1; _a2 = a2; _do_syscall(); return _ret;
-}
-static inline long syscall3(long n, long a1, long a2, long a3) {
-    _n = n; _a1 = a1; _a2 = a2; _a3 = a3; _do_syscall(); return _ret;
-}
+long __syscall(long n, ...);
 
 // --- Syscall numbers ---
-#define SYS_read   0
-#define SYS_write  1
-#define SYS_open   2
-#define SYS_close  3
-#define SYS_mmap   9
-#define SYS_exit   60
-#define SYS_creat  85
+enum {
+    SYS_read  = 0,
+    SYS_write = 1,
+    SYS_open  = 2,
+    SYS_close = 3,
+    SYS_mmap  = 9,
+    SYS_exit  = 60,
+    SYS_creat = 85,
+    SYS_gettimeofday = 96,
+};
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -125,26 +149,49 @@ static inline long syscall3(long n, long a1, long a2, long a3) {
 #define O_BINARY 0
 
 // --- POSIX wrappers ---
-ssize_t read(int fd, const char *buf, size_t len) {
-    return syscall3(SYS_read, fd, (long)buf, len);
+ssize_t read(int fd, void *buf, size_t len) {
+    for (;;) {
+        ssize_t n = __syscall(SYS_read, fd, buf, len);
+        if (n >= 0 || errno != EINTR) return n;
+    }
 }
-ssize_t write(int fd, const char *buf, size_t len) {
-    return syscall3(SYS_write, fd, (long)buf, len);
+ssize_t write(int fd, const void *buf, size_t len) {
+    for (;;) {
+        ssize_t n = __syscall(SYS_write, fd, buf, len);
+        if (n >= 0 || errno != EINTR) return n;
+    }
 }
 int creat(const char *path, int mode) {
-    return syscall2(SYS_creat, (long)path, mode);
+    return __syscall(SYS_creat, path, mode);
 }
 int open(const char *path, int flags, ...) {
-    return syscall3(SYS_open, (long)path, flags, 0777);
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    return __syscall(SYS_open, path, flags, mode);
 }
 int close(int fd) {
-    return syscall1(SYS_close, fd);
+    return __syscall(SYS_close, fd);
 }
-int fflush(struct FILE *fp);
-void exit(int code) {
+int fflush(struct FILE *fp);    // should use an atexit function table
+_Noreturn void exit(int code) {
     fflush(NULL);
-    syscall1(SYS_exit, code);
+    __syscall(SYS_exit, code);
     while(1);
+}
+
+#if SYSTEM_DARWIN
+typedef long time_t;
+typedef int suseconds_t;
+#else
+// Same for Linux, FreeBSD and OpenBSD
+typedef long time_t;
+typedef long suseconds_t;
+#endif
+
+struct timeval { time_t tv_sec; suseconds_t tv_usec; };
+struct timezone { int tz_minuteswest; int tz_dsttime; };
+
+int gettimeofday(struct timeval *tv, struct timezone *tz) {
+    return __syscall(SYS_gettimeofday, tv, tz);
 }
 #endif
 
@@ -171,7 +218,6 @@ FILE *fopen(const char *filename, char *mode) {
 }
 
 int fgetc(FILE *fp) { char b; return read(fp->hd, &b, 1) == 1 ? b & 255 : EOF; }
-
 char *fgets(char *buf, size_t n, FILE *fp) {
     size_t i = 0;
     int c;
@@ -179,6 +225,12 @@ char *fgets(char *buf, size_t n, FILE *fp) {
     if (i < size) buf[i] = 0;
     if (c == EOF && i == 0) return NULL;
     return buf;
+}
+size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
+    size_t len = size * nmemb;  // should check overflow
+    ssize_t slen = read(fp->hd, p, len);
+    if (slen < 0) return 0;
+    return ((size_t)slen < len) ? (size_t)slen / size : nmemb;
 }
 
 int fputc(int c, FILE *fp) {
@@ -191,7 +243,7 @@ int fputc(int c, FILE *fp) {
 }
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
     if (!nmemb) return 0;
-    size_t len = size * nmemb, wlen;
+    size_t len = size * nmemb, wlen = len;  // should check overflow
     if (fp->dest) {
         if (wlen > fp->cap - fp->pos) wlen = fp->cap - fp->pos;
         memcpy(fp->dest + fp->pos, p, wlen);
@@ -201,7 +253,7 @@ size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
         if (slen < 0) return 0;
         wlen = (size_t)slen;
     }
-    return (slen < len) ? (size_t)slen / nmemb : nmemb;
+    return (wlen < len) ? wlen / size : nmemb;
 }
 
 int fputs(const char *s, FILE *fp) {
@@ -239,7 +291,11 @@ size_t ultoa(char *dest, unsigned long n, int base) {
     const char *digits = "0123456789abcdefghijklmnopqrstuvwxyz";    // share digit string
     *--p = 0;
     if (n == 0) *--p = '0';
-    while (n > 0) { *--p = digits[n % base]; n = n / base; }
+    if (base >= 2 && base <= 36) {
+        while (n > 0) { *--p = digits[__lmod(n, base)]; n = __ldiv(n, base); }
+    } else {
+        errno = ERANGE;
+    }
     size_t size = &buf[sizeof(buf)] - p;
     memcpy(dest, p, size);
     return size - 1;
@@ -270,12 +326,12 @@ int vfprintf(FILE *fp, const char *fmt, va_list ap) {
         switch (*fmt++) {
         case 'd':
         case 'u':            goto out_num;
-        case 'l': mod++;     goto again;
+        case 'l': case 'z': case 't': mod++; goto again;
         case 'x': base = 16; goto out_num;
         case 'o': base = 8;  goto out_num;
         case 'b': base = 2;  goto out_num;
         case 's':
-            s = (char *)va_arg(ap, char *);
+            s = va_arg(ap, char *);
             if (!s) s = "(null)";
             len = strlen(s);
             goto out_str;
@@ -321,43 +377,7 @@ int snprintf(char *dest, size_t size, const char *fmt, ...) {
     return n;
 }
 
-// errno.h
-enum {
-    EPERM    = 1,  /* Operation not permitted */
-    ENOENT   = 2,  /* No such file or directory */
-    ESRCH    = 3,  /* No such process */
-    EINTR    = 4,  /* Interrupted system call */
-    EIO      = 5,  /* I/O error */
-    ENXIO    = 6,  /* No such device or address */
-    E2BIG    = 7,  /* Argument list too long */
-    ENOEXEC  = 8,  /* Exec format error */
-    EBADF    = 9,  /* Bad file number */
-    ECHILD  = 10,  /* No child processes */
-    EAGAIN  = 11,  /* Try again */
-    ENOMEM  = 12,  /* Out of memory */
-    EACCES  = 13,  /* Permission denied */
-    EFAULT  = 14,  /* Bad address */
-    ENOTBLK = 15,  /* Block device required */
-    EBUSY   = 16,  /* Device or resource busy */
-    EEXIST  = 17,  /* File exists */
-    EXDEV   = 18,  /* Cross-device link */
-    ENODEV  = 19,  /* No such device */
-    ENOTDIR = 20,  /* Not a directory */
-    EISDIR  = 21,  /* Is a directory */
-    EINVAL  = 22,  /* Invalid argument */
-    ENFILE  = 23,  /* File table overflow */
-    EMFILE  = 24,  /* Too many open files */
-    ENOTTY  = 25,  /* Not a typewriter */
-    ETXTBSY = 26,  /* Text file busy */
-    EFBIG   = 27,  /* File too large */
-    ENOSPC  = 28,  /* No space left on device */
-    ESPIPE  = 29,  /* Illegal seek */
-    EROFS   = 30,  /* Read-only file system */
-    EMLINK  = 31,  /* Too many links */
-    EPIPE   = 32,  /* Broken pipe */
-    EDOM    = 33,  /* Math argument out of domain of func */
-    ERANGE  = 34,  /* Math result not representable */
-};
+// sys_err.c
 int sys_nerr = 35;
 const char *sys_errlist[] = {
     "Success",
