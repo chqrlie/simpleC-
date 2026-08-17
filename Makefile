@@ -90,7 +90,7 @@ nano: $(BIN) Makefile
 	./$(BIN) $(FLAGS) -t $(SRC) -o nano.s
 	$(AS) -nostdlib nano.s -o nano_prog -g
 	$(RUN) ./nano_prog $(FLAGS) -t $(SRC) -o nano2.s
-	$(RUN) diff nano.s nano2.s
+	$(RUN) diff nano.s nano2.s | head -50
 	@if [ '!' -f STATS.csv ] ; then echo "Source lines,Source bytes,Library lines,Library bytes,nano.s lines,nano.s bytes,nano_cc bytes,nano_prog bytes" > STATS.csv ; fi
 	@if [ -f nano_prog ] ; then \
 	    echo `wc -l < simpleC++.c`,`wc -c < simpleC++.c`,`cat nano-*.h | wc -l`,`cat nano-*.h | wc -c`,`wc -l < nano.s`,`wc -c < nano.s`,`wc -c < nano_cc`,`wc -c < nano_prog`   >> STATS.csv ; \

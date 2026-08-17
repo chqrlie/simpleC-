@@ -37,17 +37,17 @@ typedef unsigned char bool;
 // stddef.h
 #ifndef NULL
 #define NULL  ((void*)0)
-#endif
 typedef unsigned long size_t;
 typedef long ssize_t;
+#endif
 
 // stdarg.h on top of nano_cc's variadic built-ins ---
 #ifndef va_start
-#define va_list         long
-#define va_start(ap, l) __builtin_va_start(ap)
-#define va_arg(ap, t)   ((t)__builtin_va_arg(ap))
-#define va_copy(a1, a2) ((a1) = (a2))
-#define va_end(ap)      __builtin_va_end(ap)
+#define va_list          long
+#define va_start(ap, l)  __builtin_va_start(ap)
+#define va_arg(ap, t)    ((t)__builtin_va_arg(ap))
+#define va_copy(a1, a2)  ((a1) = (a2))
+#define va_end(ap)       __builtin_va_end(ap)
 #endif
 
 // ctype.h
@@ -104,15 +104,15 @@ enum {
 
 // string.h
 void *memcpy(void *d, const void *s, size_t n) {
-    char *a = (char*)d; const char *b = (const char*)s;
+    unsigned char *a = d; const unsigned char *b = s;
     while (n--) *a++ = *b++; return d;
 }
 void *memset(void *d, int c, size_t n) {
-    char *a = (char*)d; while (n--) *a++ = (char)c; return d;
+    unsigned char *a = d; while (n--) *a++ = (unsigned char)c; return d;
 }
 int memcmp(const void *p1, const void *p2, size_t n) {
-    const char *a = (const char*)p1; const char *b = (const char*)p2;
-    for (; n--; a++, b++) if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+    const unsigned char *a = p1, *b = p2;
+    for (; n--; a++, b++) { if (*a == *b) continue; return *a - *b; }
     return 0;
 }
 size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
@@ -178,6 +178,7 @@ _Noreturn void exit(int code) {
     while(1);
 }
 
+// sys/time.h
 #if SYSTEM_DARWIN
 typedef long time_t;
 typedef int suseconds_t;
@@ -195,6 +196,7 @@ int gettimeofday(struct timeval *tv, struct timezone *tz) {
 }
 #endif
 
+// stdio.h (no buffering)
 typedef struct FILE { int hd; char *dest; size_t pos, cap; } FILE;
 #define NFILE 10
 FILE _iofb[NFILE] = {{ 0 }, { 1 }, { 2 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }};
@@ -203,7 +205,7 @@ FILE _iofb[NFILE] = {{ 0 }, { 1 }, { 2 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }
 #define stderr &_iofb[2]
 #define EOF   (-1)
 
-int fclose(FILE *fp) { close(fp->hd); fp->hd = -1; }
+int fclose(FILE *fp) { int res = close(fp->hd); fp->hd = -1; return res; }
 int fflush(FILE *fp) { return 0; }
 FILE *fopen(const char *filename, char *mode) {
     for (int i = 0; i < NFILE; i++) {
@@ -226,11 +228,15 @@ char *fgets(char *buf, size_t n, FILE *fp) {
     if (c == EOF && i == 0) return NULL;
     return buf;
 }
-size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
-    size_t len = size * nmemb;  // should check overflow
+size_t __fread(void *p, size_t len, FILE *fp) {
     ssize_t slen = read(fp->hd, p, len);
     if (slen < 0) return 0;
-    return ((size_t)slen < len) ? (size_t)slen / size : nmemb;
+    return (size_t)slen;
+}
+size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
+    size_t len = size * nmemb;  // should check overflow
+    size_t rlen = __fread(p, len, fp);
+    if (rlen == len) return nmemb; else return rlen / size;
 }
 
 int fputc(int c, FILE *fp) {
@@ -238,38 +244,41 @@ int fputc(int c, FILE *fp) {
         if (fp->pos < fp->cap) return (unsigned char)(fp->dest[fp->pos++] = (char)c);
     } else {
         unsigned char b = (unsigned char)c;
-        return write(fp->hd, &b, 1) == 1 ? b : EOF;
+        if (write(fp->hd, &b, 1) == 1) return b;
+    }
+    return EOF;
+}
+
+// write bytes to a stream, return the number of bytes written or -1 on error
+ssize_t __fwrite(const void *p, size_t len, FILE *fp) {
+    if (fp->dest) {
+        if (len > fp->cap - fp->pos) len = fp->cap - fp->pos;
+        memcpy(fp->dest + fp->pos, p, len);
+        fp->pos += len;
+        return (ssize_t)len;
+    } else {
+        return write(fp->hd, p, len);
     }
 }
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
-    if (!nmemb) return 0;
-    size_t len = size * nmemb, wlen = len;  // should check overflow
-    if (fp->dest) {
-        if (wlen > fp->cap - fp->pos) wlen = fp->cap - fp->pos;
-        memcpy(fp->dest + fp->pos, p, wlen);
-        fp->pos += wlen;
-    } else {
-        ssize_t slen = write(fp->hd, p, len);
-        if (slen < 0) return 0;
-        wlen = (size_t)slen;
-    }
-    return (wlen < len) ? wlen / size : nmemb;
+    size_t len = size * nmemb;  // should check overflow
+    ssize_t wlen = __fwrite(p, len, fp);
+    if (wlen < 0) return 0;
+    if ((size_t)wlen == len) return nmemb; else return wlen / size;
 }
 
+// return the number of bytes written or EOF on error
 int fputs(const char *s, FILE *fp) {
-    size_t len = strlen(s);
-    if (fp->dest) {
-        if (len > fp->cap - fp->pos) len = fp->cap - fp->pos;
-        memcpy(fp->dest + fp->pos, s, len);
-        return fp->pos += len;
-    } else {
-        return write(fp->hd, s, len);
-    }
+    return (int)__fwrite(s, strlen(s), fp);
 }
 
-int puts(const char *s) { fputs(s, stdout); return fputc('\n', stdout); }
+// return the number of bytes written or EOF on error
+int puts(const char *s) {
+    int res = (int)__fwrite(s, strlen(s), stdout);
+    if (fputc('\n', stdout) < 0) return EOF;
+    return res + 1;
+}
 
-// --- printf: supports %d %x %c %s and %% ---
 size_t ltoa(char *dest, long n) {
     char buf[24]; char *p = &buf[sizeof(buf)];
     *--p = 0;
@@ -292,7 +301,7 @@ size_t ultoa(char *dest, unsigned long n, int base) {
     *--p = 0;
     if (n == 0) *--p = '0';
     if (base >= 2 && base <= 36) {
-        while (n > 0) { *--p = digits[__lmod(n, base)]; n = __ldiv(n, base); }
+        while (n > 0) { *--p = digits[n % base]; n = n / base; }
     } else {
         errno = ERANGE;
     }
@@ -301,57 +310,49 @@ size_t ultoa(char *dest, unsigned long n, int base) {
     return size - 1;
 }
 
-void _puts(const char *s) { fputs(s, stdout); }
-void _print_int(long n) {
-    char buf[24]; size_t len = ltoa(buf, n);
-    fwrite(buf, 1, len, stdout);
-}
-
+// --- vfprintf: supports bcdosux formats and lzt modifiers ---
 int vfprintf(FILE *fp, const char *fmt, va_list ap) {
-    char buf[72];
-    const char *q = fmt;
     size_t total = 0;
+    const char *q = fmt;
     for (;;) {
-        if (*fmt && (*fmt != '%' || !fmt[1])) { fmt++; continue; }
+        if (*fmt && *fmt != '%') { fmt++; continue; }
         size_t len = fmt - q;
-        fwrite(q, 1, len, fp);
-        total += len;
+        __fwrite(q, len, fp); total += len;
         q = fmt;
         if (!*fmt) return (int)total;
-        char *s;
-        int base = 10;
-        int mod = 0;
+        char buf[72], *s = buf;
+        long n;
+        int base = 10, mod = 0;
         fmt++;  // past '%'
     again:
         switch (*fmt++) {
         case 'd':
+            n = mod ? va_arg(ap, long) : (long)va_arg(ap, int);
+            len = ltoa(buf, n);
+            goto out_str;
         case 'u':            goto out_num;
-        case 'l': case 'z': case 't': mod++; goto again;
         case 'x': base = 16; goto out_num;
         case 'o': base = 8;  goto out_num;
-        case 'b': base = 2;  goto out_num;
+        case 'b': base = 2;
+        out_num:
+            n = mod ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
+            len = ultoa(buf, n, base);
+            goto out_str;
+        case 'c':
+            *buf = (char)va_arg(ap, int); len = 1;
+            goto out_str;
         case 's':
             s = va_arg(ap, char *);
             if (!s) s = "(null)";
             len = strlen(s);
-            goto out_str;
-        case 'c':
-            fputc(va_arg(ap, int), fp);
-            total++;
+        out_str:
+            __fwrite(s, len, fp); total += len;
             q = fmt;
             continue;
+        case 'l': case 'z': case 't': mod++; goto again;
         case '%':  q = fmt - 1; continue;
         case '\0': fmt--;       continue;
-        default:                continue;
         }
-    out_num:
-        long n = mod ? va_arg(ap, long) : va_arg(ap, int);
-        len = fmt[-1] == 'd' ? ltoa(buf, n) : ultoa(buf, n, base);
-        s = buf;
-    out_str:
-        fwrite(s, 1, len, fp);
-        total += len;
-        q = fmt;
     }
 }
 
@@ -419,13 +420,19 @@ const char *sys_errlist[] = {
 static char errbuf[20];
 const char *strerror(int errnum) {
     if (errnum >= 0 && errnum < sys_nerr) return sys_errlist[errnum];
-    snprintf(errbuf, "Error %d", errnum);
+    snprintf(errbuf, sizeof(errbuf), "Error %d", errnum);
     return errbuf;
 }
 void perror(const char *s) {
     int errnum = errno;
     if (s && *s) fprintf(stderr, "%s: ", s);
     fprintf(stderr, "%s\n", strerror(errnum));
+}
+
+// examples ancillary functions
+void _puts(const char *s) { fputs(s, stdout); }
+void _print_int(long n) {
+    char buf[24]; __fwrite(buf, ltoa(buf, n), stdout);
 }
 
 #endif // NANO_NOLIBC_H

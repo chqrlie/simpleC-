@@ -32,9 +32,6 @@
 
 #if (defined(__GNUC__) || defined(__TINYC__))
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
-#define __ldiv(a, b)  ((unsigned long)(a) / (unsigned long)(b))
-#define __lmod(a, b)  ((unsigned long)(a) % (unsigned long)(b))
-#define __lshr(a, b)  ((unsigned long)(a) >> (b))
 #else
 #define attr_printf(a, b)
 #endif
@@ -71,17 +68,27 @@ static void warning(int pos, const char *fmt, ...) {
     va_list a; va_start(a, fmt); err_message(pos, "warning", fmt, a); va_end(a);
 }
 static const char *next_comment;
-//#define emit_comment(comment) next_comment = (comment)
-static void emit_comment(const char *comment) { next_comment = comment; }
-static void emit_label(int lab) { if (lab >= 0) fprintf(fout, ".L%d:\n", lab); }
-static void emit_label2(int lab, const char *buf) { fprintf(fout, ".L%d:\t\t# %s\n", lab, buf); }
+static int next_label;
+static void emit_indent(int indent) { while (indent > 0) { fputc('\t', fout); indent -= 4; } }
 static void emit(const char *fmt, ...) attr_printf(1,2);
 static void emit(const char *fmt, ...) {
-    fputc('\t', fout);
-    va_list a; va_start(a, fmt); vfprintf(fout, fmt, a); va_end(a);
-    if (next_comment && *next_comment) { fprintf(fout, "\t# %s", next_comment); next_comment = NULL; }
+    int indent = 28;
+    if (next_label > 0) indent -= fprintf(fout, ".L%d:", next_label);
+    next_label = 0;
+    if (*fmt != ' ') {  // no empty format strings to avoid gcc warning
+        emit_indent(indent - 20);
+        va_list a; va_start(a, fmt); indent = 20 - vfprintf(fout, fmt, a); va_end(a);
+    }
+    if (next_comment && *next_comment) {
+        emit_indent(indent);
+        fprintf(fout, "\t# %s", next_comment); next_comment = NULL;
+    }
     fputc('\n', fout);
 }
+static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); next_label = lab; }
+//#define emit_comment(comment) next_comment = (comment)
+static void emit_comment(const char *comment) { next_comment = comment; }
+
 static int xdigit(int d) { return (d <= '9') ? d - '0' : ((d - 'A') & 0x1f) + 10; }
 static size_t skip_blanks(const char *s) {
     size_t i = 0;
@@ -143,7 +150,7 @@ static void *allocz(size_t nelems, size_t size) {
 }
 static void *reallocate(void *ptr, size_t *nelems, size_t size) {
     size_t new_nelems = *nelems + (*nelems >> 1);
-#ifndef NO_REALLOC    // XXX use realloc if available
+#ifndef NO_REALLOC    // use realloc if available
     void *new_ptr = realloc(ptr, new_nelems * size);
     if (!new_ptr) die("out of memory");
 #else
@@ -180,10 +187,10 @@ static atom_t new_atom_len(const char *str, size_t len) {
         atoms[0] = allocz(1, sizeof(Atom)); natoms = 1;
     }
     if (!len) { return 0; } // special case the empty string
-    unsigned int hash = 0;
+    unsigned long hash = 0;
     for (size_t i = 0; i < len; i++) hash = hash * 37 + (str[i] & 255);
     // Achtung Minen! we do not support unsigned arithmetics yet
-    hash = __lmod(hash, ATOM_HASH_LEN);
+    hash = hash % ATOM_HASH_LEN;
     atom_t a = atom_hash[hash];
     while (a) {
         Atom *ap = atoms[a];
@@ -202,7 +209,11 @@ static atom_t new_atom_len(const char *str, size_t len) {
     return a;
 }
 static atom_t new_atom(const char *str) { return new_atom_len(str, strlen(str)); }
-static void emit_entry(atom_t name) { if (name) fprintf(fout, "%s:\n", atom_str(name)); }
+static void emit_entry(atom_t name) {
+    if (!name) return;
+    emit_label(-1); // flush label and comments
+    fprintf(fout, "%s:\n", atom_str(name));
+}
 
 // =====================================================================
 // 0.2. PREDEFINED ATOMS
@@ -220,20 +231,23 @@ enum {
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
     T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW, T_ELLIPSIS,
 
-    K_INT, K_LONG, K_CHAR, K_SHORT, K_VOID,
-    K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
-    K_FOR, K_DO, K_BREAK, K_CONTINUE, K_STRUCT, K_UNION, K_SIZEOF,
-    K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_TYPEDEF, K_ENUM,
+#define IS_TYPE(k)    ((k) >= K_INT && (k) < K_IF)
+#define IS_KEYWORD(k) ((k) >= K_INT && (k) < K_IFDEF)
+    K_INT, K_LONG, K_CHAR, K_SHORT, K_VOID, K_FLOAT, K_DOUBLE,
+    K_SIGNED, K_UNSIGNED, K_CONST, K_VOLATILE, K_INLINE,
+    K_AUTO, K_STATIC, K_REGISTER, K_EXTERN, K_TYPEDEF,
+    K_ENUM, K_STRUCT, K_UNION,
 
-    K_CONST, K_UNSIGNED, K_SIGNED, K_STATIC, K_INLINE,
-    K_REGISTER, K_VOLATILE, K_EXTERN,
+    K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
+    K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF,
+    K_SWITCH, K_CASE, K_DEFAULT, K_GOTO,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF, K_INCLUDE,
     ID__BUILTIN_VA_START, ID__BUILTIN_VA_ARG, ID__BUILTIN_VA_END,
     ID__BUILTIN_BSWAP16, ID__BUILTIN_BSWAP32, ID__BUILTIN_BSWAP64,
     ID__BUILTIN_CLZ, ID__BUILTIN_CTZ,
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
-    ID__LDIV, ID__LMOD, ID__LSHR, ID__SYSCALL, ID__RDTSC, ID__RDTSCP,
+    ID__SYSCALL, ID__RDTSC, ID__RDTSCP,
     ID_START, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
     T_count
 };
@@ -245,18 +259,19 @@ static const char *token_name[T_count] = {
     "=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=",
     "(", ")", "[", "]", "{", "}",
     ";", ",", "?", ":", ".", "->", "...",
-    "int", "long", "char", "short", "void",
+    "int", "long", "char", "short", "void", "float", "double",
+    "signed", "unsigned", "const", "volatile", "inline",
+    "auto", "static", "register", "extern", "typedef",
+    "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
-    "for", "do", "break", "continue", "struct", "union", "sizeof",
-    "switch", "case", "default", "goto", "typedef", "enum",
-    "const", "unsigned", "signed", "static", "inline",
-    "register", "volatile", "extern",
+    "for", "do", "break", "continue", "sizeof",
+    "switch", "case", "default", "goto",
     "ifdef", "ifndef", "elif", "endif", "define", "undef", "include",
     "__builtin_va_start", "__builtin_va_arg", "__builtin_va_end",
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
     "__builtin_clz", "__builtin_ctz",
     "__builtin_rotate_left",  "__builtin_rotate_right",
-    "__ldiv", "__lmod", "__lshr", "__syscall", "__rdtsc", "__rdtscp",
+    "__syscall", "__rdtsc", "__rdtscp",
     "_start", "main", "printf", "puts", "strlen", "strcpy", "memcpy",
 };
 
@@ -486,7 +501,7 @@ static void process_text(const char *text) {
                     p += k;
                 }
                 break;
-            case K_IF:  // unsupported #if -> skip body
+            case K_IF:  // unsupported #if -> ignore expression, skip body
                 cond_sp++;
                 skip += skip + 1;
                 seen_else += seen_else;
@@ -704,10 +719,7 @@ static void lex(void) {
         if (isalpha((unsigned char)c) || c == '_') {
             size_t i = sp; sp += skip_word(&SRC[sp]);
             atom_t name = new_atom_len(SRC + i, sp - i);
-            if (name >= K_INT) {
-                if (name <= K_ENUM) { add_tok((int)name); continue; }
-                if (name <= K_EXTERN) continue;   // drop qualifiers
-            }
+            if (IS_KEYWORD(name)) { add_tok((int)name); continue; }
             toks[ntok].text = name; add_tok(T_ID); continue;
         }
         if (c == '"') {                              // string literal (+ adjacent concat)
@@ -768,21 +780,31 @@ enum { TY_INT, TY_CHAR, TY_SHORT, TY_LONG, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT,
 typedef struct Type Type;
 typedef struct Member { atom_t name; int offset, align, pad; Type *type; struct Node *init; struct Member *next; } Member;
 struct Type {
-    unsigned char kind, align; int arr_len; Type *ptr; struct Node *arr_len_expr;
+    unsigned char kind, align; bool is_unsigned; int pos; int arr_len; Type *ptr; struct Node *arr_len_expr;
     Member *members; int struct_size; atom_t tag;  // TY_STRUCT / TY_UNION
 };
 
-static Type ty_char_s  = { TY_CHAR, 1, 0, 0, 0, 0, 0, 0 };
-static Type ty_short_s = { TY_SHORT, 2, 0, 0, 0, 0, 0, 0 };
-static Type ty_int_s   = { TY_INT,  4, 0, 0, 0, 0, 0, 0 };
-static Type ty_long_s  = { TY_LONG, 8, 0, 0, 0, 0, 0, 0 };
-static Type ty_void_s  = { TY_VOID, 1, 0, 0, 0, 0, 0, 0 };
+static Type ty_char_s   = { TY_CHAR,  1, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_schar_s  = { TY_CHAR,  1, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_uchar_s  = { TY_CHAR,  1, true,  0, 0, 0, 0, 0, 0, 0 };
+static Type ty_short_s  = { TY_SHORT, 2, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_ushort_s = { TY_SHORT, 2, true,  0, 0, 0, 0, 0, 0, 0 };
+static Type ty_int_s    = { TY_INT,   4, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_uint_s   = { TY_INT,   4, true,  0, 0, 0, 0, 0, 0, 0 };
+static Type ty_long_s   = { TY_LONG,  8, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_ulong_s  = { TY_LONG,  8, true,  0, 0, 0, 0, 0, 0, 0 };
+static Type ty_void_s   = { TY_VOID,  1, false, 0, 0, 0, 0, 0, 0, 0 };
 
-#define ty_char()  &ty_char_s
-#define ty_short() &ty_short_s
-#define ty_int()   &ty_int_s
-#define ty_long()  &ty_long_s
-#define ty_void()  &ty_void_s
+#define ty_char()    &ty_char_s
+#define ty_schar()   &ty_schar_s
+#define ty_uchar()   &ty_uchar_s
+#define ty_short()   &ty_short_s
+#define ty_ushort()  &ty_ushort_s
+#define ty_int()     &ty_int_s
+#define ty_uint()    &ty_uint_s
+#define ty_long()    &ty_long_s
+#define ty_ulong()   &ty_ulong_s
+#define ty_void()    &ty_void_s
 
 static Type *ptr_to(Type *base) {
     Type *t = allocz(1, sizeof(Type)); t->align = 8; t->kind = TY_PTR; t->ptr = base; return t;
@@ -826,7 +848,7 @@ static bool same_type(Type *t1, Type *t2) {
 enum {
     N_NUM, N_STR, N_VAR, N_CALL, N_ASSIGN, N_BIN, N_UNARY,
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
-    N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
+    N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECLIST, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
     N_MEMBER, N_SIZEOF,
     N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
@@ -834,6 +856,7 @@ enum {
 
 #define HAS_BREAK     1     // bits in n->ival
 #define HAS_CONTINUE  2
+#define HAS_DEFAULT   4
 typedef struct Node Node;
 struct Node {
     unsigned char kind;
@@ -848,7 +871,7 @@ struct Node {
 #define MAX_ARGS 6
     int nargs, nbody;
     Node *args[MAX_ARGS];
-    Node *body[512];   // N_BLOCK statements
+    Node *body[512];        // N_BLOCK, N_DECLIST statements
 };
 
 static Token *cur(void);
@@ -923,8 +946,7 @@ static atom_t getid(void) {
 
 static bool is_type_start(Token *t) {
     int k = t->kind;
-    if (k == K_INT || k == K_LONG || k == K_CHAR || k == K_SHORT || k == K_VOID ||
-        k == K_ENUM || k == K_STRUCT || k == K_UNION) return true;
+    if (IS_TYPE(k)) return true;
     if (k == T_ID && find_typedef(t->text)) return true;
     return false;
 }
@@ -933,13 +955,14 @@ static bool is_type_start(Token *t) {
 // XXX: these should be global/local based
 typedef struct Tag { atom_t name; int kind; Type *type; struct Tag *next; } Tag;
 static Tag *tags;
-static Type *tag_get(atom_t name, int kind) { // find or forward-declare
+static Type *tag_get(atom_t name, int kind, int pos) { // find or forward-declare
     if (name) {
         for (Tag *e = tags; e; e = e->next) {
             if (e->name == name && e->kind == kind) return e->type;
         }
     }
-    Type *t = allocz(1, sizeof(Type)); t->kind = (unsigned char)kind; t->tag = name;
+    Type *t = allocz(1, sizeof(Type)); t->kind = (unsigned char)kind;
+    t->pos = pos; t->tag = name;
     if (name) {
         Tag *e = allocz(1, sizeof(Tag));
         e->name = name; e->kind = kind; e->type = t;
@@ -951,7 +974,26 @@ static Type *tag_get(atom_t name, int kind) { // find or forward-declare
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
-static Type *parse_type_base_only(void);
+enum {
+    HAS_INT      = 1 << (K_INT      - K_INT),
+    HAS_LONG     = 1 << (K_LONG     - K_INT),
+    HAS_CHAR     = 1 << (K_CHAR     - K_INT),
+    HAS_SHORT    = 1 << (K_SHORT    - K_INT),
+    HAS_VOID     = 1 << (K_VOID     - K_INT),
+    HAS_FLOAT    = 1 << (K_FLOAT    - K_INT),
+    HAS_DOUBLE   = 1 << (K_DOUBLE   - K_INT),
+    HAS_SIGNED   = 1 << (K_SIGNED   - K_INT),
+    HAS_UNSIGNED = 1 << (K_UNSIGNED - K_INT),
+    HAS_CONST    = 1 << (K_CONST    - K_INT),
+    HAS_VOLATILE = 1 << (K_VOLATILE - K_INT),
+    HAS_AUTO     = 1 << (K_AUTO     - K_INT),
+    HAS_STATIC   = 1 << (K_STATIC   - K_INT),
+    HAS_INLINE   = 1 << (K_INLINE   - K_INT),
+    HAS_REGISTER = 1 << (K_REGISTER - K_INT),
+    HAS_EXTERN   = 1 << (K_EXTERN   - K_INT),
+    HAS_TYPEDEF  = 1 << (K_TYPEDEF  - K_INT),
+};
+static Type *parse_type_base_only(long *flags);
 
 static Node *this_switch;
 static Node *this_loop;
@@ -970,15 +1012,17 @@ static Type *parse_array(Type *t) {
 
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
 static Type *parse_struct(int kind) {
+    int pos = cur()->lineno; P++;
     atom_t tag = at(T_ID) ? getid() : 0;
-    Type *st = tag_get(tag, kind);
+    Type *st = tag_get(tag, kind, pos);
     if (eat(T_LBRACE)) {                           // definition
         if (st->members) error(NULL, "%s already has a definition", atom_str((atom_t)kind));
         Member *head = NULL, *tail = NULL;
         int off = 0, maxsz = 0;
         st->align = 1;
         while (!at(T_RBRACE) && !at(T_EOF)) {
-            Type *mbase = parse_type_base_only();
+            long flags;
+            Type *mbase = parse_type_base_only(&flags);
             for (;;) {
                 Type *mt = mbase;
                 while (eat(T_STAR)) mt = ptr_to(mt);
@@ -1022,8 +1066,9 @@ static Type *parse_struct(int kind) {
 
 // enum specifier:  enum [tag] [ { members [= value], } ]
 static Type *parse_enum(void) {
+    int pos = cur()->lineno; P++;
     atom_t tag = at(T_ID) ? getid() : 0;
-    Type *st = tag_get(tag, TY_ENUM);
+    Type *st = tag_get(tag, TY_ENUM, pos);
     if (eat(T_LBRACE)) {                           // definition
         Member **tailp = &st->members;
         long off = 0;
@@ -1059,8 +1104,8 @@ static Type *parse_enum(void) {
 }
 
 // parse base type + pointer stars; returns Type*
-static Type *parse_type(void) {
-    Type *base = parse_type_base_only();
+static Type *parse_type(long *flags) {
+    Type *base = parse_type_base_only(flags);
     while (eat(T_STAR)) base = ptr_to(base);
     return base;
 }
@@ -1069,7 +1114,8 @@ static Node *parse_primary(void) {
     if (eat(T_LP)) {
         // cast?  ( type ) unary
         if (is_type_start(cur())) {
-            Type *t = parse_type();
+            long flags;
+            Type *t = parse_type(&flags);
             expect(T_RP);
             Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_assign();
             return n;
@@ -1129,8 +1175,11 @@ static Node *parse_unary(void) {
     switch (toks[P].kind) {
     case K_SIZEOF: {
         Node *n = new_node(N_SIZEOF); P++;
-        if (at(T_LP) && is_type_start(&toks[P+1])) { P++; n->type = parse_type(); expect(T_RP); }
-        else n->lhs = parse_unary();
+        if (at(T_LP) && is_type_start(&toks[P+1])) {
+            P++; n->type = parse_type(NULL); expect(T_RP);
+        } else {
+            n->lhs = parse_unary();
+        }
         return n;
     }
     case T_MINUS:
@@ -1209,9 +1258,9 @@ static Node *parse_const_expr(void) { return parse_ternary(); }
 static Node *parse_assign(void) {
     Node *n = parse_ternary();
     switch (toks[P].kind) {
-    case T_ASSIGN:  case T_PLUSEQ:  case T_MINUSEQ:  case T_STAREQ:
-    case T_SLASHEQ:  case T_PERCENTEQ:  case T_OREQ:  case T_ANDEQ:
-    case T_XOREQ:  case T_SHLEQ:  case T_SHREQ:
+    case T_ASSIGN:  case T_PLUSEQ:    case T_MINUSEQ:  case T_STAREQ:
+    case T_SLASHEQ: case T_PERCENTEQ: case T_OREQ:     case T_ANDEQ:
+    case T_XOREQ:   case T_SHLEQ:     case T_SHREQ:
         n = new_node1(N_ASSIGN, n); P++; n->rhs = parse_assign();
         break;
     }
@@ -1225,8 +1274,9 @@ static Node *parse_expr(void) {
 
 // a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
 static Node *parse_decl_stmt(void) {
-    Type *base = parse_type_base_only();   // fwd-declared below
-    Node *blk = new_node(N_BLOCK);
+    long flags;
+    Type *base = parse_type_base_only(&flags);   // fwd-declared below
+    Node *blk = new_node(N_DECLIST);
     if (eat(T_SEMI)) return blk;           // bare  struct Foo { ... };  (type only)
     for (;;) {
         Type *t = base;
@@ -1247,20 +1297,60 @@ static Node *parse_decl_stmt(void) {
     return blk;
 }
 // parse just the base type (no trailing stars) — stars belong to each declarator
-static Type *parse_type_base_only(void) {
-    if (eat(K_STRUCT)) return parse_struct(TY_STRUCT);
-    if (eat(K_UNION))  return parse_struct(TY_UNION);
-    if (eat(K_ENUM))   return parse_enum();
-    if (eat(K_INT))    return ty_int();
-    if (eat(K_CHAR))   return ty_char();
-    if (eat(K_SHORT))  return ty_short();
-    if (eat(K_LONG))   return ty_long();
-    if (eat(K_VOID))   return ty_void();
-    if (at(T_ID)) {
-        Type *type = find_typedef(toks[P].text);
-        if (type) { P++; return type; }
+static Type *parse_type_base_only(long *pflags) {
+    Type *t = NULL; long flags = 0;
+    for (;;) {
+        int k;
+        switch (k = cur()->kind) {
+        case K_STRUCT:   if (t) goto invalid; return parse_struct(TY_STRUCT);
+        case K_UNION:    if (t) goto invalid; return parse_struct(TY_UNION);
+        case K_ENUM:     if (t) goto invalid; return parse_enum();
+        case K_INT:
+        case K_LONG:
+        case K_CHAR:
+        case K_SHORT:
+        case K_VOID:
+        case K_FLOAT:
+        case K_DOUBLE:
+        case K_SIGNED:
+        case K_UNSIGNED:
+        case K_CONST:
+        case K_VOLATILE:
+        case K_STATIC:
+        case K_INLINE:
+        case K_REGISTER:
+        case K_EXTERN:
+        case K_TYPEDEF:  flags |= 1 << (k - K_INT); break;
+        default:
+            if (t) return t;
+            if (k == T_ID) {
+                Type *type = find_typedef(toks[P].text);
+                if (type) { P++; return type; }
+            }
+            error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
+        }
+        switch (flags & (HAS_INT | HAS_SHORT | HAS_LONG | HAS_CHAR | HAS_SIGNED | HAS_UNSIGNED | HAS_VOID | HAS_FLOAT | HAS_DOUBLE)) {
+        case 0: break;
+        case HAS_CHAR: t = ty_char(); break;
+        case HAS_SIGNED | HAS_CHAR: t = ty_schar(); break;
+        case HAS_UNSIGNED | HAS_CHAR: t = ty_uchar(); break;
+        case HAS_INT: case HAS_SIGNED: case HAS_SIGNED | HAS_INT: t = ty_int(); break;
+        case HAS_UNSIGNED: case HAS_UNSIGNED | HAS_INT: t = ty_uint(); break;
+        case HAS_LONG: case HAS_SIGNED | HAS_LONG: case HAS_LONG | HAS_INT: case HAS_SIGNED | HAS_LONG | HAS_INT: t = ty_long(); break;
+        case HAS_UNSIGNED | HAS_LONG: case HAS_UNSIGNED | HAS_LONG | HAS_INT: t = ty_ulong(); break;
+        case HAS_SHORT: case HAS_SIGNED | HAS_SHORT: case HAS_SHORT | HAS_INT: case HAS_SIGNED | HAS_SHORT | HAS_INT: t = ty_short(); break;
+        case HAS_UNSIGNED | HAS_SHORT: case HAS_UNSIGNED | HAS_SHORT | HAS_INT: t = ty_ushort(); break;
+        case HAS_FLOAT: case HAS_SHORT | HAS_FLOAT: case HAS_DOUBLE: case HAS_LONG | HAS_DOUBLE: error(NULL, "floating point types not supported"); return 0;
+        case HAS_VOID: t = ty_void(); break;
+        default:
+        invalid: error(NULL, "invalid type combination"); return 0;
+        }
+        switch (flags & (HAS_STATIC | HAS_REGISTER | HAS_EXTERN | HAS_TYPEDEF)) {
+        case 0: case HAS_STATIC: case HAS_REGISTER: case HAS_EXTERN: case HAS_TYPEDEF: break;
+        default: error(NULL, "invalid storage class %ld at '%s'", flags, atom_str(k)); return 0;
+        }
+        P++; if (pflags) *pflags = flags;
     }
-    error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
 }
 static Node *parse_typedef(void) {
     P++;    // skip 'typedef'
@@ -1335,6 +1425,12 @@ static Node *parse_stmt(void) {
     }
     if (at(K_DEFAULT))  {
         if (!this_switch) error(NULL, "'default' outside a 'switch' statement");
+        else {
+            if (this_switch->ival & HAS_DEFAULT) {
+                error(NULL, "duplicate 'default' in 'switch' statement");
+            }
+            this_switch->ival |= HAS_DEFAULT;
+        }
         n = new_node(N_DEFAULT); P++;
         n->name = K_DEFAULT;
     link_case:
@@ -1374,8 +1470,8 @@ static Node *parse_stmt(void) {
         return n;
     }
     if (at(K_BREAK)) {
-        if (this_loop) { this_loop->ival |= HAS_BREAK; }
-        else if (this_switch) { this_switch->ival |= HAS_BREAK; }
+        if (this_switch) { this_switch->ival |= HAS_BREAK; }
+        else if (this_loop) { this_loop->ival |= HAS_BREAK; }
         else { error(NULL, "'break' outside a loop or 'switch' statement"); }
         n = new_node(N_BREAK); P++; expect(T_SEMI); return n;
     }
@@ -1417,7 +1513,7 @@ static Node *parse_stmt(void) {
 
 // 5.1 Constant expression evaluator
 
-static Sym *lookup(atom_t name);
+static Sym *lookup(atom_t name, Node *n);
 static Type *static_typeof(Node *n);
 
 static bool eval_expr(Node *n, long *vp) {
@@ -1426,8 +1522,7 @@ static bool eval_expr(Node *n, long *vp) {
     case N_EXPR: return eval_expr(n->lhs, vp);
     case N_NUM:  *vp = n->ival; return true;
     case N_VAR: {
-        Sym *s = lookup(n->name);
-        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
+        Sym *s = lookup(n->name, n);
         if (!s->is_constant) {
             s->is_constant = eval_expr(s->init, &s->ival);
             if (!s->is_constant) error(n, "symbol is not constant: '%s'", atom_str(n->name));
@@ -1496,7 +1591,7 @@ static bool eval_expr(Node *n, long *vp) {
 }
 
 // ---- top level ----
-typedef struct Func { atom_t name; int nparams; Node *params[8]; Type *ptype[8];
+typedef struct Func { atom_t name; int pos, endpos; int nparams; Node *params[8]; Type *ptype[8];
                       bool is_variadic, used; Node *body; Type *rtype; struct Label *labels; struct Func *next; } Func;
 static Func *funcs, **funcs_tail;
 static Func *this_fn;
@@ -1531,7 +1626,9 @@ static void parse_toplevel(void) {
         for (int i = 0; i < n->nbody; i++) { add_typedef(n->body[i]); }
         return;
     }
-    Type *base = parse_type_base_only();
+    long flags;
+    int pos = cur()->lineno;
+    Type *base = parse_type_base_only(&flags);
     if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
     Type *t = base;
     while (eat(T_STAR)) t = ptr_to(t);
@@ -1553,12 +1650,13 @@ static void parse_toplevel(void) {
         }
         int nparams = 0;
         bool is_variadic = false;
+        if (at(K_VOID) && toks[P+1].kind == T_RP) P++; // (void) -> ()
         while (!at(T_RP)) {
             if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
             if (nparams >= MAX_ARGS) error(NULL, "too many function arguments");
-            Type *pt = parse_type_base_only();
+            long flags;
+            Type *pt = parse_type_base_only(&flags);
             while (eat(T_STAR)) pt = ptr_to(pt);
-            if (pt->kind == TY_VOID && !at(T_ID)) break;   // (void)
             Node *pv = new_node(N_DECL);
             if (at(T_ID)) pv->name = getid();   // argument name is optional
             if (eat(T_LBRK)) {
@@ -1579,9 +1677,11 @@ static void parse_toplevel(void) {
         fn->nparams = nparams;
         if (!eat(T_SEMI)) { // actual function definition
             if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
+            fn->pos = pos;
             this_fn = fn;
             fn->body = parse_block();
             this_fn = NULL;
+            fn->endpos = toks[P-1].lineno;
         }
         if (verbose) printf("-> %s\n", atom_str(nm));
         return;
@@ -1620,26 +1720,27 @@ static Sym *add_local(atom_t name, int pos, Type *t) {
 static void collect_locals(Node *n) {
     if (!n) return;
     switch (n->kind) {
-        case N_BLOCK: for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]); break;
-        case N_DECL:
-            if (!sym_find(locals, n->name)) add_local(n->name, n->lineno, n->type);
-            if (n->init) collect_locals(n->init);
-            break;
-        case N_IF: case N_TERNARY:
-            collect_locals(n->cond); collect_locals(n->lhs); collect_locals(n->rhs); break;
-        case N_WHILE: case N_DOWHILE:
-            collect_locals(n->lhs); collect_locals(n->cond); break;
-        case N_FOR:
-            collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs);
-            collect_locals(n->lhs); break;
-        case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
-        case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
-            collect_locals(n->lhs); break;
-        case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
-            collect_locals(n->lhs); collect_locals(n->rhs); break;
-        case N_CALL:  for (int i = 0; i < n->nargs; i++) collect_locals(n->args[i]); break;
-        case N_SWITCH: collect_locals(n->cond); collect_locals(n->lhs); break;
-        default: break;
+      case N_DECLIST:
+      case N_BLOCK: for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]); break;
+      case N_DECL:
+        if (!sym_find(locals, n->name)) add_local(n->name, n->lineno, n->type);
+        if (n->init) collect_locals(n->init);
+        break;
+      case N_IF: case N_TERNARY:
+        collect_locals(n->cond); collect_locals(n->lhs); collect_locals(n->rhs); break;
+      case N_WHILE: case N_DOWHILE:
+        collect_locals(n->lhs); collect_locals(n->cond); break;
+      case N_FOR:
+        collect_locals(n->init); collect_locals(n->cond); collect_locals(n->rhs);
+        collect_locals(n->lhs); break;
+      case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
+      case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
+        collect_locals(n->lhs); break;
+      case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
+        collect_locals(n->lhs); collect_locals(n->rhs); break;
+      case N_CALL:  for (int i = 0; i < n->nargs; i++) collect_locals(n->args[i]); break;
+      case N_SWITCH: collect_locals(n->cond); collect_locals(n->lhs); break;
+      default: break;
     }
 }
 
@@ -1649,12 +1750,11 @@ static bool check_intrinsics(Node *n) {
     case ID__BUILTIN_ROTATE_LEFT: case ID__BUILTIN_ROTATE_RIGHT:
     case ID__BUILTIN_BSWAP16:     case ID__BUILTIN_BSWAP32: case ID__BUILTIN_BSWAP64:
     case ID__BUILTIN_CLZ:         case ID__BUILTIN_CTZ:
-    case ID__LDIV:                case ID__LMOD:            case ID__LSHR:
     case ID__SYSCALL:             case ID__RDTSC:           case ID__RDTSCP:
         return false;
-    case ID_PRINTF: {
+    case ID_PRINTF: {   // optimize printf("Hello world\n");
         if (!optimize) return false;
-        if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
+        if (n->nargs != 1 || n->args[0]->kind != N_STR || !n->discard) return false;
         const char *fmt = atom_str(n->args[0]->str);
         if (!*fmt) { n->kind = N_NUM; n->ival = 0; n->type = ty_int(); return true; }
         size_t len = strlen(fmt);
@@ -1663,21 +1763,21 @@ static bool check_intrinsics(Node *n) {
         n->args[0]->str = new_atom_len(fmt, len - 1);
         return true;
     }
-    case ID_STRLEN: {
+    case ID_STRLEN: {   // optimize str("str");
         if (!optimize) return false;
         if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
         const char *s = atom_str(n->args[0]->str);
-        long len = (long)strlen(s); // do not use atom len to allow embedded nuls
-        n->kind = N_NUM; n->ival = len; n->type = ty_long();
+        size_t len = strlen(s); // do not use atom len to allow embedded nuls
+        n->kind = N_NUM; n->ival = (long)len; n->type = ty_ulong();
         return true;
     }
-    case ID_STRCPY: {
+    case ID_STRCPY: {   // optimize strcpy(dest, "str");
         if (!optimize) return false;
         if (n->nargs != 2 || n->args[1]->kind != N_STR) return false;
         const char *s = atom_str(n->args[1]->str);
         long len = (long)strlen(s); // do not use atom len to allow embedded nuls
-        n->name = ID_MEMCPY; n->ival = (long)strlen(s); n->type = ty_long();
-        n->args[2] = new_num_node(len + 1, ty_long());
+        n->name = ID_MEMCPY;
+        n->args[2] = new_num_node(len + 1, ty_ulong());
         n->args[2]->lineno = n->args[1]->lineno;
         n->nargs = 3;
         return true;
@@ -1697,6 +1797,7 @@ static void check_used_func(atom_t name) {
 static void check_used(Node *n) {
     if (!n) return;
     switch (n->kind) {
+        case N_DECLIST:
         case N_BLOCK:
             // XXX: should handle scoping
             for (int i = 0; i < n->nbody; i++) check_used(n->body[i]); break;
@@ -1727,49 +1828,69 @@ static void check_used(Node *n) {
 // =====================================================================
 // 7. CODE GENERATION
 // =====================================================================
-static int label_id;
-static const char *ARGREG[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+const char *reg64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
+const char *reg32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d" };
+const char *reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
+const char *reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
+
+static int label_id = 1;
+static int ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
 static int cur_va_off, cur_named;
 
-static Type *gen_expr(Node *n);       // fwd
+static void emit_jmp(Node *n, const char *instr, int lab) {
+    if (!lab) error(n, "invalid jump");
+    emit("%s .L%d", instr, lab);
+}
+
+static Type *gen_expr(Node *n);
+static Type *gen_expr2(Node *n);
 static void  gen_stmt(Node *n);
 
-static Sym *lookup(atom_t name) {
+static Sym *lookup(atom_t name, Node *n) {
     Sym *s = sym_find(locals, name);
     if (!s) s = sym_find(globals, name);
+    if (!s && n) error(n, "undeclared identifier '%s'", atom_str(name));
     return s;
 }
-static void promote_rax(int size) {
-    switch (size) {
-    case 1: emit("movsx rax, al"); return;
-    case 2: emit("movsx rax, ax"); return;
-    case 4: emit("movsx rax, eax"); return;
+static void promote_rax(Type *t) {
+    switch (ty_size(t)) {
+    case 1: emit(t->is_unsigned ? "movzx rax, al" : "movsx rax, al"); return;
+    case 2: emit(t->is_unsigned ? "movzx rax, ax" : "movsx rax, ax"); return;
+    case 4: emit(t->is_unsigned ? "mov eax, eax" : "movsx rax, eax"); return;
     }
 }
-static void load_rax(int size) {                 // rax = *rax (size-aware, signed char)
-    switch (size) {
-    case 1: emit("movsx rax, byte ptr [rax]"); return;
-    case 2: emit("movsx rax, word ptr [rax]"); return;
-    case 4: emit("movsx rax, dword ptr [rax]"); return;
+static void load_rax(Type *t) {                 // rax = *rax (size and type aware)
+    switch (ty_size(t)) {
+    case 1: emit(t->is_unsigned ? "movzx rax, byte ptr [rax]" : "movsx rax, byte ptr [rax]"); return;
+    case 2: emit(t->is_unsigned ? "movzx rax, word ptr [rax]" : "movsx rax, word ptr [rax]"); return;
+    case 4: emit(t->is_unsigned ? "mov eax, [rax]" : "movsx rax, dword ptr [rax]"); return;
     default: emit("mov rax, [rax]"); return;
     }
 }
-static void store_rcx_rxx(int size, char c) {    // *rxx = rax
-    switch (size) {
-    case 1: emit("mov [rcx], %cl", c); return;
-    case 2: emit("mov [rcx], %cx", c); return;
-    case 4: emit("mov [rcx], e%cx", c); return;
-    default: emit("mov [rcx], r%cx", c); return;
+static void load_rcx(Type *t) {                 // rcx = *rcx (size and type aware)
+    switch (ty_size(t)) {
+    case 1: emit(t->is_unsigned ? "movzx rcx, byte ptr [rcx]" : "movsx rcx, byte ptr [rcx]"); return;
+    case 2: emit(t->is_unsigned ? "movzx rcx, word ptr [rcx]" : "movsx rcx, word ptr [rcx]"); return;
+    case 4: emit(t->is_unsigned ? "mov ecx, [rcx]" : "movsx rcx, dword ptr [rcx]"); return;
+    default: emit("mov rcx, [rcx]"); return;
+    }
+}
+static void store_rcx(Type *t, int r) {    // [rcx] = reg (size and type aware)
+    switch (ty_size(t)) {
+    case 1: emit("mov [rcx], %s", reg8[r]); return;
+    case 2: emit("mov [rcx], %s", reg16[r]); return;
+    case 4: emit("mov [rcx], %s", reg32[r]); return;
+    default: emit("mov [rcx], %s", reg64[r]); return;
     }
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
 static Type *gen_addr(Node *n) {
     if (n->kind == N_VAR) {
-        Sym *s = lookup(n->name);
-        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
+        Sym *s = lookup(n->name, n);
         if (s->is_global) emit("lea rax, [rip + %s]", atom_str(n->name));
         else              { emit_comment(atom_str(n->name)); emit("lea rax, [rbp - %d]", s->offset); }
         return s->type;
@@ -1790,13 +1911,37 @@ static Type *gen_addr(Node *n) {
     error(n, "not an lvalue"); return 0;
 }
 
+// leave the ADDRESS of an lvalue node in rcx, return the lvalue type
+static Type *gen_addr2(Node *n) {
+    if (n->kind == N_VAR) {
+        Sym *s = lookup(n->name, n);
+        if (s->is_global) emit("lea rcx, [rip + %s]", atom_str(n->name));
+        else              { emit_comment(atom_str(n->name)); emit("lea rcx, [rbp - %d]", s->offset); }
+        return s->type;
+    }
+    if (n->kind == N_DEREF) {                      // &*p  ==  p
+        Type *t = gen_expr2(n->lhs);
+        //return t; //is_ptrish(t) ? t->ptr : ty_long(); @@@
+        return is_ptrish(t) ? t->ptr : ty_long();
+    }
+    if (n->kind == N_MEMBER) {                     // &(s.field)
+        Type *st = gen_addr2(n->lhs);               // rax = &struct
+        Member *m = find_member(st, n->name);
+        if (!m) error(n, "no such struct member: %s", atom_str(n->name));
+        emit_comment(atom_str(n->name));
+        if (m->offset) { emit("add rcx, %d", m->offset); }
+        return m->type;
+    }
+    error(n, "not an lvalue"); return 0;
+}
+
 // best-effort static type inference (used only by sizeof(expr))
 static Type *static_typeof(Node *n) {
     switch (n->kind) {
         case N_NUM:    return n->type ? n->type : ty_long();
         case N_STR:    return ptr_to(ty_char());
         case N_CAST:   return n->type;
-        case N_VAR:  { Sym *s = lookup(n->name); return s ? s->type : ty_long(); }
+        case N_VAR:  { Sym *s = lookup(n->name, NULL); return s ? s->type : ty_long(); }
         case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
                          return m ? m->type : ty_long(); }
         case N_DEREF: { Type *t = static_typeof(n->lhs); return is_ptrish(t) ? t->ptr : ty_long(); } // should report error
@@ -1848,21 +1993,21 @@ static void gen_string_def(atom_t id) {
     fprintf(fout, ".LC%d: .string %s\n", id, buf);
 }
 
-static void gen_string(Node *n) {
+static void load_string(Node *n, int r) {
     char buf[37];
     atom_t id = n->str;
     size_t len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
     if (len > 32) strcpy(buf + 32, "...\"");
-    emit_comment(buf); emit("lea rax, [rip + .LC%d]", id);
+    emit_comment(buf); emit("lea %s, [rip + .LC%d]", reg64[r], id);
     atom_flags(id) |= ATOM_USED;
 }
 
-static void gen_mul_size(const char *reg, int s) {
-    if (s > 1) {
-        if ((s & (s - 1)) == 0) { // power of 2
-            emit("shl %s, %d", reg, __builtin_ctz(s));
+static void gen_mul_size(int r, int size) {
+    if (size > 1) {
+        if ((size & (size - 1)) == 0) { // power of 2
+            emit("shl %s, %d", reg64[r], __builtin_ctz(size));
         } else {
-            emit("imul %s, %d", reg, s);
+            emit("imul %s, %d", reg64[r], size);
         }
     }
 }
@@ -1873,12 +2018,12 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     case T_PLUS:
         if (is_ptrish(lt)) {
             if (is_ptrish(rt)) error(n, "cannot add pointers");
-            gen_mul_size("rcx", elem_size(lt));
+            gen_mul_size(RCX, elem_size(lt));
             emit("add rax, rcx");
             return lt;
         }
         if (is_ptrish(rt)) {
-            gen_mul_size("rax", elem_size(rt));
+            gen_mul_size(RAX, elem_size(rt));
             emit("add rax, rcx");
             return rt;
         }
@@ -1899,24 +2044,39 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
                 }
                 break;
             }
-            gen_mul_size("rcx", s);
+            gen_mul_size(RCX, s);
             emit("sub rax, rcx");
             return lt;
         }
         emit("sub rax, rcx");
         break;
     case T_STAR:    emit("imul rax, rcx"); break;
-    case T_SLASH:   emit("cqo"); emit("idiv rcx"); break;
-    case T_PERCENT: emit("cqo"); emit("idiv rcx"); emit("mov rax, rdx"); break;
+    case T_SLASH:
+        if (lt->is_unsigned | rt->is_unsigned) {
+            emit("xor rdx,rdx"); emit("div rcx"); break;
+        } else {
+            emit("cqo"); emit("idiv rcx"); break;
+        }
+    case T_PERCENT:
+        if (lt->is_unsigned | rt->is_unsigned) {
+            emit("xor rdx,rdx"); emit("div rcx");
+        } else {
+            emit("cqo"); emit("idiv rcx");
+        }
+        emit("mov rax, rdx"); break;
     case T_AMP:     emit("and rax, rcx"); break;
     case T_BITOR:   emit("or rax, rcx");  break;
     case T_BITXOR:  emit("xor rax, rcx"); break;
     case T_SHL:     emit("shl rax, cl");  break;   // count in cl (low byte of rcx)
-    case T_SHR:     emit("sar rax, cl");  break;   // arithmetic shift right
+    case T_SHR:     if (lt->is_unsigned) emit("shr rax, cl"); else emit("sar rax, cl"); break;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
         emit("cmp rax, rcx");
         const char *cc = op == T_LT ? "setl" : op == T_GT ? "setg" : op == T_LE ? "setle" :
             op == T_GE ? "setge" : op == T_EQ ? "sete" : "setne";
+        if (lt->is_unsigned | rt->is_unsigned) {
+            cc = op == T_LT ? "setb" : op == T_GT ? "seta" : op == T_LE ? "setbe" :
+                op == T_GE ? "setae" : op == T_EQ ? "sete" : "setne";
+        }
         emit("%s al", cc); emit("movzx rax, al");
         break;
     }
@@ -1925,35 +2085,77 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     return ty_long();
 }
 
+static Type *load_var(Node *n, int r) {
+    const char *reg = reg64[r];
+    Sym *s = lookup(n->name, n);
+    if (s->is_constant) { emit_comment(atom_str(n->name)); emit("mov %s, %ld", reg, s->ival); return ty_long(); }
+    Type *t = s->type;
+    switch (t->kind) {
+    case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
+        if (s->is_global) emit("lea %s, [rip + %s]", reg, atom_str(n->name));
+        else            { emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %d]", reg, s->offset); }
+        break;
+    default: {
+        const char *mov = t->is_unsigned ? "movzx" : "movsx";
+        if (s->is_global) {
+            switch (ty_size(t)) {
+            case 1: emit("%s %s, byte ptr [rip + %s]", mov, reg, atom_str(n->name)); break;
+            case 2: emit("%s %s, word ptr [rip + %s]", mov, reg, atom_str(n->name)); break;
+            case 4: if (t->is_unsigned) emit("mov %s, [rip + %s]", reg32[r], atom_str(n->name));
+                else emit("movsx %s, dword ptr [rip + %s]", reg, atom_str(n->name)); break;
+            default: emit("mov %s, [rip + %s]", reg, atom_str(n->name)); break;
+            }
+        } else {
+            emit_comment(atom_str(n->name));
+            switch (ty_size(t)) {
+            case 1: emit("%s %s, byte ptr [rbp - %d]", mov, reg, s->offset); break;
+            case 2: emit("%s %s, word ptr [rbp - %d]", mov, reg, s->offset); break;
+            case 4: if (t->is_unsigned) emit("mov %s, [rbp - %d]", reg32[r], s->offset);
+                else emit("movsx %s, dword ptr [rbp - %d]", reg, s->offset); break;
+            default: emit("mov %s, [rbp - %d]", reg, s->offset); break;
+            }
+        }
+        break;
+    }}
+    return s->type;
+}
+
+static bool is_simple_load(Node *n) {
+    switch (n->kind) {
+    case N_NUM: case N_STR: case N_VAR: return true;
+    }
+    return false;
+}
+
+static void gen_simple_load(Node *n, int r) {
+    switch (n->kind) {
+    case N_NUM:  emit("mov %s, %ld", reg64[r], n->ival); return;
+    case N_STR:  load_string(n, r); return;
+    case N_VAR:  load_var(n, r); return;
+    }
+}
+
 static Type *gen_expr(Node *n) {
     switch (n->kind) {
     case N_NUM:  emit("mov rax, %ld", n->ival); return n->type ? n->type : ty_long();
-    case N_STR:  gen_string(n); return n->type;
-    case N_VAR: {
-        Sym *s = lookup(n->name);
-        if (!s) error(n, "undeclared identifier '%s'", atom_str(n->name));
-        if (s->is_constant) { emit("mov rax, %ld", s->ival); return ty_long(); }
-        // arrays and structs are used by-address (decay); scalars are loaded
-        if (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT || s->type->kind == TY_UNION) { gen_addr(n); return s->type; }
-        gen_addr(n); load_rax(ty_size(s->type));
-        return s->type;
-    }
+    case N_STR:  load_string(n, RAX); return n->type;
+    case N_VAR:  return load_var(n, RAX);
     case N_MEMBER: {
         Type *mt = gen_addr(n);                    // rax = &member
         if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) return mt;   // decay
-        load_rax(ty_size(mt));
+        load_rax(mt);
         return mt;
     }
     case N_SIZEOF: {
         Type *t = n->type ? n->type : static_typeof(n->lhs);
         emit("mov rax, %d", ty_size(t));
-        return ty_long();
+        return ty_ulong();
     }
     case N_CAST: gen_expr(n->lhs); return n->type;
     case N_DEREF: {
         Type *t = gen_expr(n->lhs);
         Type *pt = is_ptrish(t) ? t->ptr : ty_long();
-        load_rax(ty_size(pt));
+        load_rax(pt);
         return pt;
     }
     case N_ADDR: {
@@ -1961,48 +2163,51 @@ static Type *gen_expr(Node *n) {
         return ptr_to(t);
     }
     case N_ASSIGN: {
-        Type *lt = gen_addr(n->lhs); emit("push rax");
-        int sz = ty_size(lt);
+        Type *lt;
         if (n->op == T_ASSIGN) {
             gen_expr(n->rhs);
+            lt = gen_addr2(n->lhs);
+            store_rcx(lt, RAX);
         } else {
-            load_rax(sz); emit("push rax");
-            Type *rt = gen_expr(n->rhs);
-            emit("mov rcx, rax"); emit("pop rax");
+            lt = gen_addr(n->lhs); emit("push rax");
+            load_rax(lt);
+            Type *rt = gen_expr2(n->rhs);
             gen_bin(n, n->op - T_PLUSEQ + T_PLUS, lt, rt);
+            emit("pop rcx");
+            store_rcx(lt, RAX);
         }
-        emit("pop rcx");
-        store_rcx_rxx(sz, 'a');
-        if (!n->discard) promote_rax(sz);
+        if (!n->discard) promote_rax(lt);
         return lt;
     }
     case N_POST: {                                 // x++ / x--  (returns old value)
+        // XXX: should optimize if value is discarded
+        // XXX: should optimize if address is simple
         Type *lt = gen_addr(n->lhs);
-        int step = is_ptrish(lt) ? elem_size(lt) : 1;
-        int sz = ty_size(lt);
         emit("mov rcx, rax");                      // save &x
-        load_rax(sz);                              // rax = old
+        load_rax(lt);                              // rax = old
         emit("mov rdx, rax");
+        int step = is_ptrish(lt) ? elem_size(lt) : 1;
         if (n->op == T_INC) emit("add rdx, %d", step);
         else                emit("sub rdx, %d", step);
-        store_rcx_rxx(sz, 'd');
+        store_rcx(lt, RDX);
         return lt;                                 // rax still = old value
     }
     case N_PRE: {                                  // ++x / --x  (returns new value)
+        // XXX: should optimize if value is discarded
+        // XXX: should optimize if address is simple
         Type *lt = gen_addr(n->lhs);
-        int step = is_ptrish(lt) ? elem_size(lt) : 1;
-        int sz = ty_size(lt);
         emit("mov rcx, rax");                      // save &x
-        load_rax(sz);                              // rax = old
+        load_rax(lt);                              // rax = old
+        int step = is_ptrish(lt) ? elem_size(lt) : 1;
         if (n->op == T_INC) emit("add rax, %d", step);
         else                emit("sub rax, %d", step);
-        store_rcx_rxx(sz, 'a');                    // *&x = new (rax)
+        store_rcx(lt, RAX);                        // *&x = new (rax)
         return lt;                                 // rax = new value
     }
     case N_TERNARY: {
         int els = label_id++, end = label_id++;
-        gen_expr(n->cond); emit("test rax, rax"); emit("jz .L%d", els);
-        gen_expr(n->lhs);  emit("jmp .L%d", end);
+        gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jz", els);
+        gen_expr(n->lhs); emit_jmp(n, "jmp", end);
         emit_label(els); gen_expr(n->rhs);
         emit_label(end);
         return ty_long();
@@ -2015,17 +2220,17 @@ static Type *gen_expr(Node *n) {
         return ty_long();
     case N_LOGAND: {
         int f = label_id++, e = label_id++;
-        gen_expr(n->lhs); emit("test rax, rax"); emit("jz .L%d", f);
-        gen_expr(n->rhs); emit("test rax, rax"); emit("jz .L%d", f);
-        emit("mov rax, 1"); emit("jmp .L%d", e);
+        gen_expr(n->lhs); emit("test rax, rax"); emit_jmp(n, "jz", f);
+        gen_expr(n->rhs); emit("test rax, rax"); emit_jmp(n, "jz", f);
+        emit("mov rax, 1"); emit_jmp(n, "jmp", e);
         emit_label(f); emit("mov rax, 0"); emit_label(e);
         return ty_long();
     }
     case N_LOGOR: {
         int tl = label_id++, e = label_id++;
-        gen_expr(n->lhs); emit("test rax, rax"); emit("jnz .L%d", tl);
-        gen_expr(n->rhs); emit("test rax, rax"); emit("jnz .L%d", tl);
-        emit("mov rax, 0"); emit("jmp .L%d", e);
+        gen_expr(n->lhs); emit("test rax, rax"); emit_jmp(n, "jnz", tl);
+        gen_expr(n->rhs); emit("test rax, rax"); emit_jmp(n, "jnz", tl);
+        emit("mov rax, 0"); emit_jmp(n, "jmp", e);
         emit_label(tl); emit("mov rax, 1"); emit_label(e);
         return ty_long();
     }
@@ -2033,14 +2238,13 @@ static Type *gen_expr(Node *n) {
         // ---- variadic built-ins (handled inline, not real calls) ----
         switch (n->name) {
         case ID__BUILTIN_VA_START: {
-            gen_addr(n->args[0]);                  // rax = &ap
-            emit("mov rcx, rax");
             emit("lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
+            gen_addr2(n->args[0]);             // rcx = &ap
             emit("mov [rcx], rax");            // ap = first vararg slot
             return ty_long();
         }
         case ID__BUILTIN_VA_ARG: {
-            gen_addr(n->args[0]);                  // rax = &ap
+            gen_addr(n->args[0]);              // rax = &ap
             emit("mov rcx, rax");              // rcx = &ap
             emit("mov rax, [rcx]");            // rax = ap
             emit("mov rax, [rax]");            // rax = *ap  (the argument value)
@@ -2049,12 +2253,12 @@ static Type *gen_expr(Node *n) {
         }
         case ID__BUILTIN_VA_END: return ty_void();   // no-op
         case ID__BUILTIN_ROTATE_LEFT:
-            gen_expr(n->args[1]); emit("push rax");
-            gen_expr(n->args[0]); emit("pop rcx"); emit("rol rax, cl");
+            gen_expr(n->args[0]);
+            gen_expr2(n->args[1]); emit("rol rax, cl");
             return ty_long();
         case ID__BUILTIN_ROTATE_RIGHT:
-            gen_expr(n->args[1]); emit("push rax");
-            gen_expr(n->args[0]); emit("pop rcx"); emit("ror rax, cl");
+            gen_expr(n->args[0]);
+            gen_expr2(n->args[1]); emit("ror rax, cl");
             return ty_long();
         case ID__BUILTIN_BSWAP16:
             gen_expr(n->args[0]); emit("rol ax, 16");
@@ -2071,32 +2275,26 @@ static Type *gen_expr(Node *n) {
         case ID__BUILTIN_CTZ:
             gen_expr(n->args[0]); emit("rep bsf rax, rax");
             return ty_long();
-        case ID__LDIV:
-            gen_expr(n->args[1]); emit("push rax");
-            gen_expr(n->args[0]); emit("xor rdx, rdx");
-            emit("div qword ptr [rsp]"); emit("add rsp, 8");
-            return ty_long();
-        case ID__LMOD:
-            gen_expr(n->args[1]); emit("push rax");
-            gen_expr(n->args[0]); emit("xor rdx, rdx");
-            emit("div qword ptr [rsp]"); emit("add rsp, 8"); emit("mov rax, rdx");
-            return ty_long();
-        case ID__LSHR:
-            gen_expr(n->args[1]); emit("push rax");
-            gen_expr(n->args[0]); emit("pop rcx"); emit("shr rax, cl");
-            return ty_long();
-        case ID__SYSCALL:
-            for (int i = 1; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
-            gen_expr(n->args[0]);
-            for (int i = n->nargs; i-- > 1;) emit("pop %s", ARGREG[i-1]);
+        case ID__SYSCALL: {
+            bool all_simple = true;
+            for (int i = 0; i < n->nargs; i++) all_simple &= is_simple_load(n->args[i]);
+            if (all_simple) {
+                for (int i = 1; i < n->nargs; i++) gen_simple_load(n->args[i], ARGREG[i-1]);
+                gen_simple_load(n->args[0], RAX);
+            } else {
+                for (int i = 1; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
+                gen_expr(n->args[0]);
+                for (int i = n->nargs; i-- > 1;) emit("pop %s", reg64[ARGREG[i-1]]);
+            }
             emit("syscall");
             int end1 = label_id++;
             emit("test rax, rax");
-            emit("jge .L%d", end1);
+            emit_jmp(n, "jge", end1);
             emit("neg rax");
             emit("mov [rip + errno], rax");
             emit_label(end1);
             return ty_long();
+        }
         case ID__RDTSC:
             emit("rdtsc"); emit("shl rdx,32"); emit("or rax, rdx");
             return ty_long();
@@ -2112,8 +2310,14 @@ static Type *gen_expr(Node *n) {
         }
         // XXX: should check and convert arguments according to prototype
         // XXX: here we could support default argument values
-        for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
-        for (int i = n->nargs; i-- > 0;) emit("pop %s", ARGREG[i]);
+        bool all_simple = true;
+        for (int i = 0; i < n->nargs; i++) all_simple &= is_simple_load(n->args[i]);
+        if (all_simple) {
+            for (int i = 0; i < n->nargs; i++) gen_simple_load(n->args[i], ARGREG[i]);
+        } else {
+            for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
+            for (int i = n->nargs; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
+        }
         if (!fn || fn->is_variadic) emit("xor eax, eax"); // variadic-safe; harmless otherwise
         emit("call %s", atom_str(n->name));
         if (fn) return fn->rtype;
@@ -2122,12 +2326,43 @@ static Type *gen_expr(Node *n) {
     }
     case N_BIN: {
         if (n->op == T_COMMA) { n->lhs->discard = true; gen_expr(n->lhs); return gen_expr(n->rhs); }
-        Type *lt = gen_expr(n->lhs); emit("push rax");
-        Type *rt = gen_expr(n->rhs); emit("mov rcx, rax"); emit("pop rax");
+        Type *lt = gen_expr(n->lhs);
+        Type *rt = gen_expr2(n->rhs);
         return gen_bin(n, n->op, lt, rt);
     }
     default: error(n, "cannot generate expression"); return 0;
     }
+}
+
+static Type *gen_expr2(Node *n) {
+    // evaluate an expression into rcx
+    switch (n->kind) {
+    case N_NUM:  emit("mov rcx, %ld", n->ival); return n->type ? n->type : ty_long();
+    case N_STR:  load_string(n, RCX); return n->type;
+    case N_VAR:  return load_var(n, RCX);
+    case N_MEMBER: {
+        Type *mt = gen_addr2(n);                    // rcx = &member
+        if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) return mt;   // decay
+        load_rcx(mt);
+        return mt;
+    }
+    case N_SIZEOF: {
+        Type *t = n->type ? n->type : static_typeof(n->lhs);
+        emit("mov rcx, %d", ty_size(t));
+        return ty_ulong();
+    }
+    case N_CAST: gen_expr2(n->lhs); return n->type;
+    case N_UNARY:
+        gen_expr2(n->lhs);
+        if      (n->op == T_MINUS)  emit("neg rcx");
+        else if (n->op == T_BITNOT) emit("not rcx");
+        else { emit("test rcx, rcx"); emit("sete cl"); emit("movzx rcx, cl"); }
+        return ty_long();
+    default: break;
+    }
+    emit("push rax");
+    Type *t = gen_expr(n); emit("mov rcx, rax"); emit("pop rax");
+    return t;
 }
 
 static void gen_asm(Node *n) {
@@ -2148,23 +2383,30 @@ static void gen_asm(Node *n) {
 }
 
 // break/continue target stack
-static int brk_lbl[64], cont_lbl[64], loop_sp;
-static void loop_push(int b, int c) { brk_lbl[loop_sp] = b; cont_lbl[loop_sp] = c; loop_sp++; }
+#define MAX_LOOP 32
+static int brk_lbl[MAX_LOOP], cont_lbl[MAX_LOOP], loop_sp;
+static void loop_push(Node *n, int b, int c) {
+    loop_sp++;
+    if (loop_sp >= MAX_LOOP) error(n, "too many nested loops or switch statements");
+    brk_lbl[loop_sp] = b; cont_lbl[loop_sp] = c;
+}
 static void loop_pop(void) { loop_sp--; }
 
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (int i = 0; i < n->nbody; i++) gen_stmt(n->body[i]); break;
     case N_EMPTY: break;
-    case N_DECL:
-        if (n->init) {
-            Sym *s = lookup(n->name);
-            if (!s) error(n, "symbol not found '%s'", atom_str(n->name));
-            emit("lea rax, [rbp - %d]", s->offset);
-            emit("push rax");
-            gen_expr(n->init);
-            emit("pop rcx");
-            store_rcx_rxx(ty_size(s->type), 'a');
+    case N_DECLIST:
+        for (int i = 0; i < n->nbody; i++) {
+            Node *e = n->body[i];
+            if (e->init) {
+                Sym *s = lookup(e->name, e);
+                // XXX: should optimize if value is constant
+                gen_expr(e->init);
+                // XXX: should since destination is local
+                emit_comment(atom_str(e->name)); emit("lea rcx, [rbp - %d]", s->offset);
+                store_rcx(s->type, RAX);
+            }
         }
         break;
     case N_EXPR: n->lhs->discard = true; gen_expr(n->lhs); break;
@@ -2173,74 +2415,86 @@ static void gen_stmt(Node *n) {
         emit("leave"); emit("ret");
         break;
     case N_IF: {
-        int els = label_id++, end = label_id++;
-        gen_expr(n->cond); emit("test rax, rax"); emit("jz .L%d", els);
-        gen_stmt(n->lhs);  emit("jmp .L%d", end);
-        emit_label(els); if (n->rhs) gen_stmt(n->rhs);
-        emit_label(end);
+        int els = label_id++;
+        gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jz", els);
+        gen_stmt(n->lhs);
+        if (n->rhs) {
+            int end = label_id++; emit_jmp(n, "jmp", end);
+            emit_label(els); gen_stmt(n->rhs); els = end;
+        }
+        emit_label(els);
         break;
     }
     case N_WHILE: {
         int top = label_id++, end = label_id++;
         emit_label(top);
-        gen_expr(n->cond); emit("test rax, rax"); emit("jz .L%d", end);
-        loop_push(end, top); gen_stmt(n->lhs); loop_pop();
-        emit("jmp .L%d", top);
+        gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jz", end);
+        loop_push(n, end, top); gen_stmt(n->lhs); loop_pop();
+        // XXX: should duplicate test
+        emit_jmp(n, "jmp", top);
         emit_label(end);
         break;
     }
     case N_DOWHILE: {
-        int top = label_id++, cont = label_id++, end = label_id++;
+        int top = label_id++, cont = 0, end = 0;
+        if (n->ival & HAS_CONTINUE) cont = label_id++;
+        if (n->ival & HAS_BREAK) end = label_id++;
         emit_label(top);
-        loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
+        loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
         emit_label(cont);
-        gen_expr(n->cond); emit("test rax, rax"); emit("jnz .L%d", top);
+        gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jnz", top);
         emit_label(end);
         break;
     }
     case N_FOR: {
-        int top = label_id++, cont = label_id++, end = label_id++;
+        int top = label_id++, cont = top, end = 0;
+        if (n->rhs && (n->ival & HAS_CONTINUE)) cont = label_id++;
+        if (n->cond || (n->ival & HAS_BREAK)) end = label_id++;
         if (n->init) gen_stmt(n->init);
         emit_label(top);
-        if (n->cond) { gen_expr(n->cond); emit("test rax, rax"); emit("jz .L%d", end); }
-        loop_push(end, cont); gen_stmt(n->lhs); loop_pop();
-        emit_label(cont);
-        if (n->rhs) { n->rhs->discard = true; gen_expr(n->rhs); }  // step
-        emit("jmp .L%d", top);
+        if (n->cond) { gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jz", end); }
+        loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
+        if (n->rhs) {
+            if (cont != top) emit_label(cont);
+            n->rhs->discard = true; gen_expr(n->rhs);  // step
+        }
+        // XXX: should duplicate test
+        emit_jmp(n, "jmp", top);
         emit_label(end);
         break;
     }
     case N_BREAK:
-        if (loop_sp == 0) error(n, "'break' outside loop or switch");
-        emit("jmp .L%d", brk_lbl[loop_sp-1]);
+        emit_jmp(n, "jmp", brk_lbl[loop_sp]);
         break;
     case N_CONTINUE:
-        if (loop_sp == 0) error(n, "'continue' outside loop");
-        emit("jmp .L%d", cont_lbl[loop_sp-1]);
+        emit_jmp(n, "jmp", cont_lbl[loop_sp]);
         break;
     case N_SWITCH: {
         gen_expr(n->cond);
         // Emit "if (switch_value == case_value) goto case_label" for every case.
         // XXX: should check for duplicates
-        int def = -1;
+        int def = 0, end = 0;
         for (Node *e = n->rhs; e; e = e->rhs) {
             long val;
             e->ival = label_id++;
             if (e->kind == N_CASE) {
                 if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
+                char cbuf[6];
+                if (val >= ' ' && val < 127) {
+                    snprintf(cbuf, sizeof(cbuf), "'%c'", (int)val);
+                    emit_comment(cbuf);
+                }
                 emit("cmp rax, %ld", val);
-                emit("jz .L%d", (int)e->ival);
+                emit_jmp(n, "jz", (int)e->ival);
             } else {
-                if (def >= 0) error(e, "duplicate 'default' in 'switch' statement");
                 def = (int)e->ival;
             }
         }
-        int end = label_id++;
-        emit("jmp .L%d", def >= 0 ? def : end);   // no match -> default or end
+        if ((n->ival & HAS_BREAK) || !def) end = label_id++;
+        emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
 
         // break exits the switch; continue passes through to the enclosing loop
-        int current_cont = (loop_sp > 0) ? cont_lbl[loop_sp-1] : -1;
-        loop_push(end, current_cont);
+        loop_push(n, end, cont_lbl[loop_sp]);
         gen_stmt(n->lhs);               // the body places the case labels inline
         loop_pop();
         emit_label(end);
@@ -2249,13 +2503,16 @@ static void gen_stmt(Node *n) {
     case N_CASE: {
         char buf[32];
         long val; eval_expr(n->cond, &val);
-        snprintf(buf, sizeof(buf), "case %ld", val);
-        emit_label2((int)n->ival, buf);
+        if (val >= ' ' && val < 127) snprintf(buf, sizeof(buf), "case %d ('%c')", (int)val, (int)val);
+        else snprintf(buf, sizeof(buf), "case %ld", val);
+        emit_comment(buf);
+        emit_label((int)n->ival);
         break;
     }
     case N_DEFAULT:
     case N_LABEL:
-        emit_label2((int)n->ival, atom_str(n->name));
+        emit_comment(atom_str(n->name));
+        emit_label((int)n->ival);
         break;
     case N_GOTO: {
         Label *lab = find_label(n->name);
@@ -2264,11 +2521,27 @@ static void gen_stmt(Node *n) {
             break;
         }
         lab->used = true;
-        emit_comment(atom_str(n->name)); emit("jmp .L%d", (int)lab->n->ival);
+        emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", (int)lab->n->ival);
         break;
     }
     case N_ASM: gen_asm(n); break;
     default: gen_expr(n); break;                    // expression used as statement
+    }
+}
+
+static bool has_flow(Node *n) {
+    if (!n) return true;
+    switch (n->kind) {
+    case N_GOTO:
+    case N_RETURN: return false;
+    case N_BLOCK:  return !n->nbody || has_flow(n->body[n->nbody - 1]);
+    case N_IF:     return has_flow(n->lhs) | has_flow(n->rhs);
+    case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
+    case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
+                   return has_flow(n->lhs);
+    //case N_WHILE: case N_DOWHILE: // XXX: check constant loop condition and break
+    //case N_CALL:    // XXX: check for _Noreturn attribute
+    default:       return true;
     }
 }
 
@@ -2292,18 +2565,26 @@ static void gen_func(Func *fn) {
     if (fs > 0) emit("sub rsp, %d", fs);
     for (int i = 0; i < fn->nparams && i < 6; i++) {
         Sym *s = sym_find(locals, fn->params[i]->name);
-        int sz = ty_size(s->type);
-        if (sz == 1) emit("mov [rbp - %d], %s", s->offset,
-                          i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
-        else emit("mov [rbp - %d], %s", s->offset, ARGREG[i]);
+        emit_comment(atom_str(fn->params[i]->name));
+        emit("mov [rbp - %d], %s", s->offset, reg64[ARGREG[i]]);
     }
     if (fn->is_variadic) {
         // spill all six integer arg registers so va_arg can walk them
-        //const char *r[6] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
-        for (int i = 0; i < 6; i++) emit("mov [rbp - %d], %s", va_off - i * 8, ARGREG[i]);
+        // XXX: should only spill arg registers beyond the 'last' named parameter
+        for (int i = 0; i < 6; i++) emit("mov [rbp - %d], %s", va_off - i * 8, reg64[ARGREG[i]]);
     }
     gen_stmt(fn->body);
-    emit("leave"); emit("ret");             // safety epilogue
+    if (has_flow(fn->body)) {
+        if (fn->name == ID_MAIN) {
+            emit("xor rax, rax");   // main returns 0 by default
+        } else
+        if (fn->rtype != ty_void()) {
+            // should flag non void functions with out flow
+            // disabled for now because loops and switches are not full analysed
+            warning(fn->endpos, "function '%s': missing return statement", atom_str(fn->name));
+        }
+        emit("leave"); emit("ret"); // safety epilogue
+    }
 }
 
 static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
@@ -2324,7 +2605,8 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
                 case 1: emit(".byte %ld", ival); return;
                 case 2: emit(".short %ld", ival); return;
                 case 4: emit(".long %ld", ival); return;
-                default: emit(".quad %ld", ival); return;
+                case 8: emit(".quad %ld", ival); return;
+                default: warning(t->pos, "invalid alignment %d for type %d", t->align, t->kind); exit(1);
                 }
             }
             break;
@@ -2372,9 +2654,9 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         else if (mname) { warning(init->lineno, "unsupported initializer for member '%s'", mname); }
         else { warning(init->lineno, "unsupported initializer"); }
     }
-    int sz = ty_size(t); if (sz < 1) sz = 8;
     emit_entry(name);
     emit_comment(mname);
+    int sz = ty_size(t); if (sz < 1) sz = 8;
     emit(".zero %d", sz);
 }
 
@@ -2496,12 +2778,12 @@ int main(int argc, char **argv) {
         emit_entry(ID_START);
         emit("cld");
         emit("xor rbp, rbp");
-        emit("mov rdi, [rsp]    # argc");
-        emit("lea rsi, [rsp+8]  # argv");
-        emit("lea rdx, [rsi+8*rdi+8]  # envp");
+        emit_comment("argc"); emit("mov rdi, [rsp]");
+        emit_comment("argv"); emit("lea rsi, [rsp+8]");
+        emit_comment("envp"); emit("lea rdx, [rsi+8*rdi+8]");
         emit("call main");
         emit("mov rdi, rax");
-        emit("mov rax, 60       # SYS_exit");
+        emit_comment("SYS_exit"); emit("mov rax, 60");
         emit("syscall");
     }
 
