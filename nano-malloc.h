@@ -1,3 +1,4 @@
+#ifndef ARENA_LENGTH
 // stdlib.h
 #define ARENA_LENGTH 88000000 // 88MB should suffice for everyone
 unsigned char arena[ARENA_LENGTH];
@@ -36,3 +37,4 @@ char *strdup(const char *s) {
     size_t size = strlen(s) + 1; char *p = malloc(size);
     if (p) return memcpy(p, s, size); return p;
 }
+#endif

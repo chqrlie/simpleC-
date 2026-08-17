@@ -2,29 +2,6 @@
 #ifndef NANO_NOLIBC_H
 #define NANO_NOLIBC_H
 
-#ifdef __GNUC__
-#define FILE xFILE
-#undef strlen
-#undef memcpy
-#undef memset
-#undef strcmp
-#undef stdin
-#undef stdout
-#undef stderr
-#undef NULL
-#undef EOF
-#undef islower
-#undef isupper
-#undef isalpha
-#undef isdigit
-#undef isxdigit
-#undef isalnum
-#undef isblank
-#undef isspace
-#undef tolower
-#undef toupper
-#endif
-
 #define _Noreturn
 
 // stdbool.h (should make these keywords)

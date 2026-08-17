@@ -43,3 +43,4 @@ static inline long sys_write(int fd, const char *buf, long count) {
     );
     return ret;
 }
+#endif
