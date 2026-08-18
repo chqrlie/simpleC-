@@ -1,6 +1,6 @@
 #ifndef ARENA_LENGTH
 // stdlib.h
-#define ARENA_LENGTH 88000000 // 88MB should suffice for everyone
+#define ARENA_LENGTH 4194304 // 4MB should suffice for everyone
 unsigned char arena[ARENA_LENGTH];
 size_t arena_top;
 size_t arena_last;

@@ -900,16 +900,16 @@ struct Node {
     unsigned char kind;
     unsigned char op;       // token kind for N_BIN / N_POST (T_INC/T_DEC)
     bool  discard;          // N_ASSIGN: value of assignment expression is discarded
+    unsigned char nargs;    // N_CALL
     int   pos;
     long  ival;             // N_NUM, N_CASE, N_DEFAULT, N_LABEL, N_FOR, N_DO, N_WHILE, N_SWITCH
     atom_t str;             // N_STR, N_ASM decoded text
     atom_t name;            // N_VAR / N_CALL / N_DECL
     Type *type;             // result / declared type
     Node *lhs, *rhs, *cond, *init;
+    Node *elems, *next;     // N_BLOCK, N_DECLIST
 #define MAX_ARGS 6
-    int nargs, nbody;
     Node *args[MAX_ARGS];
-    Node *body[512];        // N_BLOCK, N_DECLIST statements
 };
 
 static Token *cur(void);
@@ -921,6 +921,9 @@ static Node *new_node(int k) {
 static Node *new_node1(int k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
 static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
 static Node *new_num_node(long ival, Type *t) { Node *n = new_node(N_NUM); n->ival = ival; n->type = t; return n; }
+static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
+static int node_length(Node *n) { int len = 0; while (n) { len++; n = n->next; } return len; }
+
 static void error(Node *n, const char *fmt, ...) attr_printf(2,3);
 static void error(Node *n, const char *fmt, ...) {
     int pos = n ? n->pos : cur()->pos;
@@ -1332,8 +1335,9 @@ static Node *parse_expr(void) {
 static Node *parse_decl_stmt(void) {
     long flags;
     Type *base = parse_type_base_only(&flags);   // fwd-declared below
-    Node *blk = new_node(N_DECLIST);
-    if (eat(T_SEMI)) return blk;           // bare  struct Foo { ... };  (type only)
+    Node *n = new_node(N_DECLIST);
+    if (eat(T_SEMI)) return n;           // bare  struct Foo { ... };  (type only)
+    Node **tailp = &n->elems;
     for (;;) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
@@ -1343,14 +1347,14 @@ static Node *parse_decl_stmt(void) {
         if (eat(T_ASSIGN)) {
             d->init = parse_init();
             if (t->kind == TY_ARRAY && t->arr_len < 0 && d->init->kind == N_BLOCK) {
-                t->arr_len = d->init->nbody;
+                t->arr_len = node_length(d->init->elems);
             }
         }
-        blk->body[blk->nbody++] = d;
+        *tailp = d; tailp = &d->next;
         if (!eat(T_COMMA)) break;
     }
     expect(T_SEMI);
-    return blk;
+    return n;
 }
 // parse just the base type (no trailing stars) — stars belong to each declarator
 static Type *parse_type_base_only(long *pflags) {
@@ -1418,8 +1422,10 @@ static Node *parse_typedef(void) {
 static Node *parse_init(void) {
     if (at(T_LBRACE)) {
         Node *n = new_node(N_BLOCK); P++;
+        Node **tailp = &n->elems;
         while (!at(T_RBRACE) && !at(T_EOF)) {
-            n->body[n->nbody++] = parse_init();
+            Node *e = parse_init();
+            *tailp = e; tailp = &e->next;
             if (!eat(T_COMMA)) break;
         }
         expect(T_RBRACE);
@@ -1443,7 +1449,11 @@ static Node *parse_loop_body(Node *n) {
 static Node *parse_block(void) {
     if (!at(T_LBRACE)) expect(T_LBRACE);
     Node *n = new_node(N_BLOCK); P++;
-    while (!at(T_RBRACE) && !at(T_EOF)) n->body[n->nbody++] = parse_stmt();
+    Node **tailp = &n->elems;
+    while (!at(T_RBRACE) && !at(T_EOF)) {
+        Node *e = parse_stmt();
+        *tailp = e; tailp = &e->next;
+    }
     expect(T_RBRACE);
     return n;
 }
@@ -1678,7 +1688,7 @@ static void parse_toplevel(void) {
     if (at(K_TYPEDEF)) {
         // XXX: should be handled like a decl
         Node *n = parse_typedef();
-        for (int i = 0; i < n->nbody; i++) { add_typedef(n->body[i]); }
+        for (Node *e = n->elems; e; e = e->next) add_typedef(e);
         return;
     }
     long flags;
@@ -1741,7 +1751,7 @@ static void parse_toplevel(void) {
         if (verbose) printf("-> %s\n", atom_str(nm));
         return;
     }
-    // global variable(s):  type name [= ...] (, ...) ;   (initialisers ignored -> .bss)
+    // global variable(s):  type name [= ...] (, ...) ;
     for (;;) {
         int pos = toks[P].pos;
         if (eat(T_LBRK)) t = parse_array(t);
@@ -1749,7 +1759,7 @@ static void parse_toplevel(void) {
         if (eat(T_ASSIGN)) {
             sym->init = parse_init();
             if (t->kind == TY_ARRAY && t->arr_len < 0 && sym->init->kind == N_BLOCK) {
-                t->arr_len = sym->init->nbody;
+                t->arr_len = node_length(sym->init->elems);
             }
         }
         if (verbose) printf("-> %s\n", atom_str(nm));
@@ -1776,7 +1786,7 @@ static void collect_locals(Node *n) {
     if (!n) return;
     switch (n->kind) {
       case N_DECLIST:
-      case N_BLOCK: for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]); break;
+      case N_BLOCK: for (Node *e = n->elems; e; e = e->next) collect_locals(e); break;
       case N_DECL:
         if (!sym_find(locals, n->name)) add_local(n->name, n->pos, n->type);
         if (n->init) collect_locals(n->init);
@@ -1855,7 +1865,7 @@ static void check_used(Node *n) {
         case N_DECLIST:
         case N_BLOCK:
             // XXX: should handle scoping
-            for (int i = 0; i < n->nbody; i++) check_used(n->body[i]); break;
+            for (Node *e = n->elems; e; e = e->next) check_used(e); break;
         case N_DECL: check_used(n->init); break; // XXX: should handle scoping
         case N_IF: case N_TERNARY:
             check_used(n->cond); check_used(n->lhs); check_used(n->rhs); break;
@@ -2449,11 +2459,10 @@ static void loop_pop(void) { loop_sp--; }
 
 static void gen_stmt(Node *n) {
     switch (n->kind) {
-    case N_BLOCK: for (int i = 0; i < n->nbody; i++) gen_stmt(n->body[i]); break;
+    case N_BLOCK: for (Node *e = n->elems; e; e = e->next) gen_stmt(e); break;
     case N_EMPTY: break;
     case N_DECLIST:
-        for (int i = 0; i < n->nbody; i++) {
-            Node *e = n->body[i];
+        for (Node *e = n->elems; e; e = e->next) {
             if (e->init) {
                 Sym *s = lookup(e->name, e);
                 // XXX: should optimize if value is constant
@@ -2589,7 +2598,7 @@ static bool has_flow(Node *n) {
     switch (n->kind) {
     case N_GOTO:
     case N_RETURN: return false;
-    case N_BLOCK:  return !n->nbody || has_flow(n->body[n->nbody - 1]);
+    case N_BLOCK:  return has_flow(node_last(n->elems));
     case N_IF:     return has_flow(n->lhs) | has_flow(n->rhs);
     case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
     case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
@@ -2686,8 +2695,10 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         case TY_ARRAY:
             if (init->kind == N_BLOCK) {
                 emit_entry(name);
+                Node *e = init->elems;
                 for (int i = 0; i < t->arr_len; i++) {
-                    gen_init(t->ptr, 0, init->body[i], NULL);
+                    gen_init(t->ptr, 0, e, NULL);
+                    if (e) e = e->next;
                 }
                 return;
             }
@@ -2697,9 +2708,10 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         case TY_UNION:
             if (init->kind != N_BLOCK) break;
             emit_entry(name);
-            int i = 0;
-            for (Member *m = t->members; m; m = m->next, i++) {
-                gen_init(m->type, 0, init->body[i], atom_str(m->name));
+            Node *e = init->elems;
+            for (Member *m = t->members; m; m = m->next) {
+                gen_init(m->type, 0, e, atom_str(m->name));
+                if (e) e = e->next;
                 if (m->pad) emit(".zero %d", m->pad);
                 if (t->kind == TY_UNION) break;
             }

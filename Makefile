@@ -28,7 +28,7 @@ ifneq (,$(NORUN))
 RUN	= @\#
 endif
 
-.PHONY: all run test demo structs bitwise printf switch clean nano
+.PHONY: all test_all run test demo structs bitwise printf switch clean nano
 
 INC = nano-malloc.h nano-nolibc.h
 
