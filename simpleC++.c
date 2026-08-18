@@ -86,7 +86,11 @@ static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); n
 //#define emit_comment(comment) next_comment = (comment)
 static void emit_comment(const char *comment) { next_comment = comment; }
 
-static int xdigit(int d) { return (d <= '9') ? d - '0' : ((d - 'A') & 0x1f) + 10; }
+static int xdigit(int d) {
+    if (d >= '0' && d <= '9') return d - '0';
+    if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
+    return 255;
+}
 static size_t skip_blanks(const char *s) {
     size_t i = 0;
     while (s[i] == ' ' || s[i] == '\t') i++;
@@ -167,6 +171,34 @@ static long now(void) {
     return tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
+// Reallocatable string buffer
+typedef struct sbuf_t { char *buf; size_t len, cap; } sbuf_t;
+
+static bool sbuf_init(sbuf_t *sb, size_t cap) {
+    sb->len = 0; sb->cap = cap; sb->buf = cap ? alloc(cap, 1) : NULL; return true;
+}
+static void sbuf_deinit(sbuf_t *sb) { free(sb->buf); }
+static bool sbuf_realloc(sbuf_t *sb) {
+    size_t cap = sb->cap; sb->buf = reallocate(sb->buf, &cap, 1); sb->cap = cap; return true;
+}
+static char *sbuf_getptr(sbuf_t *sb) { if (sb->cap) sb->buf[sb->len] = '\0'; return sb->buf; }
+static bool sbuf_putc(sbuf_t *sb, char c) {
+    if (sb->len + 2 > sb->cap) sbuf_realloc(sb); sb->buf[sb->len++] = c; return true;
+}
+static bool sbuf_put(sbuf_t *sb, const char *s, size_t len) {
+    while (sb->len + len + 1 > sb->cap) sbuf_realloc(sb);
+    memcpy(sb->buf + sb->len, s, len); sb->len += len; return true;
+}
+//static bool sbuf_puts(sbuf_t *sb, const char *s) { return sbuf_put(sb, s, strlen(s)); }
+static size_t sbuf_load_file(sbuf_t *sb, FILE *f) {
+    for (;;) {
+        if (sb->len + 1 >= sb->cap) sbuf_realloc(sb);
+        size_t nread = fread(sb->buf + sb->len, 1, sb->cap - sb->len - 1, f);
+        if (!nread) return sb->len;
+        sb->len += nread;
+    }
+}
+
 // =====================================================================
 // 0.1. ATOM TABLE -> convert names and strings to single atoms
 // =====================================================================
@@ -201,10 +233,11 @@ static atom_t new_atom_len(const char *str, size_t len) {
     }
     if (natoms >= atoms_cap) { atoms = reallocate(atoms, &atoms_cap, sizeof(Atom*)); }
     Atom *ap = alloc(1, sizeof(Atom) - 7 + len + 1);
+    ap->next = atom_hash[hash];
+    ap->len = (unsigned int)len;
+    ap->flags = 0;
     memcpy(ap->str, str, len);
     ap->str[len] = 0;
-    ap->len = (unsigned int)len;
-    ap->next = atom_hash[hash];
     a = (atom_t)natoms++;
     atom_hash[hash] = a;
     atoms[a] = ap;
@@ -257,11 +290,9 @@ enum {
 static const char *token_name[T_count] = {
     "", "<EOF>", "number", "identifier", "string", "char const",
     "+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>",
-    "==", "!=", "<", ">", "<=", ">=",
-    "&&", "||", "!", "~", "++", "--",
+    "==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "~", "++", "--",
     "=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=",
-    "(", ")", "[", "]", "{", "}",
-    ";", ",", "?", ":", ".", "->", "...",
+    "(", ")", "[", "]", "{", "}", ";", ",", "?", ":", ".", "->", "...",
     "int", "long", "char", "short", "void", "float", "double",
     "signed", "unsigned", "const", "volatile", "inline",
     "auto", "static", "register", "extern", "typedef",
@@ -289,9 +320,6 @@ static void lex_init(void) {
 // =====================================================================
 // 1. PREPROCESSOR  ->  produces a single clean source buffer in SRC
 // =====================================================================
-#define MAX_SRC   400000
-static char SRC[MAX_SRC];
-static size_t SRC_LEN;
 
 // A macro is either object-like (#define PI 3) or function-like
 // (#define MAX(a,b) ((a)>(b)?(a):(b))).  For function-like macros we keep
@@ -326,12 +354,6 @@ static void macro_undef(atom_t name) {
         m->name = 0;
     }
 }
-
-static void src_putc(char c) {
-    if (SRC_LEN >= MAX_SRC - 1) die("source too large");
-    SRC[SRC_LEN++] = c;
-}
-static void src_puts(const char *s) { while (*s) src_putc(*s++); }
 
 typedef struct MacroArguments {
     const char *argv[8];
@@ -370,13 +392,12 @@ static size_t subst_macro_body(const Macro *m, MacroArguments *ma, char *out, si
 }
 
 // Expand object-like and simple function-like macros in one logical line.
-static void expand_line(const char *in) {
+static void expand_line(const char *in, sbuf_t *sb) {
     char work[8192];
-    pstrcpy(work, sizeof(work), in);
-    for (int pass = 0; pass < 8; pass++) {
+    const char *p = in;
+    for (int pass = 0;; pass++) {
         char out[8192]; size_t j = 0; bool changed = false;
-        char *p = work;
-        char *q = p;
+        const char *q = p;
         char c;
         while ((c = *p) != '\0') {
             if (c == '"' || c == '\'') { p += skip_string(p, NULL); continue; }
@@ -427,28 +448,28 @@ static void expand_line(const char *in) {
                 p++;
             }
         }
+        if (!changed) { sbuf_put(sb, q, (size_t)(p - q)); return; }
         j += pmemcpy(out + j, sizeof(out) - j, q, (size_t)(p - q));
         if (j >= sizeof(out)) die("macro expansion overflow");
-        memcpy(work, out, j);
-        work[j] = '\0';
-        if (!changed) break;
+        if (pass == 8) { sbuf_put(sb, out, j); return; }    // should complain about recursion
+        memcpy(work, out, j); work[j] = '\0';
+        p = work;
     }
-    src_puts(work);
 }
 
-// Strip // and /* */ comments (string/char aware) into `dst`.
-static char *strip_comments(const char *s, size_t len) {
-    char *dst = alloc(len + 1, 1), *out = dst;
+// Strip // and /* */ comments (string/char aware) in place.
+static size_t strip_comments(char *s) {
+    char *dst = s, *out = dst;
     const char *p = s, *q = p;
     char c;
     while ((c = *p) != '\0') {
         if (c == '"' || c == '\'') {
             p += skip_string(p, NULL);
         } else if (c == '/' && p[1] == '/') {
-            memcpy(out, q, (size_t)(p - q)); out += p - q;
+            while (q < p) *out++ = *q++;
             while (*p && *p != '\n') p++; q = p;
         } else if (c == '/' && p[1] == '*') {
-            memcpy(out, q, (size_t)(p - q)); out += p - q;
+            while (q < p) *out++ = *q++;
             p += 2;
             while (*p && !(*p == '*' && p[1] == '/'))
                 if (*p++ == '\n') *out++ = '\n';    // preserve line numbers
@@ -458,16 +479,15 @@ static char *strip_comments(const char *s, size_t len) {
             p++;
         }
     }
-    memcpy(out, q, (size_t)(p - q + 1));
-    out += p - q;
-    if (verbose) printf("Stripped: %td bytes\n", out - dst);
-    return dst;
+    while (q < p) *out++ = *q++;
+    *out = '\0';
+    return out - dst;
 }
 
-static void preprocess(const char *path);   // fwd
+static void preprocess(const char *path, sbuf_t *sb);
 
 // Process already-comment-stripped text of one file.
-static void process_text(const char *text) {
+static void process_text(const char *text, sbuf_t *sb) {
     int cond_sp = 0; long skip = 0, seen_else = 0;
 
     const char *cursor = text;
@@ -568,7 +588,7 @@ static void process_text(const char *text) {
                     p += k;
                 }
                 break;
-            case K_LINE: src_puts(line); break;
+            case K_LINE: sbuf_put(sb, line, li); break;
             case K_INCLUDE:
                 if (!skip) {
                     char fn[256]; size_t k;
@@ -576,14 +596,14 @@ static void process_text(const char *text) {
                         k = skip_until(p + 1, '"');
                         pstrncpy(fn, sizeof(fn), p + 1, k);
                         p += k + 1 + (*p == '"');
-                        preprocess(fn);
+                        preprocess(fn, sb);
                     } else
                     if (*p == '<') {
                         k = skip_until(p + 1, '>');
                         p += k + 1 + (*p == '>');
                         if (!has_library) {
-                            preprocess("nano-nolibc.h");
-                            preprocess("nano-malloc.h");
+                            preprocess("nano-nolibc.h", sb);
+                            preprocess("nano-malloc.h", sb);
                             has_library = true;
                         }
                     }
@@ -594,12 +614,11 @@ static void process_text(const char *text) {
                 break;
             }
         } else {
-            if (!skip) expand_line(line);
+            if (!skip) expand_line(line, sb);
         }
-        src_putc('\n'); src_pos++; // preserve line numbers
+        sbuf_putc(sb, '\n'); src_pos++; // preserve line numbers
     }
     if (cond_sp) warning(src_pos, "missing '#endif'");
-    SRC[SRC_LEN] = 0;
 }
 
 static int sharp_line_set(int pos, const char *path, int lineno) {
@@ -610,33 +629,29 @@ static int sharp_line_set(int pos, const char *path, int lineno) {
     }
     return (fn << 24) + lineno;
 }
-static void sharp_line(int pos) {
+static void sharp_line(int pos, sbuf_t *sb) {
     if (pos) {
-        char buf[300]; snprintf(buf, sizeof(buf), "#line %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
-        src_puts(buf);
+        char buf[300]; int len = snprintf(buf, sizeof(buf), "#line %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
+        sbuf_put(sb, buf, len);
     }
 }
 
-static void preprocess(const char *path) {
+static void preprocess(const char *path, sbuf_t *sb) {
     FILE *f = fopen(path, "r");
     if (!f) { die("%s: cannot open %s\n", progname, path); }
-    size_t raw_cap = 64 * 1024;
-    char *raw = alloc(raw_cap, 1);
-    size_t n = 0, nread;
-    while ((nread = fread(raw + n, 1, raw_cap - n - 1, f)) > 0) {
-        if ((n += nread) + 1 >= raw_cap) { raw = reallocate(raw, &raw_cap, 1); }
-    }
-    raw[n] = 0;
+    sbuf_t raw[1]; sbuf_init(raw, 64 * 1024);
+    size_t n = sbuf_load_file(raw, f);
     if (verbose) printf("Read %s: %zu bytes\n", path, n);
     fclose(f);
     int save_pos = src_pos;
     src_pos = sharp_line_set(src_pos, path, 1);
-    sharp_line(src_pos);
-    char *nocmt = strip_comments(raw, n);
-    process_text(nocmt);   // may recurse (with its own buffers)
-    sharp_line(src_pos = save_pos);
-    free(raw); free(nocmt);
-    if (verbose) printf("Preprocessed: %zu bytes\n", SRC_LEN);
+    sharp_line(src_pos, sb);
+    raw->len = strip_comments(sbuf_getptr(raw));
+    if (verbose) printf("Stripped: %td bytes\n", raw->len);
+    process_text(sbuf_getptr(raw), sb);   // may recurse (with its own buffers)
+    sharp_line(src_pos = save_pos, sb);
+    sbuf_deinit(raw);
+    if (verbose) printf("Preprocessed: %zu bytes\n", sb->len);
 }
 
 // =====================================================================
@@ -644,7 +659,10 @@ static void preprocess(const char *path) {
 // =====================================================================
 
 typedef struct {
-    int   kind;
+    unsigned char kind;
+    bool  is_unsigned;   // T_NUM
+    bool  is_long;       // T_NUM
+    unsigned char base;  // T_NUM
     int   pos;
     long  ival;          // T_NUM / T_CHAR
     atom_t text;         // T_ID, T_STR (decoded bytes)
@@ -654,38 +672,36 @@ typedef struct {
 static Token toks[MAX_TOK];
 static size_t ntok;
 
-static void add_tok(int kind) { toks[ntok].kind = kind; toks[ntok].pos = src_pos; ntok++; }
+static Token *add_tok(int kind) { Token *t = &toks[ntok++]; t->kind = kind; t->pos = src_pos; return t; }
 static const char *token_str(Token *t) {
     return atom_str(t->kind == T_ID ? t->text : (atom_t)t->kind);
 }
 
-#define sp SRC_INDEX        // avoid problem with generated assembly '[rip+sp]' considered invalid
-static size_t sp;           // scan position in SRC
-static void skip_space(void) { while (isspace((unsigned char)SRC[sp])) if (SRC[sp++] == '\n') src_pos++; }
-
-static int read_escape(void) {            // SRC[sp] points just past a backslash
-    int c = (unsigned char)SRC[sp++];
+static int read_escape(const char *p, size_t *len) { // `p` points just past a backslash
+    *len = 1;
+    int c = *p++;
     switch (c) {
-    case 0: sp--; return 0;
+    case 0: *len = 0; return 0;
     case 'n': return '\n';  case 't': return '\t';  case 'r': return '\r';
     case 'b': return '\b';  case 'f': return '\f';  case 'v': return '\v';
     case '\\': case '\'': case '"': return c;
     case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7':
         c -= '0';
-        if (SRC[sp] >= '0' && SRC[sp] <= '7') {
-            c = (c << 3) + (SRC[sp++] - '0');
-            if (SRC[sp] >= '0' && SRC[sp] <= '7') {
-                c = (c << 3) + (SRC[sp++] - '0');
+        if (*p >= '0' && *p <= '7') {
+            c = (c << 3) + (*p++ - '0'); *len = 2;
+            if (*p >= '0' && *p <= '7') {
+                c = (c << 3) + (*p++ - '0'); *len = 3;
             }
         }
-        return c;
+        return (unsigned char)c;
     case 'x':
         c = 0;
-        while (isxdigit((unsigned char)SRC[sp])) c = c * 16 + xdigit((unsigned char)SRC[sp]);
-        return c;
+        int d;
+        while ((d = xdigit(*p++)) < 16) { c = c * 16 + d; *len += 1; }
+        return (unsigned char)c;
     default:
         warning(src_pos, "invalid escape sequence '\\%c'", c);
-        return c;
+        return (unsigned char)c;
     }
 }
 
@@ -718,79 +734,83 @@ static char const ops[] = {
 #undef ____
 };
 
-static void lex(void) {
+static size_t lex(const char *p) {
+    const char *start = p;
     for (;;) {
-        skip_space();
-        char c = SRC[sp];
-        if (c == 0) { add_tok(T_EOF); break; }
+        p += skip_blanks(p);
+        unsigned char c = *p++;
+        if (c == '\n') { src_pos++; }
+        if (isspace(c)) continue;
 
-        if (isdigit((unsigned char)c)) {
-            long v = 0;
+        if (c == 0) { p--; add_tok(T_EOF); break; }
+        if (isdigit(c)) {
+            Token *t = add_tok(T_NUM);
+            long v = c - '0';
+            int base = 10, d;
             if (c == '0') {
-                if (SRC[sp+1] == 'x' || SRC[sp+1] == 'X') {
-                    sp += 2;
-                    while (isxdigit((unsigned char)SRC[sp])) {
-                        v = v * 16 + xdigit(SRC[sp++]);
-                    }
-                } else {
-                    while (SRC[sp] >= '0' && SRC[sp] <= '7') v = v * 8 + (SRC[sp++] - '0');
+                switch (*p | 0x20) {  // lowercase if letter
+                case 'x': base = 16; p++; break;
+                case 'b': base = 2;  p++; break;
+                case 'o': base = 8;  p++; break;
+                default:  base = 8;        break;
                 }
-            } else {
-                while (isdigit((unsigned char)SRC[sp])) v = v * 10 + (SRC[sp++] - '0');
             }
-            if (c == '.' || c == 'E' || c == 'e') die("floating point not supported");
-            if (isalnum((unsigned char)SRC[sp])) die("invalid integer literal");
-            toks[ntok].ival = v; add_tok(T_NUM); continue;
+            while ((d = xdigit(c = *p)) < base) { v = v * base + d; p++; }
+            t->base = base;
+            t->ival = v;
+            if (isdigit(c)) die("invalid digit '%c' for base %d", c, base);
+            if (c == '.' || (c | 0x20) == 'e') die("floating point not supported");
+            for (;; c = *++p) {
+                switch (c | 0x20) {
+                case 'u': t->is_unsigned = true; continue;
+                case 'l': t->is_long     = true; continue;
+                }
+                break;
+            }
+            if (isalnum(c)) die("integer literal suffix '%c'", c);
+            continue;
         }
-        if (isalpha((unsigned char)c) || c == '_') {
-            size_t i = sp; sp += skip_word(&SRC[sp]);
-            atom_t name = new_atom_len(SRC + i, sp - i);
+        if (isalpha(c) || c == '_') {
+            size_t k = skip_word(p);
+            atom_t name = new_atom_len(p - 1, k + 1); p += k;
             if (IS_KEYWORD(name)) { add_tok((int)name); continue; }
-            toks[ntok].text = name; add_tok(T_ID); continue;
+            Token *t = add_tok(T_ID); t->text = name; ; continue;
         }
-        if (c == '"') {  // string literal
+        if (c == '"' || c == '\'') {  // string literal / character constant
             char buf[8192]; size_t len = 0;
-            sp++;                                 // skip opening quote
-            while (SRC[sp] && SRC[sp] != '"' && SRC[sp] != '\n') {
-                int ch = SRC[sp++];
-                if (ch == '\\') ch = read_escape();
-                if (len >= sizeof(buf)) die("string too long");
+            const char *thing = (c == '"') ? "string" : "character constant";
+            unsigned char ch;
+            while ((ch = *p++) != c) {
+                if (!ch || ch == '\n') { p--; die("unterminated %s", thing); }
+                if (ch == '\\') { size_t k; if (!*p) continue; ch = read_escape(p, &k); p += k; }
+                if (len >= sizeof(buf)) die("%s too long", thing);
                 buf[len++] = (char)ch;
             }
-            if (SRC[sp] != '"') die("unterminated string");
-            sp++;               // skip closing quote
-            toks[ntok].text = new_atom_len(buf, len); add_tok(T_STR); continue;
-        }
-        if (c == '\'') {  // character constant
-            sp++;
-            int ch = SRC[sp];
-            if (ch == '\\' && SRC[sp+1]) { sp++; ch = read_escape(); }
-            else if (ch) sp++;
-            if (SRC[sp] == '\'') sp++;
-            else die("malformed character constant");
-            toks[ntok].ival = ch; add_tok(T_CHAR); continue;
+            Token *t;
+            if (ch == '"') { t = add_tok(T_STR); t->text = new_atom_len(buf, len); continue; }
+            if (len != 1) die("malformed character constant");
+            t = add_tok(T_CHAR); t->ival = *buf; continue;
         }
         if (c == '.') {
-            if (isdigit((unsigned char)SRC[sp+1])) { die("floating point not supported"); }
-            if (SRC[sp+1] == '.' && SRC[sp+2] == '.') {
-                sp += 3; add_tok(T_ELLIPSIS); continue;
+            if (isdigit((unsigned char)*p)) { die("floating point not supported"); }
+            if (*p == '.' && p[1] == '.') {
+                p += 2; add_tok(T_ELLIPSIS); continue;
             }
-            sp += 1; add_tok(T_DOT); continue;
+            add_tok(T_DOT); continue;
         }
-        if (c == '-' && SRC[sp+1] == '>') { sp += 2; add_tok(T_ARROW); continue; }
-        const char *p = ops;
-        while (p < ops + sizeof(ops) && *p && *p != c) p += 5;
-        if (*p) {
-            if (p[2] && SRC[sp+1] == c) {
-                if (p[4] && SRC[sp+2] == '=') { sp += 3; add_tok(p[4]); continue; }
-                else { sp += 2; add_tok(p[2]); continue; }
+        if (c == '-' && *p == '>') { p++; add_tok(T_ARROW); continue; }
+        const char *pp = ops;
+        while (pp < ops + sizeof(ops) && *pp && *pp != c) pp += 5;
+        if (*pp) {
+            if (pp[2] && *p == c) {
+                if (pp[4] && p[1] == '=') { p += 2; add_tok(pp[4]); continue; }
+                else { p++; add_tok(pp[2]); continue; }
             }
-            if (p[3] && SRC[sp+1] == '=') { sp += 2; add_tok(p[3]); continue; }
-            else { sp += 1; add_tok(p[1]); continue; }
+            if (pp[3] && *p == '=') { p++; add_tok(pp[3]); continue; }
+            else { add_tok(pp[1]); continue; }
         }
         if (c == '#') { // parse #line number [filename]
-            p = SRC + sp + 1;
-             p += skip_blanks(p); p += skip_word(p); p += skip_blanks(p);
+            p += skip_blanks(p); p += skip_word(p); p += skip_blanks(p);
             const char *filename = NULL;
             int lineno = 0;
             while (isdigit((unsigned char)*p)) lineno = lineno * 10 + (*p++ - '0');
@@ -800,15 +820,14 @@ static void lex(void) {
                 filename = atom_str(new_atom_len(p, k));
             }
             src_pos = sharp_line_set(src_pos, filename, lineno);
-            sp += skip_until(&SRC[sp], '\n');
-            sp += (SRC[sp] == '\n');
+            p += skip_until(p, '\n');
+            p += (*p == '\n');
             continue;
         }
         warning(src_pos, "unknown character '%c' in source", c);
-        sp += 1;
-        continue;
     }
     if (verbose) printf("Tokenized: %zu tokens\n", ntok);
+    return p - start;
 }
 
 // =====================================================================
@@ -1182,7 +1201,10 @@ static Node *parse_primary(void) {
         }
         Node *n = parse_expr(); expect(T_RP); return n;
     }
-    if (at(T_NUM))  { Node *n = new_num_node(cur()->ival, ty_long()); P++; return n; }
+    if (at(T_NUM))  { Node *n = new_num_node(cur()->ival, cur()->is_unsigned ?
+                                             (cur()->is_long ? ty_ulong() : ty_uint()) :
+                                             (cur()->is_long ? ty_long() : ty_int()));
+                      P++; return n; }
     if (at(T_CHAR)) { Node *n = new_num_node(cur()->ival, ty_int());  P++; return n; }
     if (at(T_STR))  { return parse_string(); }
     if (at(T_ID)) {
@@ -2768,7 +2790,20 @@ static int output_token(FILE *fp, Token *t) {
     char buf[8192], c;
     const char *s = buf;
     switch (t->kind) {
-    case T_NUM:   snprintf(buf, sizeof buf, "%ld", t->ival); break;
+    case T_NUM: {
+            char *p = buf + 68; *--p = '\0';
+            unsigned long val = (unsigned long)t->ival;
+            unsigned char base = t->base;
+            if (t->is_unsigned) *--p = 'U';
+            if (t->is_long) *--p = 'L';
+            do { *--p = "0123456789abcdef"[val % base]; } while (val /= base);
+            switch (base) {
+            case 8:   if (*p != '0') *--p = '0'; break;
+            case 2:   *--p = 'b';    *--p = '0'; break;
+            case 16:  *--p = 'x';    *--p = '0'; break;
+            }
+            s = p; break;
+        }
     case T_ID:    s = atom_str(t->text); break;
     case T_STR:   gen_quoted_string(buf, sizeof(buf), atom_str(t->text), atom_len(t->text), '"'); break;
     case T_CHAR:  c = (char)t->ival; gen_quoted_string(buf, sizeof(buf), &c, 1, '\''); break;
@@ -2832,12 +2867,11 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
 // 8. MAIN
 // =====================================================================
 
-static _Noreturn void usage(const char *msg, const char *arg) {
-    if (msg) { fprintf(stderr, "%s: %s%s\n", progname, msg, arg); }
+static _Noreturn void usage(bool full) {
     fprintf(stderr, "Usage: %s [OPTIONS] <input.c> [<output.s]\n", progname);
-    if (!msg) {
+    if (full) {
         fprintf(stderr,
-                "  --kernel       kernel mode (no bss, no _start)\n"
+                "  --kernel       kernel mode (no bss, no _start/exit stub)\n"
                 "  --libc         hosted mode (no _start, link to the C library\n"
                 "  -E             output preprocessed test\n"
                 "  -ET            output preprocessed tokens\n"
@@ -2848,38 +2882,45 @@ static _Noreturn void usage(const char *msg, const char *arg) {
     exit(1);
 }
 
+static _Noreturn void arg_error(const char *msg, const char *arg) {
+    fprintf(stderr, "%s: %s%s\n", progname, msg, arg);
+    usage(false);
+}
+
 int main(int argc, char **argv) {
     // Optional flags may precede the file names.  --kernel suppresses the
     // Linux _start/exit stub so a bare-metal boot stub can provide the entry
     // point and simply call main() (no Linux syscalls exist in a kernel).
     long t0 = now();
     progname = argv[0];
-    if (argc == 1) usage(NULL, NULL);
+    if (argc == 1) usage(true);
     int preprocess_mode = 0, timings = 0;
     bool kernel_mode = false, libc_mode = false;
     const char *inpath = NULL, *outpath = NULL;
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
-        if (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
-        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(NULL, NULL);
+        if      (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
+        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(true);
         else if (!strcmp(arg, "--libc")) libc_mode = true;
         else if (!strcmp(arg, "-E")) preprocess_mode = 1;
         else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
         else if (!strcmp(arg, "-O")) optimize++;
         else if (!strcmp(arg, "-t")) timings++;
         else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
-        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) usage("missing output filename", ""); outpath = argv[++i]; }
-        else if (*arg == '-') usage("invalid option: ", arg);
+        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) arg_error("missing output filename", ""); outpath = argv[++i]; }
+        else if (*arg == '-') arg_error("invalid option: ", arg);
         else if (!inpath)  inpath  = arg;
         else if (!outpath) outpath = arg;
-        else usage("too many arguments", "");
+        else arg_error("too many arguments", "");
     }
-    if (!inpath) usage("missing filename", "");
+    if (!inpath) arg_error("missing filename", "");
 
     lex_init();
-    preprocess(inpath);
-    if (preprocess_mode == 1) { fputs(SRC, stdout); return 0; }
-    lex();
+    sbuf_t src[1]; sbuf_init(src, 128 * 1024);
+    preprocess(inpath, src);
+    if (preprocess_mode == 1) { fputs(sbuf_getptr(src), stdout); return 0; }
+    lex(sbuf_getptr(src));
+    sbuf_deinit(src);
 
     if (!preprocess_mode) { while (!at(T_EOF)) parse_toplevel(); }
     if (!outpath) {
