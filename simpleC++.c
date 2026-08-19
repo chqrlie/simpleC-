@@ -4,19 +4,6 @@
 // Emits GNU-as compatible x86_64 assembly (.intel_syntax noprefix) that
 // links with:  gcc -nostdlib -no-pie out.s -o prog
 //
-// Supported subset:
-//   * preprocessor: #include "...", #define (object macros),
-//                   #ifndef/#ifdef/#else/#endif include guards,
-//                   // and /* */ comments
-//   * types: int, long, char, void, pointers, arrays, struct/union,
-//            const/unsigned qualifiers (parsed, ignored), static/inline
-//   * expressions: + - * / %, < > <= >= == !=, && ||, unary - ! * &,
-//                  prefix & postfix ++/--, ternary ?:, casts, sizeof,
-//                  function calls, indexing a[i], member access . and ->,
-//                  assignment and compound assignment (+= -= *= /= %=)
-//   * statements: if/else, while, for, do/while, break, continue, return,
-//                 blocks, __asm__("..."), declarations (comma lists + init)
-//
 // Build:  gcc -std=c11 -O2 -Wall -Wextra -o nano_cc 'simpleC++.c'
 // Use:    ./nano_cc input.c output.s
 // =====================================================================
@@ -283,11 +270,14 @@ enum {
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
     K_INCLUDE, K_LINE,
+
+#define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) < ID_START)
     ID__BUILTIN_VA_START, ID__BUILTIN_VA_ARG, ID__BUILTIN_VA_END,
     ID__BUILTIN_BSWAP16, ID__BUILTIN_BSWAP32, ID__BUILTIN_BSWAP64,
     ID__BUILTIN_CLZ, ID__BUILTIN_CTZ,
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
     ID__SYSCALL, ID__RDTSC, ID__RDTSCP,
+
     ID_START, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
     T_count
 };
@@ -953,6 +943,7 @@ struct Node {
     unsigned char kind;
     unsigned char op;       // token kind for N_BIN / N_POST (T_INC/T_DEC)
     bool  discard;          // N_ASSIGN: value of assignment expression is discarded
+#define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
     int   pos;
     long  ival;             // N_NUM, N_CASE, N_DEFAULT, N_LABEL, N_FOR, N_DO, N_WHILE, N_SWITCH
@@ -961,8 +952,6 @@ struct Node {
     Type *type;             // result / declared type
     Node *lhs, *rhs, *cond, *init;
     Node *elems, *next;     // N_BLOCK, N_DECLIST
-#define MAX_ARGS 6
-    Node *args[MAX_ARGS];
 };
 
 static Token *cur(void);
@@ -992,7 +981,7 @@ static Type *array_of(Type *base, Node *len_expr) {
 }
 
 // ---- symbols ----
-typedef struct Sym { atom_t name; int pos; Type *type; bool is_global, is_constant; int offset; int flags;
+typedef struct Sym { atom_t name; int pos, flags, offset; bool is_global, is_constant; Type *type;
                      struct Node *init; long ival; struct Sym *next; } Sym;
 static Sym *globals, *globals_tail;
 
@@ -1226,9 +1215,11 @@ static Node *parse_primary(void) {
         atom_t nm = getid();
         if (at(T_LP)) {                       // function call
             Node *n = new_node(N_CALL); P++; n->name = nm;
+            Node **ap = &n->rhs;
             while (!at(T_RP)) {
                 if (n->nargs >= MAX_ARGS) error(NULL, "too many function arguments");
-                n->args[n->nargs++] = parse_assign();
+                Node *arg = parse_assign();
+                *ap = arg; ap = &arg->next; n->nargs++;
                 if (!eat(T_COMMA)) break;
             }
             expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
@@ -1704,9 +1695,9 @@ static bool eval_expr(Node *n, long *vp) {
 }
 
 // ---- top level ----
-typedef struct Func { atom_t name; int pos, endpos; int nparams; Node *params[8]; Type *ptype[8];
-                      bool is_variadic, used; int flags; Node *body; Type *rtype; struct Label *labels;
-                      struct Func *next; } Func;
+typedef struct Func {
+    atom_t name; int pos, flags, endpos; unsigned char nparams; bool is_variadic, used;
+    Node *param; Node *body; Type *rtype; struct Label *labels; struct Func *next; } Func;
 static Func *funcs, **funcs_tail;
 static Func *this_fn;
 
@@ -1765,12 +1756,13 @@ static void parse_toplevel(void) {
             fn->flags = flags;
             if (!funcs_tail) funcs_tail = &funcs; *funcs_tail = fn; funcs_tail = &fn->next;
         }
-        int nparams = 0;
+        int np = 0;
         bool is_variadic = false;
+        Node **pp = &fn->param;
         if (at(K_VOID) && toks[P+1].kind == T_RP) P++; // (void) -> ()
         while (!at(T_RP)) {
             if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
-            if (nparams >= MAX_ARGS) error(NULL, "too many function arguments");
+            if (np >= MAX_ARGS) error(NULL, "too many function arguments");
             int flags;
             Type *pt = parse_type_base_only(&flags);
             while (eat(T_STAR)) pt = ptr_to(pt);
@@ -1782,16 +1774,16 @@ static void parse_toplevel(void) {
                 pt->align = 8;
             }
             pv->type = pt;
-            if (has_prototype && fn->ptype[nparams] && !same_type(fn->ptype[nparams], pt))
-                warning(cur()->pos, "type mismatch with prototype on argument %d", nparams + 1);
-            fn->params[nparams] = pv; fn->ptype[nparams] = pt; nparams++;
+            if (has_prototype && *pp && !same_type((*pp)->type, pt))
+                warning(cur()->pos, "type mismatch with prototype on argument %d", np + 1);
+            *pp = pv; pp = &pv->next; np++;
             if (!eat(T_COMMA)) break;
         }
         expect(T_RP);
-        if (has_prototype && (fn->nparams != nparams || fn->is_variadic != is_variadic))
+        if (has_prototype && (fn->nparams != np || fn->is_variadic != is_variadic))
             warning(cur()->pos, "argument count mismatch with prototype");
         fn->is_variadic = is_variadic;
-        fn->nparams = nparams;
+        fn->nparams = np;
         if (!eat(T_SEMI)) { // actual function definition
             if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
             fn->pos = pos;
@@ -1858,47 +1850,42 @@ static void collect_locals(Node *n) {
         collect_locals(n->lhs); break;
       case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
         collect_locals(n->lhs); collect_locals(n->rhs); break;
-      case N_CALL:  for (int i = 0; i < n->nargs; i++) collect_locals(n->args[i]); break;
+      case N_CALL: for (Node *e = n->rhs; e; e = e->next) collect_locals(e); break;
       case N_SWITCH: collect_locals(n->cond); collect_locals(n->lhs); break;
       default: break;
     }
 }
 
-static bool check_intrinsics(Node *n) {
+static bool check_rewrite(Node *n) {
+    if (!optimize) return false;
     switch (n->name) {
-    case ID__BUILTIN_VA_START:    case ID__BUILTIN_VA_ARG:  case ID__BUILTIN_VA_END:
-    case ID__BUILTIN_ROTATE_LEFT: case ID__BUILTIN_ROTATE_RIGHT:
-    case ID__BUILTIN_BSWAP16:     case ID__BUILTIN_BSWAP32: case ID__BUILTIN_BSWAP64:
-    case ID__BUILTIN_CLZ:         case ID__BUILTIN_CTZ:
-    case ID__SYSCALL:             case ID__RDTSC:           case ID__RDTSCP:
-        return false;
     case ID_PRINTF: {   // optimize printf("Hello world\n");
-        if (!optimize) return false;
-        if (n->nargs != 1 || n->args[0]->kind != N_STR || !n->discard) return false;
-        const char *fmt = atom_str(n->args[0]->str);
+        if (n->nargs != 1 || !n->discard) break;
+        Node *arg = n->rhs; if (arg->kind != N_STR) break;
+        const char *fmt = atom_str(arg->str);
         if (!*fmt) { n->kind = N_NUM; n->ival = 0; n->type = ty_int(); return true; }
         size_t len = strlen(fmt);
-        if (strchr(fmt, '%') || fmt[len-1] != '\n') return false;
+        if (strchr(fmt, '%') || fmt[len-1] != '\n') break;
         n->name = ID_PUTS;
-        n->args[0]->str = new_atom_len(fmt, len - 1);
+        arg->str = new_atom_len(fmt, len - 1);
         return true;
     }
     case ID_STRLEN: {   // optimize str("str");
-        if (!optimize) return false;
-        if (n->nargs != 1 || n->args[0]->kind != N_STR) return false;
-        const char *s = atom_str(n->args[0]->str);
+        if (n->nargs != 1) break;
+        Node *arg = n->rhs; if (arg->kind != N_STR) break;
+        const char *s = atom_str(arg->str);
         size_t len = strlen(s); // do not use atom len to allow embedded nuls
         n->kind = N_NUM; n->ival = (long)len; n->type = ty_ulong();
         return true;
     }
     case ID_STRCPY: {   // optimize strcpy(dest, "str");
-        if (!optimize) return false;
-        if (n->nargs != 2 || n->args[1]->kind != N_STR) return false;
-        const char *s = atom_str(n->args[1]->str);
+        if (n->nargs != 2) break;
+        Node *arg2 = n->rhs->next; if (arg2->kind != N_STR) break;
+        const char *s = atom_str(arg2->str);
         long len = (long)strlen(s); // do not use atom len to allow embedded nuls
         n->name = ID_MEMCPY;
-        n->args[2] = new_num_node(len + 1, ty_ulong());
-        n->args[2]->pos = n->args[1]->pos;
+        arg2->next = new_num_node(len + 1, ty_ulong());
+        arg2->next->pos = arg2->pos;
         n->nargs = 3;
         return true;
     }}
@@ -1936,9 +1923,9 @@ static void check_used(Node *n) {
         case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
             check_used(n->lhs); check_used(n->rhs); break;
         case N_CALL:
-            if (check_intrinsics(n)) { check_used(n); break; }
-            check_used_func(n->name);
-            for (int i = 0; i < n->nargs; i++) check_used(n->args[i]);
+            if (check_rewrite(n)) { check_used(n); break; }
+            if (!IS_BUILTIN(n->name)) check_used_func(n->name);
+            for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
             break;
         case N_SWITCH: check_used(n->cond); check_used(n->lhs); break;
         case N_VAR: break; // XXX: should look up symbol and set used bit
@@ -2369,12 +2356,12 @@ static Type *gen_expr(Node *n) {
         switch (n->name) {
         case ID__BUILTIN_VA_START: {
             emit("lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
-            gen_addr2(n->args[0]);             // rcx = &ap
+            gen_addr2(n->rhs);                 // rcx = &ap
             emit("mov [rcx], rax");            // ap = first vararg slot
             return ty_long();
         }
         case ID__BUILTIN_VA_ARG: {
-            gen_addr(n->args[0]);              // rax = &ap
+            gen_addr(n->rhs);                  // rax = &ap
             emit("mov rcx, rax");              // rcx = &ap
             emit("mov rax, [rcx]");            // rax = ap
             emit("mov rax, [rax]");            // rax = *ap  (the argument value)
@@ -2383,38 +2370,40 @@ static Type *gen_expr(Node *n) {
         }
         case ID__BUILTIN_VA_END: return ty_void();   // no-op
         case ID__BUILTIN_ROTATE_LEFT:
-            gen_expr(n->args[0]);
-            gen_expr2(n->args[1]); emit("rol rax, cl");
+            gen_expr(n->rhs);
+            gen_expr2(n->rhs->next); emit("rol rax, cl");
             return ty_long();
         case ID__BUILTIN_ROTATE_RIGHT:
-            gen_expr(n->args[0]);
-            gen_expr2(n->args[1]); emit("ror rax, cl");
+            gen_expr(n->rhs);
+            gen_expr2(n->rhs->next); emit("ror rax, cl");
             return ty_long();
         case ID__BUILTIN_BSWAP16:
-            gen_expr(n->args[0]); emit("rol ax, 16");
+            gen_expr(n->rhs); emit("rol ax, 16");
             return ty_long();
         case ID__BUILTIN_BSWAP32:
-            gen_expr(n->args[0]); emit("bswap eax");
+            gen_expr(n->rhs); emit("bswap eax");
             return ty_long();
         case ID__BUILTIN_BSWAP64:
-            gen_expr(n->args[0]); emit("bswap rax");
+            gen_expr(n->rhs); emit("bswap rax");
             return ty_long();
         case ID__BUILTIN_CLZ:
-            gen_expr(n->args[0]); emit("bsr rax, rax"); emit("xor rax, 63");
+            gen_expr(n->rhs); emit("bsr rax, rax"); emit("xor rax, 63");
             return ty_long();
         case ID__BUILTIN_CTZ:
-            gen_expr(n->args[0]); emit("rep bsf rax, rax");
+            gen_expr(n->rhs); emit("rep bsf rax, rax");
             return ty_long();
         case ID__SYSCALL: {
             bool all_simple = true;
-            for (int i = 0; i < n->nargs; i++) all_simple &= is_simple_load(n->args[i]);
+            if (!n->nargs) error(n, "missing syscall number argument");
+            for (Node *arg = n->rhs; arg; arg = arg->next) all_simple &= is_simple_load(arg);
             if (all_simple) {
-                for (int i = 1; i < n->nargs; i++) gen_simple_load(n->args[i], ARGREG[i-1]);
-                gen_simple_load(n->args[0], RAX);
+                int i = 0;
+                for (Node *arg = n->rhs->next; arg; arg = arg->next) gen_simple_load(arg, ARGREG[i++]);
+                gen_simple_load(n->rhs, RAX);
             } else {
-                for (int i = 1; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
-                gen_expr(n->args[0]);
-                for (int i = n->nargs; i-- > 1;) emit("pop %s", reg64[ARGREG[i-1]]);
+                for (Node *arg = n->rhs->next; arg; arg = arg->next) { gen_expr(arg); emit("push rax"); }
+                gen_expr(n->rhs);
+                for (int i = n->nargs - 1; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
             }
             emit("syscall");
             int end1 = label_id++;
@@ -2441,11 +2430,12 @@ static Type *gen_expr(Node *n) {
         // XXX: should check and convert arguments according to prototype
         // XXX: here we could support default argument values
         bool all_simple = true;
-        for (int i = 0; i < n->nargs; i++) all_simple &= is_simple_load(n->args[i]);
+        for (Node *arg = n->rhs; arg; arg = arg->next) all_simple &= is_simple_load(arg);
         if (all_simple) {
-            for (int i = 0; i < n->nargs; i++) gen_simple_load(n->args[i], ARGREG[i]);
+            int i = 0;
+            for (Node *arg = n->rhs; arg; arg = arg->next) gen_simple_load(arg, ARGREG[i++]);
         } else {
-            for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); emit("push rax"); }
+            for (Node *arg = n->rhs; arg; arg = arg->next) { gen_expr(arg); emit("push rax"); }
             for (int i = n->nargs; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
         }
         if (!fn || fn->is_variadic) emit("xor eax, eax"); // variadic-safe; harmless otherwise
@@ -2680,7 +2670,7 @@ static void gen_func(Func *fn) {
     for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->ival = label_id++; }
     locals = NULL; frame_size = 0;
     // params first (so they get the lowest offsets, in declared order)
-    for (int i = 0; i < fn->nparams; i++) add_local(fn->params[i]->name, fn->params[i]->pos, fn->ptype[i]);
+    for (Node *param = fn->param; param; param = param->next) add_local(param->name, param->pos, param->type);
     collect_locals(fn->body);
     // reserve a 48-byte register save area for variadic functions
     int va_off = 0;
@@ -2692,9 +2682,10 @@ static void gen_func(Func *fn) {
     emit("push rbp");
     emit("mov rbp, rsp");
     if (fs > 0) emit("sub rsp, %d", fs);
-    for (int i = 0; i < fn->nparams && i < 6; i++) {
-        Sym *s = sym_find(locals, fn->params[i]->name);
-        emit_comment(atom_str(fn->params[i]->name));
+    int i = 0;
+    for (Node *param = fn->param; param && i < 6; param = param->next, i++) {
+        Sym *s = sym_find(locals, param->name);
+        emit_comment(atom_str(param->name));
         emit("mov [rbp - %d], %s", s->offset, reg64[ARGREG[i]]);
     }
     if (fn->is_variadic) {
