@@ -475,18 +475,23 @@ static size_t strip_comments(char *s) {
     while ((c = *p) != '\0') {
         if (c == '"' || c == '\'') {
             p += skip_string(p, NULL);
-        } else if (c == '/' && p[1] == '/') {
-            while (q < p) *out++ = *q++;
-            while (*p && *p != '\n') p++; q = p;
-        } else if (c == '/' && p[1] == '*') {
-            while (q < p) *out++ = *q++;
-            p += 2;
-            while (*p && !(*p == '*' && p[1] == '/'))
-                if (*p++ == '\n') *out++ = '\n';    // preserve line numbers
-            if (*p) p += 2; q = p;
-            if (out > dst && !isspace(out[-1])) *out++ = ' ';
         } else {
             p++;
+            if (c == '/' && (*p == '/' || *p == '*')) {
+                const char *e = p - 1;
+                while (q < e && isblank((unsigned char)e[-1])) e--;
+                while (q < e) *out++ = *q++;
+                if (*p == '/') {
+                    while (*p && *p != '\n') p++; q = p;
+                } else {
+                    while (*++p) {
+                        if (*p == '*' && p[1] == '/') { p += 2; break; }
+                        if (*p == '\n') *out++ = '\n';    // preserve line numbers
+                    }
+                    q = p += skip_blanks(p);
+                    if (*p != '\n' && out > dst && !isspace((unsigned char)out[-1])) *out++ = ' ';
+                }
+            }
         }
     }
     while (q < p) *out++ = *q++;
@@ -551,73 +556,72 @@ static void process_text(const char *text, sbuf_t *sb) {
                 cond_sp--;
                 skip >>= 1; seen_else >>= 1;
                 break;
-            case K_DEFINE:
-                if (!skip) {
-                    int pos = src_pos;
-                    size_t k = skip_word(p);
-                    if (!k) die("expected macro name after '#%s'", atom_str(dir));
-                    atom_t nm = new_atom_len(p, k); p += k;
-                    int nparams = -1; atom_t params[8]; for (k = 0; k < 8; k++) params[k] = 0;
-                    // function-like macro: '(' immediately after name (no space)
-                    if (*p == '(') {
-                        nparams = 0; p++;
-                        p += skip_blanks(p);
-                        if (*p && *p != ')') {
-                            for (;;) {
-                                size_t ai = skip_word(p);
-                                if (!ai) die("expected parameter name for macro '%s'", atom_str(nm));
-                                if (nparams >= 8) die("too many macro parameters for '%s'", atom_str(nm));
-                                params[nparams++] = new_atom_len(p, ai); p += ai;
-                                p += skip_blanks(p);
-                                if (*p == ')') break;
-                                if (*p != ',') die("expected ',' or ')' after macro parameter name");
-                                p++;
-                                p += skip_blanks(p);
-                            }
+            }
+            if (skip) continue;
+            switch (dir) {
+            case K_DEFINE: {
+                int pos = src_pos;
+                size_t k = skip_word(p);
+                if (!k) die("expected macro name after '#%s'", atom_str(dir));
+                atom_t nm = new_atom_len(p, k); p += k;
+                int nparams = -1; atom_t params[8]; for (k = 0; k < 8; k++) params[k] = 0;
+                // function-like macro: '(' immediately after name (no space)
+                if (*p == '(') {
+                    nparams = 0; p++;
+                    p += skip_blanks(p);
+                    if (*p && *p != ')') {
+                        for (;;) {
+                            size_t ai = skip_word(p);
+                            if (!ai) die("expected parameter name for macro '%s'", atom_str(nm));
+                            if (nparams >= 8) die("too many macro parameters for '%s'", atom_str(nm));
+                            params[nparams++] = new_atom_len(p, ai); p += ai;
+                            p += skip_blanks(p);
+                            if (*p == ')') break;
+                            if (*p != ',') die("expected ',' or ')' after macro parameter name");
+                            p++;
+                            p += skip_blanks(p);
                         }
-                        if (*p != ')') die("expected ')' after parameters of macro '%s'", atom_str(nm));
-                        p++;
                     }
-                    const char *def = p += skip_blanks(p);
-                    size_t len = trim_len(p); p += len;
-                    Macro *m = macro_find(nm);
-                    if (m) {  // if macro already exists, check if definition is identical
-                        if (m->nparams == nparams && !memcmp(m->params, params, sizeof(params))
-                        &&  (size_t)m->len == len && !memcmp(m->def, def, len)) break;
-                        warning(pos, "macro '%s' redefinition is different", atom_str(nm));
-                        macro_undef(nm);
-                    }
-                    macro_define(nm, pos, nparams, params, len, def);
+                    if (*p != ')') die("expected ')' after parameters of macro '%s'", atom_str(nm));
+                    p++;
                 }
-                break;
-            case K_UNDEF:
-                if (!skip) {
-                    size_t k = skip_word(p);
-                    atom_t nm = new_atom_len(p, k); p += k;
+                const char *def = p += skip_blanks(p);
+                size_t len = trim_len(p); p += len;
+                Macro *m = macro_find(nm);
+                if (m) {  // if macro already exists, check if definition is identical
+                    if (m->nparams == nparams && !memcmp(m->params, params, sizeof(params))
+                    &&  (size_t)m->len == len && !memcmp(m->def, def, len)) break;
+                    warning(pos, "macro '%s' redefinition is different", atom_str(nm));
                     macro_undef(nm);
                 }
+                macro_define(nm, pos, nparams, params, len, def);
                 break;
-            case K_LINE: sbuf_put(sb, line, li); break;
+                }
+            case K_UNDEF: {
+                size_t k = skip_word(p);
+                macro_undef(new_atom_len(p, k)); p += k;
+                break;
+            }
+            case K_LINE:  sbuf_put(sb, "# ", 2); sbuf_put(sb, p, li - (p - line)); break;
             case K_INCLUDE:
-                if (!skip) {
-                    if (*p == '"') {
-                        size_t k = skip_until(++p, '"');
-                        if (p[k] != '"') die("invalid include file name");
-                        atom_t name = new_atom_len(p, k);
-                        preprocess(atom_str(name), sb);
-                    } else
-                    if (*p == '<') {  // standard header: ignore and include nano libc
-                        //size_t k = skip_until(++p, '>');
-                        //if (p[k] != '>') die("invalid include file name");
-                        if (!has_library) {
-                            preprocess("nano-nolibc.h", sb);
-                            preprocess("nano-malloc.h", sb);
-                            has_library = true;
-                        }
+                if (*p == '"') {
+                    size_t k = skip_until(++p, '"');
+                    if (p[k] != '"') die("invalid include file name");
+                    atom_t name = new_atom_len(p, k);
+                    preprocess(atom_str(name), sb);
+                } else
+                if (*p == '<') {  // standard header: ignore and include nano libc
+                    //size_t k = skip_until(++p, '>');
+                    //if (p[k] != '>') die("invalid include file name");
+                    if (!has_library) {
+                        preprocess("nano-nolibc.h", sb);
+                        preprocess("nano-malloc.h", sb);
+                        has_library = true;
                     }
                 }
                 break;
             default:
+                if (isdigit((unsigned char)*p)) sbuf_put(sb, line, li); break;
                 // ignore other preprocessing directives
                 break;
             }
@@ -629,7 +633,7 @@ static void process_text(const char *text, sbuf_t *sb) {
     if (cond_sp) warning(src_pos, "missing '#endif'");
 }
 
-static int sharp_line_set(int pos, const char *path, int lineno) {
+static int update_pos(int pos, const char *path, int lineno) {
     int fn = pos >> 24;
     if (path && *path) {
         for (fn = 0; src_name[fn] && strcmp(src_name[fn], path); fn++) continue;
@@ -639,7 +643,7 @@ static int sharp_line_set(int pos, const char *path, int lineno) {
 }
 static void sharp_line(int pos, sbuf_t *sb) {
     if (pos) {
-        char buf[300]; int len = snprintf(buf, sizeof(buf), "#line %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
+        char buf[300]; int len = snprintf(buf, sizeof(buf), "# %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
         sbuf_put(sb, buf, len);
     }
 }
@@ -652,7 +656,7 @@ static void preprocess(const char *path, sbuf_t *sb) {
     if (verbose) printf("Read %s: %zu bytes\n", path, n);
     fclose(f);
     int save_pos = src_pos;
-    src_pos = sharp_line_set(src_pos, path, 1);
+    src_pos = update_pos(src_pos, path, 1);
     sharp_line(src_pos, sb);
     raw->len = strip_comments(sbuf_getptr(raw));
     if (verbose) printf("Stripped: %td bytes\n", raw->len);
@@ -817,8 +821,8 @@ static size_t lex(const char *p) {
             if (pp[3] && *p == '=') { p++; add_tok(pp[3]); continue; }
             else { add_tok(pp[1]); continue; }
         }
-        if (c == '#') { // parse #line number [filename]
-            p += skip_blanks(p); p += skip_word(p); p += skip_blanks(p);
+        if (c == '#') { // parse # number [filename]
+            p += skip_blanks(p);
             const char *filename = NULL;
             int lineno = 0;
             while (isdigit((unsigned char)*p)) lineno = lineno * 10 + (*p++ - '0');
@@ -827,7 +831,7 @@ static size_t lex(const char *p) {
                 size_t k = skip_until(++p, '"');
                 filename = atom_str(new_atom_len(p, k)); p += k;
             }
-            src_pos = sharp_line_set(src_pos, filename, lineno);
+            src_pos = update_pos(src_pos, filename, lineno);
             p += skip_until(p, '\n');
             p += (*p == '\n');
             continue;

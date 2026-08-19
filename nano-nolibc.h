@@ -40,41 +40,11 @@ int toupper(int c) { return islower(c) ? c - ('a' - 'A') : c; }
 
 // errno.h
 thread_local int errno;
-enum {
-    EPERM    = 1,  /* Operation not permitted */
-    ENOENT   = 2,  /* No such file or directory */
-    ESRCH    = 3,  /* No such process */
-    EINTR    = 4,  /* Interrupted system call */
-    EIO      = 5,  /* I/O error */
-    ENXIO    = 6,  /* No such device or address */
-    E2BIG    = 7,  /* Argument list too long */
-    ENOEXEC  = 8,  /* Exec format error */
-    EBADF    = 9,  /* Bad file number */
-    ECHILD  = 10,  /* No child processes */
-    EAGAIN  = 11,  /* Try again */
-    ENOMEM  = 12,  /* Out of memory */
-    EACCES  = 13,  /* Permission denied */
-    EFAULT  = 14,  /* Bad address */
-    ENOTBLK = 15,  /* Block device required */
-    EBUSY   = 16,  /* Device or resource busy */
-    EEXIST  = 17,  /* File exists */
-    EXDEV   = 18,  /* Cross-device link */
-    ENODEV  = 19,  /* No such device */
-    ENOTDIR = 20,  /* Not a directory */
-    EISDIR  = 21,  /* Is a directory */
-    EINVAL  = 22,  /* Invalid argument */
-    ENFILE  = 23,  /* File table overflow */
-    EMFILE  = 24,  /* Too many open files */
-    ENOTTY  = 25,  /* Not a typewriter */
-    ETXTBSY = 26,  /* Text file busy */
-    EFBIG   = 27,  /* File too large */
-    ENOSPC  = 28,  /* No space left on device */
-    ESPIPE  = 29,  /* Illegal seek */
-    EROFS   = 30,  /* Read-only file system */
-    EMLINK  = 31,  /* Too many links */
-    EPIPE   = 32,  /* Broken pipe */
-    EDOM    = 33,  /* Math argument out of domain of func */
-    ERANGE  = 34,  /* Math result not representable */
+enum {  // Linux error codes
+    EPERM = 1, ENOENT, ESRCH, EINTR, EIO, ENXIO, E2BIG, ENOEXEC, EBADF,
+    ECHILD, EAGAIN, ENOMEM, EACCES, EFAULT, ENOTBLK, EBUSY, EEXIST, EXDEV,
+    ENODEV, ENOTDIR, EISDIR, EINVAL, ENFILE, EMFILE, ENOTTY, ETXTBSY, EFBIG,
+    ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, EDOM, ERANGE,
 };
 
 // string.h
@@ -98,10 +68,6 @@ int strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-#ifdef __GNUC__
-#include <unistd.h>
-#include <fcntl.h>
-#else
 long __syscall(long n, ...);
 
 // --- Syscall numbers ---
@@ -169,7 +135,6 @@ struct timezone { int tz_minuteswest; int tz_dsttime; };
 int gettimeofday(struct timeval *tv, struct timezone *tz) {
     return __syscall(SYS_gettimeofday, tv, tz);
 }
-#endif
 
 // stdio.h (no buffering)
 typedef struct FILE { int hd; char *dest; size_t pos, cap; } FILE;
