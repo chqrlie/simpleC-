@@ -2,8 +2,6 @@
 #ifndef NANO_NOLIBC_H
 #define NANO_NOLIBC_H
 
-#define _Noreturn
-
 // stdbool.h (should make these keywords)
 #ifndef true
 typedef unsigned char bool;
@@ -41,7 +39,7 @@ int tolower(int c) { return isupper(c) ? c + ('a' - 'A') : c; }
 int toupper(int c) { return islower(c) ? c - ('a' - 'A') : c; }
 
 // errno.h
-int errno;
+thread_local int errno;
 enum {
     EPERM    = 1,  /* Operation not permitted */
     ENOENT   = 2,  /* No such file or directory */
@@ -356,8 +354,8 @@ int snprintf(char *dest, size_t size, const char *fmt, ...) {
 }
 
 // sys_err.c
-int sys_nerr = 35;
-const char *sys_errlist[] = {
+const int sys_nerr = 35;
+const char * /*const*/ sys_errlist[] = {
     "Success",
     "Operation not permitted",
     "No such file or directory",
@@ -394,7 +392,7 @@ const char *sys_errlist[] = {
     "Math argument out of domain of func",
     "Math result not representable",
 };
-static char errbuf[20];
+thread_local static char errbuf[20];
 const char *strerror(int errnum) {
     if (errnum >= 0 && errnum < sys_nerr) return sys_errlist[errnum];
     snprintf(errbuf, sizeof(errbuf), "Error %d", errnum);

@@ -244,9 +244,11 @@ static atom_t new_atom_len(const char *str, size_t len) {
     return a;
 }
 static atom_t new_atom(const char *str) { return new_atom_len(str, strlen(str)); }
-static void emit_entry(atom_t name) {
+static void emit_entry(atom_t name, bool globl, bool skip) {
     if (!name) return;
     emit_label(-1); // flush label and comments
+    if (skip) fputc('\n', fout);
+    if (globl) emit(".globl %s", atom_str(name));
     fprintf(fout, "%s:\n", atom_str(name));
 }
 
@@ -269,8 +271,8 @@ enum {
 #define IS_TYPE(k)    ((k) >= K_INT && (k) < K_IF)
 #define IS_KEYWORD(k) ((k) >= K_INT && (k) < K_IFDEF)
     K_INT, K_LONG, K_CHAR, K_SHORT, K_VOID, K_FLOAT, K_DOUBLE,
-    K_SIGNED, K_UNSIGNED, K_CONST, K_VOLATILE, K_INLINE,
-    K_AUTO, K_STATIC, K_REGISTER, K_EXTERN, K_TYPEDEF,
+    K_SIGNED, K_UNSIGNED, K_CONST, K_VOLATILE, K_INLINE, K_NORETURN,
+    K_AUTO, K_STATIC, K_REGISTER, K_EXTERN, K_THREAD_LOCAL, K_TYPEDEF,
     K_ENUM, K_STRUCT, K_UNION,
 
     K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
@@ -294,8 +296,8 @@ static const char *token_name[T_count] = {
     "=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=",
     "(", ")", "[", "]", "{", "}", ";", ",", "?", ":", ".", "->", "...",
     "int", "long", "char", "short", "void", "float", "double",
-    "signed", "unsigned", "const", "volatile", "inline",
-    "auto", "static", "register", "extern", "typedef",
+    "signed", "unsigned", "const", "volatile", "inline", "_Noreturn",
+    "auto", "static", "register", "extern", "thread_local", "typedef",
     "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
     "for", "do", "break", "continue", "sizeof",
@@ -899,6 +901,28 @@ static bool same_type(Type *t1, Type *t2) {
     return t1 == t2;
 }
 
+enum {
+    HAS_INT      = 1 << (K_INT      - K_INT),
+    HAS_LONG     = 1 << (K_LONG     - K_INT),
+    HAS_CHAR     = 1 << (K_CHAR     - K_INT),
+    HAS_SHORT    = 1 << (K_SHORT    - K_INT),
+    HAS_VOID     = 1 << (K_VOID     - K_INT),
+    HAS_FLOAT    = 1 << (K_FLOAT    - K_INT),
+    HAS_DOUBLE   = 1 << (K_DOUBLE   - K_INT),
+    HAS_SIGNED   = 1 << (K_SIGNED   - K_INT),
+    HAS_UNSIGNED = 1 << (K_UNSIGNED - K_INT),
+    HAS_CONST    = 1 << (K_CONST    - K_INT),
+    HAS_VOLATILE = 1 << (K_VOLATILE - K_INT),
+    HAS_INLINE   = 1 << (K_INLINE   - K_INT),
+    HAS_NORETURN = 1 << (K_NORETURN - K_INT),
+    HAS_AUTO     = 1 << (K_AUTO     - K_INT),
+    HAS_STATIC   = 1 << (K_STATIC   - K_INT),
+    HAS_REGISTER = 1 << (K_REGISTER - K_INT),
+    HAS_EXTERN   = 1 << (K_EXTERN   - K_INT),
+    HAS_THREAD_LOCAL = 1 << (K_THREAD_LOCAL - K_INT),
+    HAS_TYPEDEF  = 1 << (K_TYPEDEF  - K_INT),
+};
+
 // =====================================================================
 // 4. AST
 // =====================================================================
@@ -958,7 +982,7 @@ static Type *array_of(Type *base, Node *len_expr) {
 }
 
 // ---- symbols ----
-typedef struct Sym { atom_t name; int pos; Type *type; bool is_global, is_constant; int offset;
+typedef struct Sym { atom_t name; int pos; Type *type; bool is_global, is_constant; int offset; int flags;
                      struct Node *init; long ival; struct Sym *next; } Sym;
 static Sym *globals, *globals_tail;
 
@@ -1034,26 +1058,7 @@ static Type *tag_get(atom_t name, int kind, int pos) { // find or forward-declar
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
-enum {
-    HAS_INT      = 1 << (K_INT      - K_INT),
-    HAS_LONG     = 1 << (K_LONG     - K_INT),
-    HAS_CHAR     = 1 << (K_CHAR     - K_INT),
-    HAS_SHORT    = 1 << (K_SHORT    - K_INT),
-    HAS_VOID     = 1 << (K_VOID     - K_INT),
-    HAS_FLOAT    = 1 << (K_FLOAT    - K_INT),
-    HAS_DOUBLE   = 1 << (K_DOUBLE   - K_INT),
-    HAS_SIGNED   = 1 << (K_SIGNED   - K_INT),
-    HAS_UNSIGNED = 1 << (K_UNSIGNED - K_INT),
-    HAS_CONST    = 1 << (K_CONST    - K_INT),
-    HAS_VOLATILE = 1 << (K_VOLATILE - K_INT),
-    HAS_AUTO     = 1 << (K_AUTO     - K_INT),
-    HAS_STATIC   = 1 << (K_STATIC   - K_INT),
-    HAS_INLINE   = 1 << (K_INLINE   - K_INT),
-    HAS_REGISTER = 1 << (K_REGISTER - K_INT),
-    HAS_EXTERN   = 1 << (K_EXTERN   - K_INT),
-    HAS_TYPEDEF  = 1 << (K_TYPEDEF  - K_INT),
-};
-static Type *parse_type_base_only(long *flags);
+static Type *parse_type_base_only(int *flags);
 
 static Node *this_switch;
 static Node *this_loop;
@@ -1081,7 +1086,7 @@ static Type *parse_struct(int kind) {
         int off = 0, maxsz = 0;
         st->align = 1;
         while (!at(T_RBRACE) && !at(T_EOF)) {
-            long flags;
+            int flags;
             Type *mbase = parse_type_base_only(&flags);
             for (;;) {
                 Type *mt = mbase;
@@ -1164,7 +1169,7 @@ static Type *parse_enum(void) {
 }
 
 // parse base type + pointer stars; returns Type*
-static Type *parse_type(long *flags) {
+static Type *parse_type(int *flags) {
     Type *base = parse_type_base_only(flags);
     while (eat(T_STAR)) base = ptr_to(base);
     return base;
@@ -1172,14 +1177,14 @@ static Type *parse_type(long *flags) {
 
 static Node *parse_string(void) {
     if (!at(T_STR)) expect(T_STR);
-    Node *n = new_node(N_STR); n->str = cur()->text; P++;
+    atom_t str = cur()->text;
+    Node *n = new_node(N_STR); n->str = str; P++;
     n->type = ptr_to(ty_char());
     if (at(T_STR)) {    // concatenate juxtaposed strings
         char buf[8192]; size_t len = 0;
-        atom_t str = n->str;
         for (;;) {
-            len = pmemcpy(buf + len, sizeof(buf) - len,
-                          atom_str(str), atom_len(str));
+            len += pmemcpy(buf + len, sizeof(buf) - len,
+                           atom_str(str), atom_len(str));
             if (!at(T_STR)) break;
             str = cur()->text; P++;
         }
@@ -1193,7 +1198,7 @@ static Node *parse_primary(void) {
     if (eat(T_LP)) {
         // cast?  ( type ) unary
         if (is_type_start(cur())) {
-            long flags;
+            int flags;
             Type *t = parse_type(&flags);
             expect(T_RP);
             Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_assign();
@@ -1355,17 +1360,20 @@ static Node *parse_expr(void) {
 
 // a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
 static Node *parse_decl_stmt(void) {
-    long flags;
+    int flags;
     Type *base = parse_type_base_only(&flags);   // fwd-declared below
     Node *n = new_node(N_DECLIST);
-    if (eat(T_SEMI)) return n;           // bare  struct Foo { ... };  (type only)
+    n->ival = flags;
+    switch (base->kind) {  // check for bare struct/union/enum Foo { ... };
+    case TY_STRUCT: case TY_UNION: case TY_ENUM: if (eat(T_SEMI)) return n;
+    }
     Node **tailp = &n->elems;
     for (;;) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
         atom_t nm = getid();
         if (eat(T_LBRK)) t = parse_array(t);
-        Node *d = new_node(N_DECL); d->name = nm; d->type = t;
+        Node *d = new_node(N_DECL); d->name = nm; d->type = t; n->ival = flags;
         if (eat(T_ASSIGN)) {
             d->init = parse_init();
             if (t->kind == TY_ARRAY && t->arr_len < 0 && d->init->kind == N_BLOCK) {
@@ -1379,8 +1387,8 @@ static Node *parse_decl_stmt(void) {
     return n;
 }
 // parse just the base type (no trailing stars) — stars belong to each declarator
-static Type *parse_type_base_only(long *pflags) {
-    Type *t = NULL; long flags = 0;
+static Type *parse_type_base_only(int *pflags) {
+    Type *t = NULL; int flags = 0;
     for (;;) {
         int k;
         switch (k = cur()->kind) {
@@ -1398,10 +1406,13 @@ static Type *parse_type_base_only(long *pflags) {
         case K_UNSIGNED:
         case K_CONST:
         case K_VOLATILE:
-        case K_STATIC:
         case K_INLINE:
+        case K_NORETURN:
+        case K_AUTO:
+        case K_STATIC:
         case K_REGISTER:
         case K_EXTERN:
+        case K_THREAD_LOCAL:
         case K_TYPEDEF:  flags |= 1 << (k - K_INT); break;
         default:
             if (t) return t;
@@ -1411,34 +1422,43 @@ static Type *parse_type_base_only(long *pflags) {
             }
             error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
         }
-        switch (flags & (HAS_INT | HAS_SHORT | HAS_LONG | HAS_CHAR | HAS_SIGNED | HAS_UNSIGNED | HAS_VOID | HAS_FLOAT | HAS_DOUBLE)) {
-        case 0: break;
-        case HAS_CHAR: t = ty_char(); break;
-        case HAS_SIGNED | HAS_CHAR: t = ty_schar(); break;
-        case HAS_UNSIGNED | HAS_CHAR: t = ty_uchar(); break;
-        case HAS_INT: case HAS_SIGNED: case HAS_SIGNED | HAS_INT: t = ty_int(); break;
-        case HAS_UNSIGNED: case HAS_UNSIGNED | HAS_INT: t = ty_uint(); break;
-        case HAS_LONG: case HAS_SIGNED | HAS_LONG: case HAS_LONG | HAS_INT: case HAS_SIGNED | HAS_LONG | HAS_INT: t = ty_long(); break;
-        case HAS_UNSIGNED | HAS_LONG: case HAS_UNSIGNED | HAS_LONG | HAS_INT: t = ty_ulong(); break;
-        case HAS_SHORT: case HAS_SIGNED | HAS_SHORT: case HAS_SHORT | HAS_INT: case HAS_SIGNED | HAS_SHORT | HAS_INT: t = ty_short(); break;
-        case HAS_UNSIGNED | HAS_SHORT: case HAS_UNSIGNED | HAS_SHORT | HAS_INT: t = ty_ushort(); break;
-        case HAS_FLOAT: case HAS_SHORT | HAS_FLOAT: case HAS_DOUBLE: case HAS_LONG | HAS_DOUBLE: error(NULL, "floating point types not supported"); return 0;
+        switch (flags & (HAS_INT | HAS_SHORT | HAS_LONG | HAS_CHAR | HAS_VOID |
+                         HAS_SIGNED | HAS_UNSIGNED | HAS_FLOAT | HAS_DOUBLE)) {
+        case 0:                                                   break;  // no type yet
+        case HAS_CHAR:                           t = ty_char();   break;
+        case HAS_SIGNED | HAS_CHAR:              t = ty_schar();  break;
+        case HAS_UNSIGNED | HAS_CHAR:            t = ty_uchar();  break;
+        case HAS_INT:
+        case HAS_SIGNED:
+        case HAS_SIGNED | HAS_INT:               t = ty_int();    break;
+        case HAS_UNSIGNED:
+        case HAS_UNSIGNED | HAS_INT:             t = ty_uint();   break;
+        case HAS_LONG:
+        case HAS_LONG | HAS_INT:
+        case HAS_SIGNED | HAS_LONG:
+        case HAS_SIGNED | HAS_LONG | HAS_INT:    t = ty_long();   break;
+        case HAS_UNSIGNED | HAS_LONG:
+        case HAS_UNSIGNED | HAS_LONG | HAS_INT:  t = ty_ulong();  break;
+        case HAS_SHORT:
+        case HAS_SHORT | HAS_INT:
+        case HAS_SIGNED | HAS_SHORT:
+        case HAS_SIGNED | HAS_SHORT | HAS_INT:   t = ty_short();  break;
+        case HAS_UNSIGNED | HAS_SHORT:
+        case HAS_UNSIGNED | HAS_SHORT | HAS_INT: t = ty_ushort(); break;
         case HAS_VOID: t = ty_void(); break;
+        case HAS_FLOAT:
+        case HAS_SHORT | HAS_FLOAT:
+        case HAS_DOUBLE:
+        case HAS_LONG | HAS_DOUBLE: error(NULL, "floating point types not supported"); return 0;
         default:
         invalid: error(NULL, "invalid type combination"); return 0;
         }
         switch (flags & (HAS_STATIC | HAS_REGISTER | HAS_EXTERN | HAS_TYPEDEF)) {
         case 0: case HAS_STATIC: case HAS_REGISTER: case HAS_EXTERN: case HAS_TYPEDEF: break;
-        default: error(NULL, "invalid storage class %ld at '%s'", flags, atom_str(k)); return 0;
+        default: error(NULL, "invalid storage class combination at '%s'", atom_str(k)); return 0;
         }
         P++; if (pflags) *pflags = flags;
     }
-}
-static Node *parse_typedef(void) {
-    P++;    // skip 'typedef'
-    Node *n = parse_decl_stmt();
-    n->op = K_TYPEDEF;
-    return n;
 }
 
 static Node *parse_init(void) {
@@ -1574,10 +1594,6 @@ static Node *parse_stmt(void) {
         expect(T_SEMI);
         return n;
     }
-    if (at(K_TYPEDEF)) {
-        // XXX: should be handled like a local decl
-        return parse_typedef();
-    }
     if (at(K_ASM) || at(K__ASM__)) {
         n = new_node(N_ASM); P++;
         expect(T_LP);
@@ -1679,7 +1695,8 @@ static bool eval_expr(Node *n, long *vp) {
 
 // ---- top level ----
 typedef struct Func { atom_t name; int pos, endpos; int nparams; Node *params[8]; Type *ptype[8];
-                      bool is_variadic, used; Node *body; Type *rtype; struct Label *labels; struct Func *next; } Func;
+                      bool is_variadic, used; int flags; Node *body; Type *rtype; struct Label *labels;
+                      struct Func *next; } Func;
 static Func *funcs, **funcs_tail;
 static Func *this_fn;
 
@@ -1707,13 +1724,14 @@ static Func *find_func(atom_t name) {
 }
 
 static void parse_toplevel(void) {
+    // XXX: should merge with parse_decl_stmt
     if (at(K_TYPEDEF)) {
         // XXX: should be handled like a decl
-        Node *n = parse_typedef();
+        Node *n = parse_decl_stmt();
         for (Node *e = n->elems; e; e = e->next) add_typedef(e);
         return;
     }
-    long flags;
+    int flags;
     int pos = cur()->pos;
     Type *base = parse_type_base_only(&flags);
     if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
@@ -1723,6 +1741,7 @@ static void parse_toplevel(void) {
 
     // XXX: parse function pointers and such
     if (eat(T_LP)) {                                   // function definition
+        if (flags & HAS_TYPEDEF) error(NULL, "function typedefs not supported");
         bool has_prototype = false;
         Func *fn = find_func(nm);
         if (fn) {
@@ -1733,6 +1752,7 @@ static void parse_toplevel(void) {
             fn = allocz(1, sizeof(Func));
             fn->name = nm;
             fn->rtype = t;
+            fn->flags = flags;
             if (!funcs_tail) funcs_tail = &funcs; *funcs_tail = fn; funcs_tail = &fn->next;
         }
         int nparams = 0;
@@ -1741,7 +1761,7 @@ static void parse_toplevel(void) {
         while (!at(T_RP)) {
             if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
             if (nparams >= MAX_ARGS) error(NULL, "too many function arguments");
-            long flags;
+            int flags;
             Type *pt = parse_type_base_only(&flags);
             while (eat(T_STAR)) pt = ptr_to(pt);
             Node *pv = new_node(N_DECL);
@@ -1773,11 +1793,13 @@ static void parse_toplevel(void) {
         if (verbose) printf("-> %s\n", atom_str(nm));
         return;
     }
+    if (flags & (HAS_NORETURN | HAS_INLINE)) warning(pos, "inline or _Noreturn can only be applied to functions");
     // global variable(s):  type name [= ...] (, ...) ;
     for (;;) {
         int pos = toks[P].pos;
         if (eat(T_LBRK)) t = parse_array(t);
         Sym *sym = add_global(nm, pos, t);
+        sym->flags = flags;
         if (eat(T_ASSIGN)) {
             sym->init = parse_init();
             if (t->kind == TY_ARRAY && t->arr_len < 0 && sym->init->kind == N_BLOCK) {
@@ -1798,7 +1820,8 @@ static void parse_toplevel(void) {
 // This seems broken: it does not allow the same name to be used in different blocks
 static Sym *add_local(atom_t name, int pos, Type *t) {
     Sym *s = allocz(1, sizeof(Sym)); s->name = name; s->pos = pos;
-    s->type = t; s->is_global = 0;
+    s->type = t;
+    // XXX: should handle static local
     int sz = ty_size(t); if (sz < 8) sz = 8; sz = (sz + 7) & ~7;
     frame_size += sz; s->offset = frame_size;
     s->next = locals; locals = s;
@@ -1927,6 +1950,16 @@ static int ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
 static int cur_va_off, cur_named;
 
+static const char *cur_section;
+static void emit_section(const char *name, int align) {
+    if (cur_section != name) {
+        cur_section = name;
+        emit(" ");
+        emit(".section %s", name);
+        if (align) emit(".align %d", align);
+    }
+}
+
 static void emit_jmp(Node *n, const char *instr, int lab) {
     if (!lab) error(n, "invalid jump");
     emit("%s .L%d", instr, lab);
@@ -2039,7 +2072,7 @@ static Type *static_typeof(Node *n) {
 
 static size_t gen_quoted_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
     size_t j = 0;
-    if (sep && j + 1 < size) buf[j++] = sep;
+    if (sep && size > 1) buf[j++] = sep;
     for (size_t i = 0; i < slen; i++) {
         char ch = str[i];
         switch (ch) {
@@ -2077,7 +2110,7 @@ static size_t gen_quoted_string(char *buf, size_t size, const char *str, size_t 
 static void gen_string_def(atom_t id) {
     char buf[8192];
     gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
-    fprintf(fout, ".LC%d: .string %s\n", id, buf);
+    fprintf(fout, ".LC%d:\t.string %s\n", id, buf);
 }
 
 static void load_string(Node *n, int r) {
@@ -2621,7 +2654,7 @@ static bool has_flow(Node *n) {
     case N_GOTO:
     case N_RETURN: return false;
     case N_BLOCK:  return has_flow(node_last(n->elems));
-    case N_IF:     return has_flow(n->lhs) | has_flow(n->rhs);
+    case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
     case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
     case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
                    return has_flow(n->lhs);
@@ -2645,7 +2678,7 @@ static void gen_func(Func *fn) {
     cur_va_off = va_off; cur_named = fn->nparams;
     int fs = (frame_size + 15) & ~15;
 
-    emit_entry(fn->name);
+    emit_entry(fn->name, !(fn->flags & HAS_STATIC), true);
     emit("push rbp");
     emit("mov rbp, rsp");
     if (fs > 0) emit("sub rsp, %d", fs);
@@ -2685,7 +2718,6 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         case TY_LONG:
         case TY_ENUM:
             if (eval_expr(init, &ival)) {
-                emit_entry(name);
                 emit_comment(mname);
                 switch (t->align) {
                 case 1: emit(".byte %ld", ival); return;
@@ -2700,14 +2732,12 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
             if (t->ptr->kind == TY_CHAR) {
                 if (init->kind == N_STR) {
                     atom_flags(init->str) |= ATOM_USED;
-                    emit_entry(name);
                     emit_comment(mname); emit(".quad .LC%d", init->str);
                     return;
                 }
             }
             if (init->kind == N_NUM) {
                 if (eval_expr(init, &ival)) {
-                    emit_entry(name);
                     emit_comment(mname); emit(".quad %ld", ival);
                     return;
                 }
@@ -2716,7 +2746,6 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
             break;
         case TY_ARRAY:
             if (init->kind == N_BLOCK) {
-                emit_entry(name);
                 Node *e = init->elems;
                 for (int i = 0; i < t->arr_len; i++) {
                     gen_init(t->ptr, 0, e, NULL);
@@ -2729,7 +2758,6 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         case TY_STRUCT:
         case TY_UNION:
             if (init->kind != N_BLOCK) break;
-            emit_entry(name);
             Node *e = init->elems;
             for (Member *m = t->members; m; m = m->next) {
                 gen_init(m->type, 0, e, atom_str(m->name));
@@ -2743,7 +2771,6 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         else if (mname) { warning(init->pos, "unsupported initializer for member '%s'", mname); }
         else { warning(init->pos, "unsupported initializer"); }
     }
-    emit_entry(name);
     emit_comment(mname);
     int sz = ty_size(t); if (sz < 1) sz = 8;
     emit(".zero %d", sz);
@@ -2946,13 +2973,11 @@ int main(int argc, char **argv) {
     check_used_func(ID_MAIN);
 
     emit(".intel_syntax noprefix");
-    emit(".section .text");
-    emit(".globl main");
+    emit_section(".text", 0);
 
     if (!kernel_mode && !libc_mode) {
         // hosted freestanding entry point: run main, then exit(rax)
-        emit(".globl %s", atom_str(ID_START));
-        emit_entry(ID_START);
+        emit_entry(ID_START, true, true);
         emit("cld");
         emit("xor rbp, rbp");
         emit_comment("argc"); emit("mov rdi, [rsp]");
@@ -2974,22 +2999,22 @@ int main(int argc, char **argv) {
     // - initialized data in .data and .rodata sections
     // - strings in .rodata sections
     // - uninitialized data in .bss sections
-    emit(".section .data");
-    emit(".align 8");
+    emit_section(".data", 8);
     for (Sym *g = globals; g; g = g->next) {
         if (g->is_constant) continue;
         if (!kernel_mode && !g->init) continue;
+        emit_entry(g->name, !(g->flags & HAS_STATIC), false);
         gen_init(g->type, g->name, g->init, NULL);
     }
     if (!kernel_mode) {
-        emit(".section .bss");
-        emit(".align 8");
+        emit_section(".bss", 8);
         for (Sym *g = globals; g; g = g->next) {
             if (g->is_constant || g->init) continue;
+            emit_entry(g->name, !(g->flags & HAS_STATIC), false);
             gen_init(g->type, g->name, g->init, NULL);
         }
     }
-    emit(".section .rodata");
+    emit_section(".rodata", 0);
     for (atom_t s = 0; s < natoms; s++) {
         if (atom_flags(s) & ATOM_USED) gen_string_def(s);
     }
