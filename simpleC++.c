@@ -27,18 +27,17 @@
 #endif
 
 // ---------------------------------------------------------------------
-// Output / errors / allocation
+// Errors / allocation
 // ---------------------------------------------------------------------
 const char *progname;
 static bool has_library;
 static const char *src_name[32];
 static int src_pos;
 static int optimize;
-static bool verbose;
-static FILE *fout;
+static bool debug, verbose;
 static void err_message(int pos, const char *kind, const char *fmt, va_list ap) {
     int fn = pos >> 24, lineno = pos & 0xffffff;
-    if (src_name[fn] && pos) fprintf(stderr, "%s:%d: %s: ", src_name[fn], lineno, kind);
+    if (pos && src_name[fn]) fprintf(stderr, "%s:%d: %s: ", src_name[fn], lineno, kind);
     else fprintf(stderr, "%s: %s: ", progname, kind);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
@@ -52,28 +51,6 @@ static void warning(int pos, const char *fmt, ...) attr_printf(2,3);
 static void warning(int pos, const char *fmt, ...) {
     va_list a; va_start(a, fmt); err_message(pos, "warning", fmt, a); va_end(a);
 }
-static const char *next_comment;
-static int next_label;
-static void emit_indent(int indent) { while (indent > 0) { fputc('\t', fout); indent -= 4; } }
-static void emit(const char *fmt, ...) attr_printf(1,2);
-static void emit(const char *fmt, ...) {
-    int indent = 28;
-    if (next_label > 0) indent -= fprintf(fout, ".L%d:", next_label);
-    next_label = 0;
-    if (*fmt != ' ') {  // no empty format strings to avoid gcc warning
-        emit_indent(indent - 20);
-        va_list a; va_start(a, fmt); indent = 20 - vfprintf(fout, fmt, a); va_end(a);
-    }
-    if (next_comment && *next_comment) {
-        emit_indent(indent);
-        fprintf(fout, "\t# %s", next_comment); next_comment = NULL;
-    }
-    fputc('\n', fout);
-}
-static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); next_label = lab; }
-//#define emit_comment(comment) next_comment = (comment)
-static void emit_comment(const char *comment) { next_comment = comment; }
-
 static int xdigit(int d) {
     if (d >= '0' && d <= '9') return d - '0';
     if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
@@ -107,7 +84,7 @@ static size_t skip_string(const char *s, size_t *slen) {
         if (s[i] == '\\' && s[i+1]) i++;
     }
 }
-#if 0
+
 // safe string copy with truncation and detection
 static size_t pstrcpy(char *dest, size_t size, const char *src) {
     if (size) {
@@ -116,6 +93,7 @@ static size_t pstrcpy(char *dest, size_t size, const char *src) {
     }
     return size;
 }
+#if 0
 // safe limited string copy with truncation and detection
 static size_t pstrncpy(char *dest, size_t size, const char *src, size_t n) {
     if (size) {
@@ -234,13 +212,6 @@ static atom_t new_atom_len(const char *str, size_t len) {
     return a;
 }
 static atom_t new_atom(const char *str) { return new_atom_len(str, strlen(str)); }
-static void emit_entry(atom_t name, bool globl, bool skip) {
-    if (!name) return;
-    emit_label(-1); // flush label and comments
-    if (skip) fputc('\n', fout);
-    if (globl) emit(".globl %s", atom_str(name));
-    fprintf(fout, "%s:\n", atom_str(name));
-}
 
 // =====================================================================
 // 0.2. PREDEFINED ATOMS
@@ -547,10 +518,8 @@ static void process_text(const char *text, sbuf_t *sb) {
                 cond_sp--;
                 skip >>= 1; seen_else >>= 1;
                 break;
-            }
-            if (skip) continue;
-            switch (dir) {
             case K_DEFINE: {
+                if (skip) break;
                 int pos = src_pos;
                 size_t k = skip_word(p);
                 if (!k) die("expected macro name after '#%s'", atom_str(dir));
@@ -589,12 +558,16 @@ static void process_text(const char *text, sbuf_t *sb) {
                 break;
                 }
             case K_UNDEF: {
+                if (skip) break;
                 size_t k = skip_word(p);
                 macro_undef(new_atom_len(p, k)); p += k;
                 break;
             }
-            case K_LINE:  sbuf_put(sb, "# ", 2); sbuf_put(sb, p, li - (p - line)); break;
+            case K_LINE:
+                if (skip) break;
+                sbuf_put(sb, "# ", 2); sbuf_put(sb, p, li - (p - line)); break;
             case K_INCLUDE:
+                if (skip) break;
                 if (*p == '"') {
                     size_t k = skip_until(++p, '"');
                     if (p[k] != '"') die("invalid include file name");
@@ -612,6 +585,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                 }
                 break;
             default:
+                if (skip) break;
                 if (isdigit((unsigned char)*p)) sbuf_put(sb, line, li); break;
                 // ignore other preprocessing directives
                 break;
@@ -1933,7 +1907,60 @@ static void check_used(Node *n) {
 }
 
 // =====================================================================
-// 7. CODE GENERATION
+// 7. ASSEMBLY OUTPUT
+// =====================================================================
+static FILE *fout;
+static bool out_comments;
+static char next_comment[48];
+static int next_label;
+static void emit_indent(int indent) { while (indent > 0) { fputc('\t', fout); indent -= 4; } }
+static void emit(const char *fmt, ...) attr_printf(1,2);
+static void emit(const char *fmt, ...) {
+    int indent = 28;
+    if (next_label > 0) indent -= fprintf(fout, ".L%d:", next_label);
+    next_label = 0;
+    if (*fmt != ' ') {  // no empty format strings to avoid gcc warning
+        emit_indent(indent - 20);
+        va_list a; va_start(a, fmt); indent = 20 - vfprintf(fout, fmt, a); va_end(a);
+    }
+    if (*next_comment) {
+        emit_indent(indent);
+        fprintf(fout, "\t# %s", next_comment); *next_comment = '\0';
+    }
+    fputc('\n', fout);
+}
+static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); next_label = lab; }
+static void emit_comment(const char *comment) {
+    if (out_comments) {
+        if (*next_comment) emit(" ");
+        if (comment) pstrcpy(next_comment, sizeof(next_comment), comment);
+    }
+}
+
+static const char *cur_section;
+static void emit_section(const char *name, int align) {
+    if (cur_section != name) {
+        cur_section = name;
+        emit(" ");
+        emit(".section %s", name);
+        if (align) emit(".align %d", align);
+    }
+}
+static void emit_entry(atom_t name, bool globl, bool skip) {
+    if (!name) return;
+    emit_label(-1); // flush label and comments
+    if (skip) fputc('\n', fout);
+    if (globl) emit(".globl %s", atom_str(name));
+    fprintf(fout, "%s:\n", atom_str(name));
+}
+
+static void emit_jmp(Node *n, const char *instr, int lab) {
+    if (!lab) error(n, "invalid jump");
+    emit("%s .L%d", instr, lab);
+}
+
+// =====================================================================
+// 7.1 CODE GENERATION
 // =====================================================================
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 const char *reg64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
@@ -1946,21 +1973,6 @@ static int ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
 static int cur_va_off, cur_named;
-
-static const char *cur_section;
-static void emit_section(const char *name, int align) {
-    if (cur_section != name) {
-        cur_section = name;
-        emit(" ");
-        emit(".section %s", name);
-        if (align) emit(".align %d", align);
-    }
-}
-
-static void emit_jmp(Node *n, const char *instr, int lab) {
-    if (!lab) error(n, "invalid jump");
-    emit("%s .L%d", instr, lab);
-}
 
 static Type *gen_expr(Node *n);
 static Type *gen_expr2(Node *n);
@@ -2111,11 +2123,14 @@ static void gen_string_def(atom_t id) {
 }
 
 static void load_string(Node *n, int r) {
-    char buf[37];
     atom_t id = n->str;
-    size_t len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
-    if (len > 32) strcpy(buf + 32, "...\"");
-    emit_comment(buf); emit("lea %s, [rip + .LC%d]", reg64[r], id);
+    if (out_comments) {
+        char buf[37];
+        size_t len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+        if (len > 32) pstrcpy(buf + 32, sizeof(buf) - 32, "...\"");
+        emit_comment(buf);
+    }
+    emit("lea %s, [rip + .LC%d]", reg64[r], id);
     atom_flags(id) |= ATOM_USED;
 }
 
@@ -2512,6 +2527,49 @@ static void loop_push(Node *n, int b, int c) {
 }
 static void loop_pop(void) { loop_sp--; }
 
+static void gen_case_comment(Node *n) {
+    if (!out_comments) return;
+    char buf[20];
+    size_t pos = pstrcpy(buf, sizeof(buf), "case ");
+    Node *e = n->cond; long val = e->ival;
+    switch (e->kind) {
+    case N_VAR: pstrcpy(buf + pos, sizeof(buf) - pos, atom_str(e->name)); break;
+    default:
+        if (val >= ' ' && val < 127) snprintf(buf + pos, sizeof(buf) - pos, "'%c'", (int)val);
+        else snprintf(buf + pos, sizeof(buf) - pos, "%ld", val);
+        break;
+    }
+    emit_comment(buf);
+}
+
+static void gen_switch(Node *n) {
+    gen_expr(n->cond);
+    // Emit "if (switch_value == case_value) goto case_label" for every case.
+    // XXX: should check for duplicates
+    int def = 0, end = 0;
+    for (Node *e = n->rhs; e; e = e->rhs) {
+        long val;
+        e->ival = label_id++;
+        if (e->kind == N_CASE) {
+            if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
+            e->cond->ival = val;
+            gen_case_comment(e);
+            emit("cmp rax, %ld", val);
+            emit_jmp(n, "jz", (int)e->ival);
+        } else {
+            def = (int)e->ival;
+        }
+    }
+    if ((n->ival & HAS_BREAK) || !def) end = label_id++;
+    emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
+
+    // break exits the switch; continue passes through to the enclosing loop
+    loop_push(n, end, cont_lbl[loop_sp]);
+    gen_stmt(n->lhs);               // the body places the case labels inline
+    loop_pop();
+    emit_label(end);
+}
+
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) gen_stmt(e); break;
@@ -2588,46 +2646,10 @@ static void gen_stmt(Node *n) {
     case N_CONTINUE:
         emit_jmp(n, "jmp", cont_lbl[loop_sp]);
         break;
-    case N_SWITCH: {
-        gen_expr(n->cond);
-        // Emit "if (switch_value == case_value) goto case_label" for every case.
-        // XXX: should check for duplicates
-        int def = 0, end = 0;
-        for (Node *e = n->rhs; e; e = e->rhs) {
-            long val;
-            e->ival = label_id++;
-            if (e->kind == N_CASE) {
-                if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
-                char cbuf[6];
-                if (val >= ' ' && val < 127) {
-                    snprintf(cbuf, sizeof(cbuf), "'%c'", (int)val);
-                    emit_comment(cbuf);
-                }
-                emit("cmp rax, %ld", val);
-                emit_jmp(n, "jz", (int)e->ival);
-            } else {
-                def = (int)e->ival;
-            }
-        }
-        if ((n->ival & HAS_BREAK) || !def) end = label_id++;
-        emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
-
-        // break exits the switch; continue passes through to the enclosing loop
-        loop_push(n, end, cont_lbl[loop_sp]);
-        gen_stmt(n->lhs);               // the body places the case labels inline
-        loop_pop();
-        emit_label(end);
-        break;
-    }
-    case N_CASE: {
-        char buf[32];
-        long val; eval_expr(n->cond, &val);
-        if (val >= ' ' && val < 127) snprintf(buf, sizeof(buf), "case %d ('%c')", (int)val, (int)val);
-        else snprintf(buf, sizeof(buf), "case %ld", val);
-        emit_comment(buf);
-        emit_label((int)n->ival);
-        break;
-    }
+    case N_SWITCH: gen_switch(n); break;
+    case N_CASE:
+        gen_case_comment(n);
+        emit_label((int)n->ival); break;
     case N_DEFAULT:
     case N_LABEL:
         emit_comment(atom_str(n->name));
@@ -2644,7 +2666,7 @@ static void gen_stmt(Node *n) {
         break;
     }
     case N_ASM: gen_asm(n); break;
-    default: gen_expr(n); break;                    // expression used as statement
+    default:    gen_expr(n); break;    // node is part of an expression
     }
 }
 
@@ -2901,6 +2923,9 @@ static _Noreturn void usage(bool full) {
         fprintf(stderr,
                 "  --kernel       kernel mode (no bss, no _start/exit stub)\n"
                 "  --libc         hosted mode (no _start, link to the C library\n"
+                "  -g             add debug info in assembly source code\n"
+                "  -memory        show memory stats\n"
+                "  -time          show timings\n"
                 "  -E             output preprocessed test\n"
                 "  -ET            output preprocessed tokens\n"
                 "  -O             perform optimizations\n"
@@ -2923,7 +2948,7 @@ int main(int argc, char **argv) {
     progname = argv[0];
     if (argc == 1) usage(true);
     int preprocess_mode = 0, timings = 0;
-    bool kernel_mode = false, libc_mode = false;
+    bool kernel_mode = false, libc_mode = false, mem_stats = false;
     const char *inpath = NULL, *outpath = NULL;
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
@@ -2933,7 +2958,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "-E")) preprocess_mode = 1;
         else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
         else if (!strcmp(arg, "-O")) optimize++;
-        else if (!strcmp(arg, "-t")) timings++;
+        else if (!strcmp(arg, "-g")) debug = out_comments = true;
+        else if (!strcmp(arg, "-time")) timings++;
+        else if (!strcmp(arg, "-memory")) mem_stats = true;
         else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
         else if (!strcmp(arg, "-o")) { if (!argv[i+1]) arg_error("missing output filename", ""); outpath = argv[++i]; }
         else if (*arg == '-') arg_error("invalid option: ", arg);
@@ -3021,6 +3048,6 @@ int main(int argc, char **argv) {
     if (verbose) printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     t0 = now() - t0;
     if (timings) printf("total time: %ld ms\n", (t0 + 500) / 1000);
-    malloc_stats();
+    if (mem_stats) malloc_stats();
     return 0;
 }
