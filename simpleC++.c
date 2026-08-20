@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <malloc.h>
 
 #if (defined(__GNUC__) || defined(__TINYC__))
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
@@ -950,8 +951,7 @@ struct Node {
     atom_t str;             // N_STR, N_ASM decoded text
     atom_t name;            // N_VAR / N_CALL / N_DECL
     Type *type;             // result / declared type
-    Node *lhs, *rhs, *cond, *init;
-    Node *elems, *next;     // N_BLOCK, N_DECLIST
+    Node *lhs, *rhs, *cond, *init, *next;
 };
 
 static Token *cur(void);
@@ -1368,7 +1368,7 @@ static Node *parse_decl_stmt(void) {
     switch (base->kind) {  // check for bare struct/union/enum Foo { ... };
     case TY_STRUCT: case TY_UNION: case TY_ENUM: if (eat(T_SEMI)) return n;
     }
-    Node **tailp = &n->elems;
+    Node **tailp = &n->rhs;
     for (;;) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
@@ -1376,9 +1376,9 @@ static Node *parse_decl_stmt(void) {
         if (eat(T_LBRK)) t = parse_array(t);
         Node *d = new_node(N_DECL); d->name = nm; d->type = t; n->ival = flags;
         if (eat(T_ASSIGN)) {
-            d->init = parse_init();
-            if (t->kind == TY_ARRAY && t->arr_len < 0 && d->init->kind == N_BLOCK) {
-                t->arr_len = node_length(d->init->elems);
+            Node *init = d->init = parse_init();
+            if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
+                t->arr_len = node_length(init->rhs);
             }
         }
         *tailp = d; tailp = &d->next;
@@ -1465,7 +1465,7 @@ static Type *parse_type_base_only(int *pflags) {
 static Node *parse_init(void) {
     if (at(T_LBRACE)) {
         Node *n = new_node(N_BLOCK); P++;
-        Node **tailp = &n->elems;
+        Node **tailp = &n->rhs;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             Node *e = parse_init();
             *tailp = e; tailp = &e->next;
@@ -1492,7 +1492,7 @@ static Node *parse_loop_body(Node *n) {
 static Node *parse_block(void) {
     if (!at(T_LBRACE)) expect(T_LBRACE);
     Node *n = new_node(N_BLOCK); P++;
-    Node **tailp = &n->elems;
+    Node **tailp = &n->rhs;
     while (!at(T_RBRACE) && !at(T_EOF)) {
         Node *e = parse_stmt();
         *tailp = e; tailp = &e->next;
@@ -1729,7 +1729,7 @@ static void parse_toplevel(void) {
     if (at(K_TYPEDEF)) {
         // XXX: should be handled like a decl
         Node *n = parse_decl_stmt();
-        for (Node *e = n->elems; e; e = e->next) add_typedef(e);
+        for (Node *e = n->rhs; e; e = e->next) add_typedef(e);
         return;
     }
     int flags;
@@ -1803,9 +1803,9 @@ static void parse_toplevel(void) {
         Sym *sym = add_global(nm, pos, t);
         sym->flags = flags;
         if (eat(T_ASSIGN)) {
-            sym->init = parse_init();
-            if (t->kind == TY_ARRAY && t->arr_len < 0 && sym->init->kind == N_BLOCK) {
-                t->arr_len = node_length(sym->init->elems);
+            Node *init = sym->init = parse_init();
+            if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
+                t->arr_len = node_length(init->rhs);
             }
         }
         if (verbose) printf("-> %s\n", atom_str(nm));
@@ -1833,7 +1833,7 @@ static void collect_locals(Node *n) {
     if (!n) return;
     switch (n->kind) {
       case N_DECLIST:
-      case N_BLOCK: for (Node *e = n->elems; e; e = e->next) collect_locals(e); break;
+      case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) collect_locals(e); break;
       case N_DECL:
         if (!sym_find(locals, n->name)) add_local(n->name, n->pos, n->type);
         if (n->init) collect_locals(n->init);
@@ -1907,7 +1907,7 @@ static void check_used(Node *n) {
         case N_DECLIST:
         case N_BLOCK:
             // XXX: should handle scoping
-            for (Node *e = n->elems; e; e = e->next) check_used(e); break;
+            for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
         case N_DECL: check_used(n->init); break; // XXX: should handle scoping
         case N_IF: case N_TERNARY:
             check_used(n->cond); check_used(n->lhs); check_used(n->rhs); break;
@@ -2514,10 +2514,10 @@ static void loop_pop(void) { loop_sp--; }
 
 static void gen_stmt(Node *n) {
     switch (n->kind) {
-    case N_BLOCK: for (Node *e = n->elems; e; e = e->next) gen_stmt(e); break;
+    case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) gen_stmt(e); break;
     case N_EMPTY: break;
     case N_DECLIST:
-        for (Node *e = n->elems; e; e = e->next) {
+        for (Node *e = n->rhs; e; e = e->next) {
             if (e->init) {
                 Sym *s = lookup(e->name, e);
                 // XXX: should optimize if value is constant
@@ -2653,7 +2653,7 @@ static bool has_flow(Node *n) {
     switch (n->kind) {
     case N_GOTO:
     case N_RETURN: return false;
-    case N_BLOCK:  return has_flow(node_last(n->elems));
+    case N_BLOCK:  return has_flow(node_last(n->rhs));
     case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
     case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
     case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
@@ -2747,7 +2747,7 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
             break;
         case TY_ARRAY:
             if (init->kind == N_BLOCK) {
-                Node *e = init->elems;
+                Node *e = init->rhs;
                 for (int i = 0; i < t->arr_len; i++) {
                     gen_init(t->ptr, 0, e, NULL);
                     if (e) e = e->next;
@@ -2759,7 +2759,7 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
         case TY_STRUCT:
         case TY_UNION:
             if (init->kind != N_BLOCK) break;
-            Node *e = init->elems;
+            Node *e = init->rhs;
             for (Member *m = t->members; m; m = m->next) {
                 gen_init(m->type, 0, e, atom_str(m->name));
                 if (e) e = e->next;
@@ -3020,9 +3020,7 @@ int main(int argc, char **argv) {
     fclose(fout);
     if (verbose) printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     t0 = now() - t0;
-#ifdef ARENA_LENGTH
-    printf("memory: %ld/%ld bytes\n", arena_top, ARENA_LENGTH);
-#endif
     if (timings) printf("total time: %ld ms\n", (t0 + 500) / 1000);
+    malloc_stats();
     return 0;
 }

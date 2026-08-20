@@ -42,7 +42,6 @@ $(BIN): $(SRC) $(INC)
 	$(CC) $(CFLAGS) -o nano_gcc_O0.s -S -O0 '$(SRC)'
 	$(CC) $(CFLAGS) -o nano_gcc_O2_g.s -S -g -O2 '$(SRC)'
 	$(CC) $(CFLAGS) -o nano_gcc_O0_g.s -S -g -O0 '$(SRC)'
-	$(SIZE) nano_cc nano_prog
 
 # Compile a small program to assembly with the built compiler.
 run: $(BIN)
@@ -97,6 +96,7 @@ nano: $(BIN) Makefile
 	./$(BIN) $(FLAGS) -t $(SRC) -o nano.s
 	$(AS) -nostdlib nano.s -o nano_prog
 	$(AS) -nostdlib nano.s -o nano_prog_g -g
+	$(SIZE) nano_cc nano_prog
 	$(RUN) ./nano_prog $(FLAGS) -t $(SRC) -o nano2.s
 	$(RUN) diff nano.s nano2.s | head -50
 	@if [ '!' -f STATS.csv ] ; then echo "Source lines,Source bytes,Library lines,Library bytes,nano.s lines,nano.s bytes,nano_cc bytes,nano_prog bytes" > STATS.csv ; fi

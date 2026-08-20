@@ -1,6 +1,6 @@
 #ifndef ARENA_LENGTH
 // stdlib.h
-#define ARENA_LENGTH 4194304 // 4MB should suffice for everyone
+#define ARENA_LENGTH 2097152 // 2MB should suffice for everyone
 unsigned char arena[ARENA_LENGTH];
 size_t arena_top, arena_last;
 void *malloc(size_t size) {
@@ -36,5 +36,9 @@ void *realloc(void *p, size_t size) {
 char *strdup(const char *s) {
     size_t size = strlen(s) + 1; char *p = malloc(size);
     if (p) return memcpy(p, s, size); return p;
+}
+void malloc_stats(void) {
+    fprintf(stderr, "system bytes = %ld\n"
+            "in use bytes = %ld\n", ARENA_LENGTH, arena_top);
 }
 #endif
