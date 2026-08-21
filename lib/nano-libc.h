@@ -184,7 +184,7 @@ _Noreturn void exit(int code) {
     while(1);
 }
 
-// sys/time.h
+// time.h
 #if SYSTEM_DARWIN
 typedef long time_t;
 typedef int suseconds_t;
@@ -193,6 +193,7 @@ typedef int suseconds_t;
 typedef long time_t;
 typedef long suseconds_t;
 #endif
+
 typedef long clock_t;
 typedef int clockid_t;
 struct timespec { time_t tv_sec; long tv_nsec; };
@@ -204,17 +205,18 @@ struct timespec { time_t tv_sec; long tv_nsec; };
 int clock_gettime(clockid_t clock_id, struct timespec *tp) {
     return __syscall(SYS_clock_gettime, clock_id, tp);
 }
+
 #define CLOCKS_PER_SEC 1000000L
 clock_t clock(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)) return -1;
     //if (ts.tv_sec > LONG_MAX / 1000000 || ts.tv_nsec / 1000 > LONG_MAX - 1000000 * ts.tv_sec) return -1;
-    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return (clock_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+// sys/time.h
 struct timeval { time_t tv_sec; suseconds_t tv_usec; };
 struct timezone { int tz_minuteswest; int tz_dsttime; };
-
 int gettimeofday(struct timeval *tv, struct timezone *tz) {
     return __syscall(SYS_gettimeofday, tv, tz);
 }

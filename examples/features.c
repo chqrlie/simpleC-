@@ -42,6 +42,6 @@ int main() {
     hi = (a > b) ? a : 99;           // a == b, so 99
     _puts("ternary (a>b?a:99) = "); _print_int(hi); _puts("\n");
 
-    exit(0);
     return 0;
 }
+

@@ -91,7 +91,7 @@ nano: $(BIN) build Makefile
 # test the host libc and nano-printf
 test-printf: build Makefile
 	$(CC) $(CFLAGS) test/printf-test.c -o $(TMP)/printf-test_g -g
-	$(TMP)//printf-test_g
+	$(TMP)/printf-test_g
 
 # test nano-printf compiled by nano as part of its C library
 nano-printf: $(BIN) build Makefile

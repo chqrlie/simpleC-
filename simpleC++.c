@@ -19,7 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
+#include <sys/time.h> // gettimeofday
 #ifdef __APPLE__
 #include <malloc/malloc.h>
 static void malloc_stats(void) {
@@ -155,7 +155,7 @@ static void *reallocate(void *ptr, size_t *nelems, size_t size) {
     *nelems = new_nelems;
     return new_ptr;
 }
-static long now(void) {
+static unsigned long now(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000000 + tv.tv_usec;
 }
@@ -279,7 +279,7 @@ enum {
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
     ID__SYSCALL, ID__RDTSC, ID__RDTSCP, ID_ABS, ID_LABS,
 
-    ID_START, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
+    ID_START, ID_EXIT, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
     T_count
 };
 static const char *token_name[T_count] = {
@@ -302,7 +302,7 @@ static const char *token_name[T_count] = {
     "__builtin_clz", "__builtin_ctz",
     "__builtin_rotate_left",  "__builtin_rotate_right",
     "__syscall", "__rdtsc", "__rdtscp", "abs", "labs",
-    "_start", "main", "printf", "puts", "strlen", "strcpy", "memcpy",
+    "_start", "exit", "main", "printf", "puts", "strlen", "strcpy", "memcpy",
 };
 
 int counter;    // value of the last expansion of __COUNTER__
@@ -946,7 +946,7 @@ typedef struct Type {
             struct Sym *enum_syms;
         };
         struct {            // TY_ARRAY / TY_PTR
-            int arr_size__; // TY_ARRAY
+            int arr_size;   // TY_ARRAY
             int arr_len;    // TY_ARRAY
             struct Type *ptr;  // TY_ARRAY / TY_PTR
             struct Node *arr_len_expr; // TY_ARRAY
@@ -995,9 +995,10 @@ static const char *type_str(const Type *t) {
 
 static Type *ptr_to(Type *base) {
     Type *t = allocz(1, sizeof(Type));
-    t->kind = TY_PTR; t->align = 8; t->is_ptrish = true;
+    t->kind = TY_PTR; t->align = t->size = 8; t->is_ptrish = true;
     t->ptr = base; return t;
 }
+#define ty_align(t) ((t)->align)
 static int ty_size(Type *t) {
     switch (t->kind) {
     case TY_ARRAY:  return ty_size(t->ptr) * t->arr_len;
@@ -1006,7 +1007,6 @@ static int ty_size(Type *t) {
     default:        return t->align;
     }
 }
-#define ty_align(t) ((t)->align)
 static Member *find_member(Type *st, atom_t name) {
     if (st->kind == TY_PTR) st = st->ptr;
     for (Member *m = st->members; m; m = m->next) {
@@ -1028,7 +1028,6 @@ static int elem_size(Type *t) {
     return 0;
 }
 #define is_ptrish(t)  ((t)->is_ptrish)
-//static int is_ptrish(Type *t) { return t->kind == TY_ARRAY || t->kind == TY_PTR; }
 static bool same_type(Type *t1, Type *t2) {
     if (t1 && t2) {
         if (t1->kind != t2->kind) return false;
@@ -1159,7 +1158,10 @@ static Type *array_of(Type *base, Node *len_expr) {
     Type *arr = allocz(1, sizeof(Type));
     arr->kind = TY_ARRAY; arr->align = base->align; arr->is_ptrish = true;
     arr->ptr = base; arr->arr_len = -1; arr->arr_len_expr = len_expr;
-    if (len_expr && (len_expr->flags & CONST_VAL)) arr->arr_len = (int)len_expr->ival;
+    if (len_expr && (len_expr->flags & CONST_VAL)) {
+        arr->arr_len = (int)len_expr->ival;
+        arr->arr_size = ty_size(base) * arr->arr_len;  // XXX: problem if base is incomplete
+    }
     return arr;
 }
 
@@ -1541,7 +1543,9 @@ static Node *parse_primary(void) {
             }
             expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
         }
-        P--; Node *n = new_node(N_VAR); P++; n->name = nm; return n; // XXX: check for constant (need proper scoping)
+        P--; Node *n = new_node(N_VAR); P++; n->name = nm;
+        // XXX: should check for constant (need proper scoping)
+        return n;
     }
     case T_LP: {
         P++; Node *n = parse_expr(); expect(T_RP);
@@ -1889,7 +1893,7 @@ static Node *parse_stmt(void) {
     link_case:
         if (this_switch) {
             // append node to case list (quadratic but small n)
-            // keep default node at the end of list
+            // keep 'default' node at the end of list
             Node **np = &this_switch->lhs, *e;
             while ((e = *np) && e->kind != N_DEFAULT) np = &e->lhs;
             n->lhs = e; *np = n;
@@ -2046,10 +2050,11 @@ static bool eval_expr(Node *n, Value *vp) {
         case T_BITOR:   v1.uval |= v2.uval; break;
         case T_BITXOR:  v1.uval ^= v2.uval; break;
         case T_SHL:     v1.uval <<= v2.uval & 63; break;
-        case T_SHR:     v1.uval >>= (v2.uval &= 63);   // emulate signed right shift
-                        if (!v1.type->is_unsigned) v1.uval |= ~((1UL << (63 - v2.uval)) - 1); break;
-        case T_LT:      if (is_unsigned) v1.uval = v1.uval < v2.uval;  else v1.uval = v1.ival < v2.ival;  break;
-        case T_GT:      if (is_unsigned) v1.uval = v1.uval > v2.uval;  else v1.uval = v1.ival > v2.ival;  break;
+        case T_SHR:     v1.uval >>= (v2.uval &= 63);
+                        // emulate signed right shift
+                        if (!v1.type->is_unsigned) v1.uval |= ~(((1UL << (63 - v2.uval)) & v1.uval) - 1); break;
+        case T_LT:      if (is_unsigned) v1.uval = v1.uval <  v2.uval; else v1.uval = v1.ival <  v2.ival; break;
+        case T_GT:      if (is_unsigned) v1.uval = v1.uval >  v2.uval; else v1.uval = v1.ival >  v2.ival; break;
         case T_LE:      if (is_unsigned) v1.uval = v1.uval <= v2.uval; else v1.uval = v1.ival <= v2.ival; break;
         case T_GE:      if (is_unsigned) v1.uval = v1.uval >= v2.uval; else v1.uval = v1.ival >= v2.ival; break;
         case T_EQ:      v1.uval = v1.uval == v2.uval; break;
@@ -2365,7 +2370,7 @@ static void emit(const char *fmt, ...) {
     }
     putc('\n', fout);
 }
-static void emit_label(int lab) { if (lab > 0) { if (next_label) emit(" "); next_label = lab; }}
+static void emit_label(int lab) { if (lab <= 0) return; if (next_label) emit(" "); next_label = lab; }
 static void emit_comment(const char *comment) {
     if (out_comments) {
         if (*next_comment) emit(" ");
@@ -2406,7 +2411,7 @@ const char *reg32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", 
 const char *reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
 const char *reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
 
-static int label_id = 10;
+static int label_id = 10;  // labels 1-9 reserved as local labels
 static int ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
@@ -2506,39 +2511,33 @@ static Type *static_typeof(Node *n) {
 }
 
 static size_t encode_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
+    if (!size) return 0;
+    size--;  // number of available bytes left in buf before the null terminator
     size_t j = 0;
-    if (sep && size > 1) buf[j++] = sep;
+#define PUT(c)  (void)(j < size && (buf[j++] = c))
+    if (sep) PUT(sep);
     for (size_t i = 0; i < slen; i++) {
-        char ch = str[i];
+        int ch = (unsigned char)str[i];
         switch (ch) {
-        case '\n': ch = 'n'; goto escape;  case '\t': ch = 't'; goto escape;
-        case '\r': ch = 'r'; goto escape;  case '\b': ch = 'b'; goto escape;
-        case '\f': ch = 'f'; goto escape;  case '\v': ch = 'v'; goto escape;
-        case '"': case '\'': if (sep && ch != sep) goto normal;
-        case '\\':
-        escape:
-            if (j + 2 >= size) break;
-            buf[j++] = '\\'; buf[j++] = ch;
-            continue;
+        case '\b': ch = 'b'; break;  case '\t': ch = 't'; break;
+        case '\n': ch = 'n'; break;  case '\v': ch = 'v'; break;
+        case '\f': ch = 'f'; break;  case '\r': ch = 'r'; break;
+        case '\\': break;
+        case '"': case '\'': if (ch == sep) break;
         default:
-        normal:
-            if (ch >= 32 && ch <= 126) {
-                if (j + 1 >= size) break;
-                buf[j++] = ch;
-                continue;
-            }
-            if (j + 4 >= size) break;
-            buf[j++] = '\\';
-            int has_digit = isdigit((unsigned char)str[i+1]);
-            if (ch & 0700 || has_digit) buf[j++] = '0' + ((ch >> 6) & 7);
-            if (ch & 0770 || has_digit) buf[j++] = '0' + ((ch >> 3) & 7);
-            buf[j++] = '0' + (ch & 7);
-            continue;
+            if (ch < 32 || ch > 126) break;
+            PUT(ch); continue;
         }
-        break;
+        PUT('\\');  // encode as an escape sequence
+        if (ch >= 32 && ch <= 126) { PUT(ch); continue; }
+        if (i < slen && isdigit((unsigned char)str[i+1])) ch |= 01000;
+        if (ch & 01700) PUT(((ch >> 6) & 7) + '0');
+        if (ch & 01770) PUT(((ch >> 3) & 7) + '0');
+        PUT((ch & 7) + '0');
     }
-    if (sep && j + 1 < size) buf[j++] = sep;
-    if (j < size) buf[j] = '\0';
+    if (sep) PUT(sep);
+#undef PUT
+    buf[j] = '\0';
     return j;
 }
 
@@ -2621,7 +2620,7 @@ static void emit_idiv_imm(int r, unsigned long val, bool save_rax) {
 static void emit_div_imm(int r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
-    if (0 && val == 10) {
+    if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
         emit("mov rcx, -3689348814741910323");
@@ -2693,7 +2692,7 @@ static void emit_imod_imm(int r, unsigned long val, bool save_rax) {
 static void emit_mod_imm(int r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
-    if (0 && val == 10) {
+    if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
         emit("mov rcx, rax");
@@ -3011,28 +3010,29 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         emit_label(end);
         return ty_long();
     }
-    case N_UNARY:
-        gen_expr(n->lhs, r, save_rax);
+    case N_UNARY: {
+        Type *t = gen_expr(n->lhs, r, save_rax);
         switch (n->op) {
-        case T_PLUS:    break; // promoted type
-        case T_MINUS:   emit("neg %s", reg); break; // type?
-        case T_BITNOT:  emit("not %s", reg); break; // type?
-        case T_NOT:     emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); break; // int?
+        case T_PLUS:    break;
+        case T_MINUS:   emit("neg %s", reg); break;
+        case T_BITNOT:  emit("not %s", reg); break;
+        case T_NOT:     emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); return ty_int();
         }
-        return ty_long(); // should be int
+        return promoted_type(t);
+    }
     case N_LOGAND: {
         int lab = label_id++;
         gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", lab);
         gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
         emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
-        return ty_long(); // should be int
+        return ty_int();
     }
     case N_LOGOR: {
         int lab = label_id++;
         gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jnz", lab);
         gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
         emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
-        return ty_long(); // should be int
+        return ty_int();
     }
     case N_CALL: {
         // ---- variadic built-ins (handled inline, not real calls) ----
@@ -3190,8 +3190,8 @@ static void loop_push(Node *n, int b, int c) {
 }
 static void loop_pop(void) { loop_sp--; }
 
-//#define OLD
-#ifndef OLD
+//#define OLD_SWITCH
+#ifndef OLD_SWITCH
 #define DEST_NONE    (-1)
 #define DEST_BREAK   (-2)
 static bool case_expr_less(Node *t1, Node *t2, bool is_unsigned) {
@@ -3261,14 +3261,13 @@ static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
 
 static size_t gen_case_value(char *cbuf, size_t size, const char *s, Node *e) {
     size_t pos = pstrcpy(cbuf, size, s);
-    switch (e->kind) {
-    case N_VAR:  pos += pstrcpy(cbuf + pos, size - pos, atom_str(e->name)); return pos;
-    default:
-        if (e->op == T_CHAR) {
-            char c = (char)e->uval; pos += encode_string(cbuf + pos, size - pos, &c, 1, '\''); return pos;
-        } else {
-            Value v; v.uval = e->uval; v.type = e->type; pos += value_str(&v, cbuf + pos, size - pos); return pos;
-        }
+    if (e->kind == N_VAR) {
+        pos += pstrcpy(cbuf + pos, size - pos, atom_str(e->name)); return pos;
+    }
+    if (e->op == T_CHAR) {
+        char c = (char)e->uval; pos += encode_string(cbuf + pos, size - pos, &c, 1, '\''); return pos;
+    } else {
+        Value v; v.uval = e->uval; v.type = e->type; pos += value_str(&v, cbuf + pos, size - pos); return pos;
     }
 }
 
@@ -3282,7 +3281,7 @@ static void gen_case_comment(Node *n) {
 
 static void gen_switch(Node *n) {
     Type *ct = promoted_type(gen_expr(n->cond, RAX, false));
-#ifdef OLD
+#ifdef OLD_SWITCH
     // Emit "if (switch_value == case_value) goto case_label" for every case.
     // XXX: should check for duplicates
     int def = 0, end = 0;
@@ -3292,6 +3291,7 @@ static void gen_switch(Node *n) {
             Value v;
             eval_const_expr(e->cond, &v, "'case' expression");
             gen_case_comment(e);
+            // XXX: handle case ranges
             emit_cmp_imm(RAX, v.uval);
             emit_jmp(n, "jz", e->lab);
         } else {
@@ -3750,8 +3750,8 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
         emit_comment("envp"); emit("lea rdx, [rsi+8*rdi+8]");
         emit("call main");
         emit("mov rdi, rax");
-        emit_comment("SYS_exit"); emit("mov rax, 60");
-        emit("syscall");
+        emit("call exit");
+        emit("hlt");
     }
 
     for (Func *f = funcs; f; f = f->next) if (f->used) gen_func(f);
@@ -3800,7 +3800,7 @@ int main(int argc, char **argv) {
     int preprocess_mode = 0, timings = 0, rc = 0;
     bool kernel_mode = false, libc_mode = false, mem_stats = false;
     const char *inpath = NULL, *outpath = NULL;
-    long t0 = now();
+    unsigned long t0 = now();
     strcpy(include_path, "lib/");   // should find nano_cc directory
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
@@ -3844,6 +3844,7 @@ int main(int argc, char **argv) {
 
     while (!at(T_EOF)) parse_toplevel();
     check_used_func(ID_MAIN);
+    if (!kernel_mode) check_used_func(ID_EXIT);
 
     if (!outpath) {
         size_t len = strlen(inpath); strend(inpath, ".c", &len);
@@ -3855,7 +3856,7 @@ int main(int argc, char **argv) {
     if (fout != stdout) fclose(fout);
 
     if (!rc && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
-    if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %ld.%03ld ms\n", t0 / 1000, t0 % 1000); }
+    if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %lu.%03lu ms\n", t0 / 1000, t0 % 1000); }
     if (mem_stats) malloc_stats();
     return rc;
 }

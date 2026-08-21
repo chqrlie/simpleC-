@@ -57,7 +57,7 @@ int _open(const char *path, int flags, ...) {
 }
 int _close(int fd) { return __syscall(SYS_close, fd); }
 
-_Noreturn void _exit(int code) {
+_Noreturn void exit(int code) {
     __syscall(SYS_exit, code);
     for(;;);
 }
@@ -70,7 +70,7 @@ void _print_int(long n) {
     if (n < 0) u = -u;
     char *p = buf + sizeof(buf);
     *--p = 0;
-    do { *--p = '0' + u % 10; u = u / 10; } while (u);
+    do { *--p = u % 10 + '0'; u = u / 10; } while (u);
     if (n < 0) *--p = '-';
     _puts(p);
 }

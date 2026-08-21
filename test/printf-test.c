@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/time.h>
 
 #if (defined(__GNUC__) || defined(__TINYC__))
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
@@ -5148,12 +5149,26 @@ static sprint_ll_type const sprint_lls[] = {
     { 0, 0, 0, 0 },
 };
 
-typedef clock_t ptimer_t;
-static inline void timer_start(ptimer_t *pt) {
-    *pt = clock();
+int use_clock;
+typedef unsigned long long ptimer_t;    // microseconds or clocks
+static unsigned long long now(void) {
+    if (use_clock) return clock();
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000000 + tv.tv_usec;
 }
-static inline unsigned long long timer_stop(ptimer_t *pt, unsigned long timescale) {
-    return (unsigned long long)((clock() - *pt) * timescale / CLOCKS_PER_SEC);
+
+static inline void timer_start(ptimer_t *pt) {
+    *pt = now();
+}
+static inline unsigned long timer_stop(const ptimer_t *pt) {
+    unsigned long n = now() - *pt;
+    if (use_clock) {
+        if (CLOCKS_PER_SEC % 1000000)
+            n = n * 1000000 / CLOCKS_PER_SEC;
+        else
+            n = n / (CLOCKS_PER_SEC / 1000000);
+    }
+    return n;
 }
 
 static void usage(const char *progname) {
@@ -5161,9 +5176,10 @@ static void usage(const char *progname) {
     fprintf(stderr,
             "options:\n"
             "  -?  --help     output this message\n"
-            "  -v  --verbose  output all conversions\n"
             "  -a  --all      output all conversion errors\n"
+            "  -c  --clock    use clock() instead of gettimeofday()\n"
             "  -n  --limit    set the error limit (default 20)\n"
+            "  -v  --verbose  output all conversions\n"
             );
     exit(1);
 }
@@ -5181,7 +5197,7 @@ int main(int argc, char *argv[]) {
     ptimer_t pt;
     int i, iter, repeat = 32;
     int verbose = 0, limit = 20;
-    int elapsed;
+    unsigned long elapsed;
     int status = 0;
 #define BSIZE 1024
 
@@ -5190,6 +5206,7 @@ int main(int argc, char *argv[]) {
         if      (!strcmp(arg, "-?") || !strcmp(arg, "--help")) { usage(argv[0]); }
         else if (!strcmp(arg, "-v") || !strcmp(arg, "--verbose")) verbose++;
         else if (!strcmp(arg, "-a") || !strcmp(arg, "--all")) limit = 0;
+        else if (!strcmp(arg, "-c") || !strcmp(arg, "--clock")) use_clock = 1;
         else if (!strcmp(arg, "-n") || !strcmp(arg, "--limit")) {
             arg = argv[i++];
             if (!arg) { fprintf(stderr, "missing limit\n"); return 1; }
@@ -5199,7 +5216,7 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef STD_FUNC
-    int std_elapsed;
+    unsigned long std_elapsed;
     int std_errcount = 0;
     int std_testcount = 0;
     char std_buffer[BSIZE];
@@ -5211,7 +5228,7 @@ int main(int argc, char *argv[]) {
 #endif
 
 #ifdef ALT_FUNC
-    int alt_elapsed;
+    unsigned long alt_elapsed;
     int alt_errcount = 0;
     int alt_testcount = 0;
     char alt_buffer[BSIZE];
@@ -5256,38 +5273,39 @@ int main(int argc, char *argv[]) {
     } while (0)
 
 #ifdef STD_FUNC
-    std_elapsed = repeat ? INT_MAX : 0;
+    std_elapsed = 0;
     for (iter = 0; iter < repeat; iter++) {
         std_testcount = 0;
         timer_start(&pt);
         RUNTESTS(sprint_int_type, sprint_ints, "%ld", STD_TEST);
         RUNTESTS(sprint_ll_type, sprint_lls, "%lld", STD_TEST);
-        elapsed = timer_stop(&pt, 1000000);
-        if (std_elapsed > elapsed)
+        elapsed = timer_stop(&pt);
+        if (std_elapsed - 1 >= elapsed)
             std_elapsed = elapsed;
     }
 #endif
 #ifdef ALT_FUNC
-    alt_elapsed = repeat ? INT_MAX : 0;
+    alt_elapsed = 0;
     for (iter = 0; iter < repeat; iter++) {
         alt_testcount = 0;
         timer_start(&pt);
         RUNTESTS(sprint_int_type, sprint_ints, "%ld", ALT_TEST);
         RUNTESTS(sprint_ll_type, sprint_lls, "%lld", ALT_TEST);
-        elapsed = timer_stop(&pt, 1000000);
-        if (alt_elapsed > elapsed)
+        elapsed = timer_stop(&pt);
+        if (alt_elapsed - 1 >= elapsed)
             alt_elapsed = elapsed;
     }
 #endif
+    fflush(stdout);
     /* group output after benchmark to reduce side effects */
 #ifdef STD_FUNC
-    printf("%s: %d tests, %d errors, %d.%03d ms.\n",
+    printf("%s: %d tests, %d errors, %lu.%03lu ms.\n",
            "libc " STD_FUNC_name,
            std_testcount, std_errcount,
            std_elapsed / 1000, std_elapsed % 1000);
 #endif
 #ifdef ALT_FUNC
-    printf("%s: %d tests, %d errors, %d.%03d ms.\n",
+    printf("%s: %d tests, %d errors, %lu.%03lu ms.\n",
            ALT_FUNC_name,
            alt_testcount, alt_errcount,
            alt_elapsed / 1000, alt_elapsed % 1000);
