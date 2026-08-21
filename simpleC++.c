@@ -248,7 +248,7 @@ enum {
     ID__BUILTIN_BSWAP16, ID__BUILTIN_BSWAP32, ID__BUILTIN_BSWAP64,
     ID__BUILTIN_CLZ, ID__BUILTIN_CTZ,
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
-    ID__SYSCALL, ID__RDTSC, ID__RDTSCP,
+    ID__SYSCALL, ID__RDTSC, ID__RDTSCP, ID_ABS, ID_LABS,
 
     ID_START, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
     T_count
@@ -272,7 +272,7 @@ static const char *token_name[T_count] = {
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
     "__builtin_clz", "__builtin_ctz",
     "__builtin_rotate_left",  "__builtin_rotate_right",
-    "__syscall", "__rdtsc", "__rdtscp",
+    "__syscall", "__rdtsc", "__rdtscp", "abs", "labs",
     "_start", "main", "printf", "puts", "strlen", "strcpy", "memcpy",
 };
 
@@ -719,7 +719,11 @@ static size_t lex(const char *p) {
         if (c == '\n') { src_pos++; }
         if (isspace(c)) continue;
 
-        if (c == 0) { p--; add_tok(T_EOF); break; }
+        if (c == 0) {
+            p--; add_tok(T_EOF);
+            if (verbose) printf("Tokenized: %zu tokens\n", ntok);
+            return p - start;
+        }
         if (isdigit(c)) {
             Token *t = add_tok(T_NUM);
             long v = c - '0';
@@ -775,17 +779,6 @@ static size_t lex(const char *p) {
             }
             add_tok(T_DOT); continue;
         }
-        if (c == '-' && *p == '>') { p++; add_tok(T_ARROW); continue; }
-        const char *pp = ops;
-        while (pp < ops + sizeof(ops) && *pp && *pp != c) pp += 5;
-        if (*pp) {
-            if (pp[2] && *p == c) {
-                if (pp[4] && p[1] == '=') { p += 2; add_tok(pp[4]); continue; }
-                else { p++; add_tok(pp[2]); continue; }
-            }
-            if (pp[3] && *p == '=') { p++; add_tok(pp[3]); continue; }
-            else { add_tok(pp[1]); continue; }
-        }
         if (c == '#') { // parse # number [filename]
             p += skip_blanks(p);
             const char *filename = NULL;
@@ -801,10 +794,19 @@ static size_t lex(const char *p) {
             p += (*p == '\n');
             continue;
         }
+        if (c == '-' && *p == '>') { p++; add_tok(T_ARROW); continue; }
+        const char *pp = ops;
+        while (pp < ops + sizeof(ops) && *pp && *pp != c) pp += 5;
+        if (*pp) {
+            if (pp[2] && *p == c) {
+                if (pp[4] && p[1] == '=') { p += 2; add_tok(pp[4]); continue; }
+                else { p++; add_tok(pp[2]); continue; }
+            }
+            if (pp[3] && *p == '=') { p++; add_tok(pp[3]); continue; }
+            else { add_tok(pp[1]); continue; }
+        }
         warning(src_pos, "unknown character '%c' in source", c);
     }
-    if (verbose) printf("Tokenized: %zu tokens\n", ntok);
-    return p - start;
 }
 
 // =====================================================================
@@ -1497,13 +1499,14 @@ static Node *parse_stmt(void) {
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         Node *save_this_switch = this_switch;
         this_switch = n;
-        n->lhs = parse_block();
+        n->rhs = parse_block();
         this_switch = save_this_switch;
         return n;
     }
     if (at(K_CASE)) {
         if (!this_switch) error(NULL, "'case' outside a 'switch' statement");
         n = new_node(N_CASE); P++; n->cond = parse_const_expr();
+        //if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
         goto link_case;
     }
     if (at(K_DEFAULT))  {
@@ -1517,9 +1520,10 @@ static Node *parse_stmt(void) {
         n = new_node(N_DEFAULT); P++;
         n->name = K_DEFAULT;
     link_case:
-        if (this_switch) {  // append node to case list (quadratic but small n)
-            Node **casep = &this_switch->rhs;
-            while (*casep) { casep = &(*casep)->rhs; } *casep = n;
+        if (this_switch) {
+            // append node to case list (quadratic but small n)
+            Node **np = &this_switch->lhs;
+            while (*np) { np = &(*np)->lhs; } *np = n;
         }
         expect(T_COLON);
         return n;
@@ -1825,7 +1829,7 @@ static void collect_locals(Node *n) {
       case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
         collect_locals(n->lhs); collect_locals(n->rhs); break;
       case N_CALL: for (Node *e = n->rhs; e; e = e->next) collect_locals(e); break;
-      case N_SWITCH: collect_locals(n->cond); collect_locals(n->lhs); break;
+      case N_SWITCH: collect_locals(n->cond); collect_locals(n->rhs); break;
       default: break;
     }
 }
@@ -1901,8 +1905,24 @@ static void check_used(Node *n) {
             if (!IS_BUILTIN(n->name)) check_used_func(n->name);
             for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
             break;
-        case N_SWITCH: check_used(n->cond); check_used(n->lhs); break;
+        case N_SWITCH: check_used(n->cond); check_used(n->rhs); break;
         case N_VAR: break; // XXX: should look up symbol and set used bit
+    }
+}
+
+static bool has_flow(Node *n) {
+    if (!n) return true;
+    switch (n->kind) {
+    case N_GOTO:
+    case N_RETURN: return false;
+    case N_BLOCK:  return has_flow(node_last(n->rhs));
+    case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
+    case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
+    case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
+                   return has_flow(n->rhs);
+    //case N_WHILE: case N_DOWHILE: // XXX: check constant loop condition and break
+    //case N_CALL:    // XXX: check for _Noreturn attribute
+    default:       return true;
     }
 }
 
@@ -2258,6 +2278,10 @@ static bool is_simple_load(Node *n) {
     }
     return false;
 }
+static bool all_simple_load(Node *n) {
+    for (Node *arg = n->rhs; arg; arg = arg->next) if (!is_simple_load(arg)) return false;
+    return true;
+}
 
 static void gen_simple_load(Node *n, int r) {
     switch (n->kind) {
@@ -2407,11 +2431,9 @@ static Type *gen_expr(Node *n) {
         case ID__BUILTIN_CTZ:
             gen_expr(n->rhs); emit("rep bsf rax, rax");
             return ty_long();
-        case ID__SYSCALL: {
-            bool all_simple = true;
+        case ID__SYSCALL:
             if (!n->nargs) error(n, "missing syscall number argument");
-            for (Node *arg = n->rhs; arg; arg = arg->next) all_simple &= is_simple_load(arg);
-            if (all_simple) {
+            if (all_simple_load(n)) {
                 int i = 0;
                 for (Node *arg = n->rhs->next; arg; arg = arg->next) gen_simple_load(arg, ARGREG[i++]);
                 gen_simple_load(n->rhs, RAX);
@@ -2428,7 +2450,14 @@ static Type *gen_expr(Node *n) {
             emit("mov [rip + errno], rax");
             emit_label(end1);
             return ty_long();
-        }
+        case ID_ABS:
+        case ID_LABS:
+            if (n->nargs != 1) error(n, "missing syscall number argument");
+            gen_expr(n->rhs);
+            emit("mov rcx, rax");
+            emit("neg rax");
+            emit("cmovs rax, rcx");
+            return n->rhs->type;
         case ID__RDTSC:
             emit("rdtsc"); emit("shl rdx,32"); emit("or rax, rdx");
             return ty_long();
@@ -2444,9 +2473,7 @@ static Type *gen_expr(Node *n) {
         }
         // XXX: should check and convert arguments according to prototype
         // XXX: here we could support default argument values
-        bool all_simple = true;
-        for (Node *arg = n->rhs; arg; arg = arg->next) all_simple &= is_simple_load(arg);
-        if (all_simple) {
+        if (all_simple_load(n)) {
             int i = 0;
             for (Node *arg = n->rhs; arg; arg = arg->next) gen_simple_load(arg, ARGREG[i++]);
         } else {
@@ -2547,7 +2574,7 @@ static void gen_switch(Node *n) {
     // Emit "if (switch_value == case_value) goto case_label" for every case.
     // XXX: should check for duplicates
     int def = 0, end = 0;
-    for (Node *e = n->rhs; e; e = e->rhs) {
+    for (Node *e = n->lhs; e; e = e->lhs) {
         long val;
         e->ival = label_id++;
         if (e->kind == N_CASE) {
@@ -2565,7 +2592,7 @@ static void gen_switch(Node *n) {
 
     // break exits the switch; continue passes through to the enclosing loop
     loop_push(n, end, cont_lbl[loop_sp]);
-    gen_stmt(n->lhs);               // the body places the case labels inline
+    gen_stmt(n->rhs);          // the body places the case labels inline
     loop_pop();
     emit_label(end);
 }
@@ -2586,7 +2613,7 @@ static void gen_stmt(Node *n) {
             }
         }
         break;
-    case N_EXPR: n->lhs->discard = true; gen_expr(n->lhs); break;
+    case N_EXPR:   n->lhs->discard = true; gen_expr(n->lhs); break;
     case N_RETURN:
         if (n->lhs) gen_expr(n->lhs);
         emit("leave"); emit("ret");
@@ -2640,21 +2667,12 @@ static void gen_stmt(Node *n) {
         emit_label(end);
         break;
     }
-    case N_BREAK:
-        emit_jmp(n, "jmp", brk_lbl[loop_sp]);
-        break;
-    case N_CONTINUE:
-        emit_jmp(n, "jmp", cont_lbl[loop_sp]);
-        break;
-    case N_SWITCH: gen_switch(n); break;
-    case N_CASE:
-        gen_case_comment(n);
-        emit_label((int)n->ival); break;
+    case N_BREAK:    emit_jmp(n, "jmp", brk_lbl[loop_sp]);  break;
+    case N_CONTINUE: emit_jmp(n, "jmp", cont_lbl[loop_sp]); break;
+    case N_SWITCH:   gen_switch(n); break;
+    case N_CASE:     gen_case_comment(n); emit_label((int)n->ival); break;
     case N_DEFAULT:
-    case N_LABEL:
-        emit_comment(atom_str(n->name));
-        emit_label((int)n->ival);
-        break;
+    case N_LABEL:    emit_comment(atom_str(n->name)); emit_label((int)n->ival); break;
     case N_GOTO: {
         Label *lab = find_label(n->name);
         if (!lab) {
@@ -2665,24 +2683,8 @@ static void gen_stmt(Node *n) {
         emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", (int)lab->n->ival);
         break;
     }
-    case N_ASM: gen_asm(n); break;
+    case N_ASM: gen_asm(n);  break;
     default:    gen_expr(n); break;    // node is part of an expression
-    }
-}
-
-static bool has_flow(Node *n) {
-    if (!n) return true;
-    switch (n->kind) {
-    case N_GOTO:
-    case N_RETURN: return false;
-    case N_BLOCK:  return has_flow(node_last(n->rhs));
-    case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
-    case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
-    case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
-                   return has_flow(n->lhs);
-    //case N_WHILE: case N_DOWHILE: // XXX: check constant loop condition and break
-    //case N_CALL:    // XXX: check for _Noreturn attribute
-    default:       return true;
     }
 }
 

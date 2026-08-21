@@ -29,7 +29,7 @@ ifneq (,$(NORUN))
 RUN	= @\#
 endif
 
-.PHONY: all test_all run test demo structs bitwise printf switch clean nano
+.PHONY: all debug run test demo structs bitwise printf switch clean nano test_all
 
 INC = nano-malloc.h nano-nolibc.h
 
@@ -37,6 +37,8 @@ all: $(BIN)
 
 $(BIN): $(SRC) $(INC)
 	$(CC) $(CFLAGS) -o $@ '$(SRC)'
+
+debug:
 	$(CC) $(CFLAGS) -o $@_g '$(SRC)' -g
 	$(CC) $(CFLAGS) -o nano_gcc_O2.s -S -O2 '$(SRC)'
 	$(CC) $(CFLAGS) -o nano_gcc_O0.s -S -O0 '$(SRC)'
