@@ -77,6 +77,7 @@ enum {
     SYS_open  = 2,
     SYS_close = 3,
     SYS_mmap  = 9,
+    SYS_ioctl = 16,
     SYS_exit  = 60,
     SYS_creat = 85,
     SYS_gettimeofday = 96,
@@ -87,7 +88,6 @@ enum {
 #define O_RDWR   2
 #define O_CREAT  0x40
 #define O_TRUNC  0x200
-#define O_BINARY 0
 
 // --- POSIX wrappers ---
 ssize_t read(int fd, void *buf, size_t len) {
@@ -109,12 +109,36 @@ int open(const char *path, int flags, ...) {
     va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
     return __syscall(SYS_open, path, flags, mode);
 }
-int close(int fd) {
-    return __syscall(SYS_close, fd);
+int close(int fd) { return __syscall(SYS_close, fd); }
+int ioctl(int fd, int cmd, ...) {
+    va_list ap; va_start(ap, flags);
+    unsigned long arg1 = va_arg(ap, unsigned long);
+    unsigned long arg2 = va_arg(ap, unsigned long);
+    unsigned long arg3 = va_arg(ap, unsigned long);
+    //unsigned long arg4 = va_arg(ap, unsigned long);
+    va_end(ap);
+    return __syscall(SYS_ioctl, fd, cmd, arg1, arg2, arg3 /*, arg4*/);
 }
-int fflush(struct FILE *fp);    // should use an atexit function table
+
+struct winsize {
+    unsigned short ws_row;     // rows, in characters
+    unsigned short ws_col;     // columns, in characters
+    unsigned short ws_xpixel;  // horizontal size, pixels
+    unsigned short ws_ypixel;  // vertical size, pixels
+};
+enum { TIOCGWINSZ = 0x5413 };
+
+int isatty(int fd) {
+    struct winsize wsz;
+    int r = __syscall(SYS_ioctl, fd, TIOCGWINSZ, &wsz);
+    if (r == 0) return 1;
+    if (errno != EBADF) errno = ENOTTY;
+    return 0;
+}
+
+int fflushall(void);    // should use an atexit function table
 _Noreturn void exit(int code) {
-    fflush(NULL);
+    fflushall();
     __syscall(SYS_exit, code);
     while(1);
 }
@@ -137,68 +161,212 @@ int gettimeofday(struct timeval *tv, struct timezone *tz) {
 }
 
 // stdio.h (no buffering)
-typedef struct FILE { int hd; char *dest; size_t pos, cap; } FILE;
-#define NFILE 10
-FILE _iofb[NFILE] = {{ 0 }, { 1 }, { 2 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }};
-#define stdin  &_iofb[0]
-#define stdout &_iofb[1]
-#define stderr &_iofb[2]
+#define _IOFBF   0
+#define _IOLBF   1
+#define _IONBF   2
+#define _IOABF   3
+#define _IOREAD  1
+#define _IOWRITE 2
+#define BUFSIZ  4096
+typedef struct FILE {
+    int hd;
+    unsigned char bmode, flags;
+    bool alloc;
+    size_t size, pos, cap, len;
+    unsigned char *buf;
+} FILE;
+#define NFILE 20
+FILE _iob[NFILE] = {
+    { 0, _IOFBF, _IOREAD,  false, BUFSIZ },
+    { 1, _IOABF, _IOWRITE, false, BUFSIZ },
+    { 2, _IONBF, _IOWRITE, false, 0 },
+};
+#define stdin  &_iob[0]
+#define stdout &_iob[1]
+#define stderr &_iob[2]
 #define EOF   (-1)
 
-int fclose(FILE *fp) { int res = close(fp->hd); fp->hd = -1; return res; }
-int fflush(FILE *fp) { return 0; }
-FILE *fopen(const char *filename, char *mode) {
-    for (int i = 0; i < NFILE; i++) {
-        FILE *fp = &_iofb[i];
-        if (fp->hd < 0) {
-            fp->hd = open(filename, *mode == 'w' ? O_WRONLY | O_CREAT | O_TRUNC : O_RDONLY, 0777);
-            if (fp->hd >= 0) return fp;
-            break;
+int fflush(FILE *fp) {
+    size_t len = fp->pos;
+    unsigned char *p = fp->buf;
+    if ((fp->flags & _IOWRITE) && p && len) {
+        fp->pos = 0;
+        while (len) {
+            ssize_t wsz = write(fp->hd, p, len);
+            if (wsz < 0) {
+                if (p > fp->buf) memcpy(fp->buf, p, len);
+                fp->pos = len;
+                return -1;
+            }
+            p += wsz; len -= wsz;
         }
     }
-    return NULL;
+    return 0;
 }
-
-int fgetc(FILE *fp) { char b; return read(fp->hd, &b, 1) == 1 ? b & 255 : EOF; }
+int fflushall(void) {
+    int res = 0; for (size_t i = 0; i < NFILE; i++) res |= fflush(&_iob[i]);
+    return res;
+}
+int fclose(FILE *fp) {
+    fflush(fp);
+    if (fp->alloc) { free(fp->buf); fp->alloc = false; }
+    if (!(fp->flags & (_IOREAD|_IOWRITE))) return 0;
+    int hd = fp->hd;
+    memset(fp, 0, sizeof(*fp));
+    return close(hd);
+}
+FILE *fopen(const char *filename, char *mode) {
+    for (size_t i = 0; i < NFILE; i++) {
+        FILE *fp = &_iob[i];
+        if (!fp->flags) {
+            int hd, mode; unsigned char flags;
+            if      (*mode == 'r') { flags = _IOREAD;  mode = O_RDONLY; }
+            else if (*mode == 'w') { flags = _IOWRITE; mode = O_WRONLY | O_CREAT | O_TRUNC; }
+            else                   { errno = EINVAL; return NULL; }
+            if ((hd = open(filename, mode, 0777)) < 0) return NULL;
+            fp->hd = hd; fp->flags = flags; fp->size = BUFSIZ;
+            return fp;
+        }
+    }
+    errno = EMFILE; return NULL;
+}
+int setvbuf(FILE *fp, char *buf, int mode, size_t size) {
+    if (!(fp->flags & (_IOREAD|_IOWRITE)) || fflush(fp)) return -1;
+    size_t cap = 0;
+    switch (mode) {
+    case _IOFBF: cap = size; break;
+    case _IOLBF:             break;
+    case _IONBF: size = 0;   break;
+    default: errno = EINVAL; return -1;
+    }
+    if (fp->alloc) { free(fp->buf); fp->alloc = false; }
+    fp->buf = buf; fp->size = size;
+    fp->bmode = (unsigned char)mode;
+    fp->cap = cap;
+    return 0;
+}
+// reading
+int _filbuf(FILE *fp) {
+    if (!(fp->flags & _IOREAD)) return EOF;
+    if (fp->bmode != _IONBF) {
+        if (!fp->buf) {
+            if ((fp->buf = malloc(fp->size))) fp->alloc = true;
+            else fp->bmode = _IONBF;
+        }
+        if (fp->buf) {
+            ssize_t rsz = read(fp->hd, fp->buf, fp->size); if (rsz <= 0) return EOF;
+            fp->pos = 0; fp->len = (size_t)rsz; return fp->buf[fp->pos++];
+        }
+    }
+    char b;
+    if (read(fp->hd, &b, 1) == 1) return b & 255;
+    return EOF;
+}
+#define getc(fp)  ((fp->pos < fp->len) ? fp->buf[fp->pos++] : _filbuf(fp))
+int fgetc(FILE *fp) { return getc(fp); }
 char *fgets(char *buf, size_t n, FILE *fp) {
     size_t i = 0;
     int c;
-    while (i + 1 < n && ((c = fgetc(fp)) != EOF)) buf[i++] = (char)c;
+    while (i + 1 < n && ((c = getc(fp)) != EOF)) buf[i++] = (char)c;
     if (i < size) buf[i] = 0;
     if (c == EOF && i == 0) return NULL;
     return buf;
 }
-size_t __fread(void *p, size_t len, FILE *fp) {
-    ssize_t slen = read(fp->hd, p, len);
-    if (slen < 0) return 0;
-    return (size_t)slen;
+// try and read exactly len bytes in memory
+size_t __fread(void *pv, size_t len, FILE *fp) {
+    size_t nread = 0;
+    unsigned char *p = pv;
+    while (len) {
+        if (fp->pos < fp->len) {
+            size_t n = fp->len - fp->pos;
+            if (n > len) n = len;
+            memcpy(p, fp->buf + fp->pos, n);
+            p += n; nread += n; fp->pos += n;
+            if (!(len -= n)) break;
+        }
+        if (len <= fp->size) {
+            if (_filbuf(fp) < 0) break;
+        } else {
+            ssize_t rsz = read(fp->hd, p, len);
+            if (rsz <= 0) break;
+            p += rsz; nread += rsz;
+            if (!(len -= rsz)) break;
+        }
+    }
+    return nread;
 }
 size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
-    size_t len = size * nmemb;  // should check overflow
+    //XXX: overflow should be an error
+    //size_t len = ((size | nmemb) > 1 && nmemb > SIZE_MAX / size) ? SIZE_MAX : size * nmemb;
+    size_t len = size * nmemb;
     size_t rlen = __fread(p, len, fp);
     if (rlen == len) return nmemb; else return rlen / size;
 }
-
-int fputc(int c, FILE *fp) {
-    if (fp->dest) {
-        if (fp->pos < fp->cap) return (unsigned char)(fp->dest[fp->pos++] = (char)c);
-    } else {
-        unsigned char b = (unsigned char)c;
-        if (write(fp->hd, &b, 1) == 1) return b;
+int _allocbuf(FILE *fp) {
+    if (!(fp->buf = malloc(fp->size))) { fp->bmode == _IONBF; return -1; }
+    fp->alloc = true;
+    if (fp->bmode == _IOABF) fp->bmode = isatty(fp->hd) ? _IOLBF : _IOFBF;
+    fp->cap = (fp->bmode == _IOFBF) ? fp->size : 0;
+    return 0;
+}
+// writing
+int _flsbuf(int c, FILE *fp) {
+    if (fp->pos < fp->size && fp->buf) {       // line buffered case
+        fp->buf[fp->pos++] = (unsigned char)c;
+        if (c != '\n') return (unsigned char)c;
+        return fflush(fp) ? EOF : '\n';
     }
+    if (!(fp->flags & _IOWRITE)) return EOF; // XXX: should potentially reallocate memory buffer
+    if (fp->bmode != _IONBF) {
+        if (!fp->buf) {
+            if (_allocbuf(fp)) goto unbuf;
+        } else if (fflush(fp)) {
+            if (fp->pos >= fp->size) return EOF;
+        }
+        return fp->buf[fp->pos++] = (unsigned char)c;
+    }
+unbuf:
+    unsigned char b = (unsigned char)c;
+    if (write(fp->hd, &b, 1) == 1) return b;
     return EOF;
 }
-
+#define putc(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)c : _flsbuf(c, fp))
+int fputc(int c, FILE *fp) { return putc(c, fp); }
 // write bytes to a stream, return the number of bytes written or -1 on error
-ssize_t __fwrite(const void *p, size_t len, FILE *fp) {
-    if (fp->dest) {
-        if (len > fp->cap - fp->pos) len = fp->cap - fp->pos;
-        memcpy(fp->dest + fp->pos, p, len);
-        fp->pos += len;
-        return (ssize_t)len;
-    } else {
-        return write(fp->hd, p, len);
+ssize_t __fwrite(const void *pv, size_t len, FILE *fp) {
+    size_t nw = 0;
+    unsigned char *p = pv;
+    if (fp->pos < fp->cap) {
+        size_t n = fp->cap - fp->pos;
+        if (n > len) n = len;
+        memcpy(fp->buf + fp->pos, p, n);
+        p += n; nw += n; fp->pos += n;
+        len -= n;
     }
+    if (fp->bmode != _IOFBF) { while (len-- && putc(*p++, fp)) nw++; return nw; }
+    while (len) {
+        if (fp->pos < fp->size && fp->buf) {
+            size_t n = fp->size - fp->pos;
+            if (n > len) n = len;
+            memcpy(fp->buf + fp->pos, p, n);
+            p += n; nw += n; fp->pos += n;
+            if (!(len -= n)) { if (fp->bmode == _IOLBF && p[-1] == '\n') fflush(fp); return nw; }
+        }
+        if (!(fp->flags & _IOWRITE)) return -1; // XXX: should potentially reallocate memory buffer
+        if (fp->bmode == _IONBF) break;
+        if (!fp->buf) {
+            if (_allocbuf(fp)) break;
+        } else {
+            if (fflush(fp)) return -1;
+            if (len >= fp->size) break;
+        }
+    }
+    while (len) {
+        ssize_t wsz = write(fp->hd, p, len);
+        if (wsz <= 0) break;
+        p += wsz; nw += wsz; len -= wsz;
+    }
+    return nw;
 }
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
     size_t len = size * nmemb;  // should check overflow
@@ -215,7 +383,7 @@ int fputs(const char *s, FILE *fp) {
 // return the number of bytes written or EOF on error
 int puts(const char *s) {
     int res = (int)__fwrite(s, strlen(s), stdout);
-    if (fputc('\n', stdout) < 0) return EOF;
+    if (putc('\n', stdout) < 0) return EOF;
     return res + 1;
 }
 
@@ -308,13 +476,13 @@ int fprintf(FILE *fp, const char *fmt, ...) {
     va_end(ap); return n;
 }
 
-int snprintf(char *dest, size_t size, const char *fmt, ...) {
-    FILE f; f.hd = -1; f.dest = dest; f.pos = 0; f.cap = size;
+int snprintf(char *buf, size_t size, const char *fmt, ...) {
+    FILE f; memset(&f, 0, sizeof(f)); f.buf = buf; f.cap = f.size = size;
     va_list ap; va_start(ap, fmt);
     int n = vfprintf(&f, fmt, ap);
     va_end(ap);
-    if ((size_t)n < size) dest[n] = '\0';
-    else if (size) dest[size - 1] = '\0';
+    if ((size_t)n < size) buf[n] = '\0';
+    else if (size) buf[size - 1] = '\0';
     return n;
 }
 

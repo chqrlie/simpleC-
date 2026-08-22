@@ -615,7 +615,7 @@ static void sharp_line(int pos, sbuf_t *sb) {
 
 static void preprocess(const char *path, sbuf_t *sb) {
     FILE *f = fopen(path, "r");
-    if (!f) { die("%s: cannot open %s\n", progname, path); }
+    if (!f) { die("cannot open %s: %s\n", path, strerror(errno)); }
     sbuf_t raw[1]; sbuf_init(raw, 64 * 1024);
     size_t n = sbuf_load_file(raw, f);
     if (verbose) printf("Read %s: %zu bytes\n", path, n);
@@ -1935,7 +1935,7 @@ static FILE *fout;
 static bool out_comments;
 static char next_comment[48];
 static int next_label;
-static void emit_indent(int indent) { while (indent > 0) { fputc('\t', fout); indent -= 4; } }
+static void emit_indent(int indent) { while (indent > 0) { putc('\t', fout); indent -= 4; } }
 static void emit(const char *fmt, ...) attr_printf(1,2);
 static void emit(const char *fmt, ...) {
     int indent = 28;
@@ -1949,7 +1949,7 @@ static void emit(const char *fmt, ...) {
         emit_indent(indent);
         fprintf(fout, "\t# %s", next_comment); *next_comment = '\0';
     }
-    fputc('\n', fout);
+    putc('\n', fout);
 }
 static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); next_label = lab; }
 static void emit_comment(const char *comment) {
@@ -1971,7 +1971,7 @@ static void emit_section(const char *name, int align) {
 static void emit_entry(atom_t name, bool globl, bool skip) {
     if (!name) return;
     emit_label(-1); // flush label and comments
-    if (skip) fputc('\n', fout);
+    if (skip) putc('\n', fout);
     if (globl) emit(".globl %s", atom_str(name));
     fprintf(fout, "%s:\n", atom_str(name));
 }
@@ -2880,7 +2880,7 @@ static int output_token(FILE *fp, Token *t) {
     case T_CHAR:  c = (char)t->ival; gen_quoted_string(buf, sizeof(buf), &c, 1, '\''); break;
     default:      s = atom_str((atom_t)t->kind); break;
     }
-    size_t len = strlen(s); fwrite(s, 1, len, fp); return (int)len;
+    fputs(s, fp); return (int)strlen(s);
 }
 
 static int output_tokens(FILE *fp, Token *t, size_t n) {
@@ -2891,12 +2891,12 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
         int pos = t->pos;
         if (pos) {
             if ((last_pos >> 24 != pos >> 24) || pos < last_pos || pos - last_pos > 5) {
-                if (last_pos) fputc('\n', fp);
+                if (last_pos) putc('\n', fp);
                 fprintf(fp, "#line %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
                 last_pos = pos;
                 bol = true;
             } else {
-                while (last_pos < pos) { fputc('\n', fp); last_pos++; bol = true; }
+                while (last_pos < pos) { putc('\n', fp); last_pos++; bol = true; }
             }
         }
         int kind = t->kind;
@@ -2917,12 +2917,12 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
                 col = indent;
             }
             int i = 0;
-            while (i++ < col) fputc(' ', fp);
+            while (i++ < col) putc(' ', fp);
             col = i;
         } else {
             bool use_space = separate_tokens(t);
             if (kind == T_COLON && has_label) has_label = use_space = false;
-            if (use_space) { fputc(' ', fp); col++; }
+            if (use_space) { putc(' ', fp); col++; }
         }
         if (kind == K_CASE || kind == K_DEFAULT) has_label = true;
         if (kind == T_LBRACE) indent += 4;

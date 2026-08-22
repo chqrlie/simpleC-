@@ -38,7 +38,7 @@ all: $(BIN)
 $(BIN): $(SRC) $(INC)
 	$(CC) $(CFLAGS) -o $@ '$(SRC)'
 
-debug:
+debug: $(BIN)
 	$(CC) $(CFLAGS) -o $@_g '$(SRC)' -g
 	$(CC) $(CFLAGS) -o nano_gcc_O2.s -S -O2 '$(SRC)'
 	$(CC) $(CFLAGS) -o nano_gcc_O0.s -S -O0 '$(SRC)'
