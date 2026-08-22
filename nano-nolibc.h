@@ -160,7 +160,10 @@ int gettimeofday(struct timeval *tv, struct timezone *tz) {
     return __syscall(SYS_gettimeofday, tv, tz);
 }
 
-// stdio.h (no buffering)
+// stdio.h
+void *malloc(size_t size);
+void free(void *p);
+
 #define _IOFBF   0
 #define _IOLBF   1
 #define _IONBF   2
@@ -387,35 +390,13 @@ int puts(const char *s) {
     return res + 1;
 }
 
-size_t ltoa(char *dest, long n) {
-    char buf[24]; char *p = &buf[sizeof(buf)];
-    *--p = 0;
-    if (n == 0) {
-        *--p = '0';
-    } else if (n < 0) {
-        while (n) { *--p = '0' - n % 10; n = n / 10; }
-        *--p = '-';
-    } else {
-        while (n) { *--p = '0' + n % 10; n = n / 10; }
+size_t _cvlong(char *p, unsigned long n, int bits) {
+    if (!bits) while (n) { *--p = '0' + n % 10; n = n / 10; }
+    else {
+        unsigned long mask = (1 << bits) - 1;
+        while (n) { *--p = "0123456789abcdef"[n & mask]; n >>= bits; }
     }
-    size_t size = &buf[sizeof(buf)] - p;
-    memcpy(dest, p, size);
-    return size - 1;
-}
-
-size_t ultoa(char *dest, unsigned long n, int base) {
-    char buf[72]; char *p = &buf[sizeof(buf)];
-    const char *digits = "0123456789abcdefghijklmnopqrstuvwxyz";    // share digit string
-    *--p = 0;
-    if (n == 0) *--p = '0';
-    if (base >= 2 && base <= 36) {
-        while (n > 0) { *--p = digits[n % base]; n = n / base; }
-    } else {
-        errno = ERANGE;
-    }
-    size_t size = &buf[sizeof(buf)] - p;
-    memcpy(dest, p, size);
-    return size - 1;
+    return p;
 }
 
 // --- vfprintf: supports bcdosux formats and lzt modifiers ---
@@ -429,22 +410,27 @@ int vfprintf(FILE *fp, const char *fmt, va_list ap) {
         q = fmt;
         if (!*fmt) return (int)total;
         char buf[72], *s = buf;
-        long n;
-        int base = 10, mod = 0;
+        unsigned long n, mask = 0xffffffff;
+        int bits = 0;
+        char pad = ' ', sign = 0;
+        bool left = false, zeroes = false, val64 = false;
+        int width = 1, prec = -1;
         fmt++;  // past '%'
     again:
+        unsigned long sbit = (mask >> 1) + 1;
         switch (*fmt++) {
+        case 'x': bits += 1; // 4
+        case 'o': bits += 2; // 3
+        case 'b': bits += 1; // 1
+        case 'u': sbit = 0;
         case 'd':
-            n = mod ? va_arg(ap, long) : (long)va_arg(ap, int);
-            len = ltoa(buf, n);
-            goto out_str;
-        case 'u':            goto out_num;
-        case 'x': base = 16; goto out_num;
-        case 'o': base = 8;  goto out_num;
-        case 'b': base = 2;
-        out_num:
-            n = mod ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
-            len = ultoa(buf, n, base);
+            n = val64 ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
+            if (n & sbit) { sign = '-'; n = -n; }
+            width -= !!sign;
+            s = buf + sizeof(buf);
+            if (!(n &= mask)) { if (prec) *--s = '0'; }
+            else s = _cvlong(s, n, bits);
+            len = buf + sizeof(buf) - s;
             goto out_str;
         case 'c':
             *buf = (char)va_arg(ap, int); len = 1;
@@ -453,13 +439,28 @@ int vfprintf(FILE *fp, const char *fmt, va_list ap) {
             s = va_arg(ap, char *);
             if (!s) s = "(null)";
             len = strlen(s);
+            if (len > prec) len = prec;
         out_str:
+            while (left && width > len) { putc(' ', fp); width--; }
+            if (sign) putc(sign, fp);
+            if (zeroes) while (width > len) { putc('0', fp); width--; }
             __fwrite(s, len, fp); total += len;
+            while (width > len) { putc(' ', fp); width--; }
             q = fmt;
             continue;
-        case 'l': case 'z': case 't': mod++; goto again;
         case '%':  q = fmt - 1; continue;
         case '\0': fmt--;       continue;
+        case 'l': case 'z': case 't': val64 = true; mask = -1UL; goto again;
+        case 'h': mask = 0xffff; if (*fmt == 'h') { mask = 0xff; fmt++; } goto again;
+        case '0': left = zeroes = true; goto again;
+        case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
+            width = fmt[-1] - '0'; while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0'); goto again;
+        case '*': width = va_arg(ap, int); if (width < 0) { left = true; width = -width; } goto again;
+        case '.': if (*fmt == '*') { fmt++; prec = va_arg(ap, int); goto again; }
+                  prec = 0; while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); goto again;
+        case '-': left = true;  goto again;
+        case ' ': sign = ' ';   goto again;
+        case '+': sign = '+';   goto again;
         }
     }
 }
@@ -540,7 +541,11 @@ void perror(const char *s) {
 // examples ancillary functions
 void _puts(const char *s) { fputs(s, stdout); }
 void _print_int(long n) {
-    char buf[24]; __fwrite(buf, ltoa(buf, n), stdout);
+    char buf[24];
+    if (n < 0) { fputc('-', stdout); n = -n; }
+    size_t len = _cvlong(buf + sizeof(buf), (unsigned long)n, 0);
+    fwrite(buf, buf, len, stdout);
 }
 
-#endif // NANO_NOLIBC_H
+#include "nano-malloc.h"
+#endif

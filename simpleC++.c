@@ -18,7 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+static void malloc_stats(void) {
+    struct mstats s = mstats();
+    fprintf(stderr, "system bytes = %lu\n"
+            "in use bytes = %lu (%lu chunks)\n", s.bytes_total, s.bytes_used, s.chunks_used);
+}
+#else
 #include <malloc.h>
+#endif
 
 #if (defined(__GNUC__) || defined(__TINYC__))
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
@@ -579,7 +588,6 @@ static void process_text(const char *text, sbuf_t *sb) {
                     //if (p[k] != '>') die("invalid include file name");
                     if (!has_library) {
                         preprocess("nano-nolibc.h", sb);
-                        preprocess("nano-malloc.h", sb);
                         has_library = true;
                     }
                 }
@@ -3068,7 +3076,7 @@ int main(int argc, char **argv) {
     fclose(fout);
     if (verbose) printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     t0 = now() - t0;
-    if (timings) printf("total time: %ld ms\n", (t0 + 500) / 1000);
+    if (timings) printf("total time: %ld.%03ld ms\n", t0 / 1000, t0 % 1000);
     if (mem_stats) malloc_stats();
     return 0;
 }
