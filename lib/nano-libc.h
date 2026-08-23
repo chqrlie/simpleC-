@@ -1,6 +1,6 @@
-// nano-nolibc.h — works with nano_cc's simple __asm__ passthrough
-#ifndef NANO_NOLIBC_H
-#define NANO_NOLIBC_H
+// nano-libc.h — C library functions used by the compiler
+#ifndef NANO_LIBC_H
+#define NANO_LIBC_H
 
 // stdbool.h (should make these keywords)
 #ifndef true
@@ -18,12 +18,20 @@ typedef long ssize_t;
 
 // stdarg.h on top of nano_cc's variadic built-ins ---
 #ifndef va_start
-#define va_list          long
-#define va_start(ap, l)  __builtin_va_start(ap)
+typedef long va_list;
+#define va_start(ap, l)  __builtin_va_start(ap, l)
 #define va_arg(ap, t)    ((t)__builtin_va_arg(ap))
 #define va_copy(a1, a2)  ((a1) = (a2))
 #define va_end(ap)       __builtin_va_end(ap)
 #endif
+
+// limits.h
+#define INT_MAX 2147483647
+#define INT_MIN (-INT_MAX-1)
+#define UINT_MAX 0xffffffffU
+#define LONG_MAX 9223372036854775807
+#define LONG_MIN (-LONG_MAX-1)
+#define LOMG_MAX 0xffffffffffffffffUL
 
 // ctype.h
 // should use a byte table
@@ -47,6 +55,34 @@ enum {  // Linux error codes
     ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, EDOM, ERANGE,
 };
 
+// stdlib.h
+static int _xdigit(int d) {
+    if (d >= '0' && d <= '9') return d - '0';
+    if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
+    return 255;
+}
+long strtol(const char *s, char **endp, int base) {
+    int sign = 1, d;
+    long n = 0;
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') { s++; }
+    if (!base) {
+        base = 10;
+        if (*s == '0') {
+            base = 8;
+            switch (s[1] | 0x20) {
+            case 'b': base -= 14;
+            case 'x': base += 8;
+            case 'o': s += 2; break;
+            }
+        }
+    }
+    while ((d = _xdigit((unsigned char)*s)) < base) { s++; n = n * base + sign * d; }
+    if (endp) *endp = (char*)s;
+    return n;
+}
+
 // string.h
 void *memcpy(void *d, const void *s, size_t n) {
     unsigned char *a = d; const unsigned char *b = s;
@@ -60,7 +96,8 @@ int memcmp(const void *p1, const void *p2, size_t n) {
     for (; n--; a++, b++) { if (*a == *b) continue; return *a - *b; }
     return 0;
 }
-size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+size_t strlen(const char *s) { size_t i = 0; while (s[i]) i++; return i; }
+size_t strnlen(const char *s, size_t n) { size_t i = 0; while (i < n && s[i]) i++; return i; }
 char *strchr(const char *s, int c) { while (*s != (char)c) if (!*s++) return NULL; return (char*)s; }
 char *strcpy(char *d, const char *s) { for (size_t i = 0; d[i] = s[i]; i++); return d; }
 int strcmp(const char *a, const char *b) {
@@ -81,6 +118,7 @@ enum {
     SYS_exit  = 60,
     SYS_creat = 85,
     SYS_gettimeofday = 96,
+    SYS_clock_gettime = 228,
 };
 
 #define O_RDONLY 0
@@ -152,6 +190,24 @@ typedef int suseconds_t;
 typedef long time_t;
 typedef long suseconds_t;
 #endif
+typedef long clock_t;
+typedef int clockid_t;
+struct timespec { time_t tv_sec; long tv_nsec; };
+
+#define CLOCK_REALTIME           0
+#define CLOCK_MONOTONIC          1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID  3
+int clock_gettime(clockid_t clock_id, struct timespec *tp) {
+    return __syscall(SYS_clock_gettime, clock_id, tp);
+}
+#define CLOCKS_PER_SEC 1000000L
+clock_t clock(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)) return -1;
+    //if (ts.tv_sec > LONG_MAX / 1000000 || ts.tv_nsec / 1000 > LONG_MAX - 1000000 * ts.tv_sec) return -1;
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 
 struct timeval { time_t tv_sec; suseconds_t tv_usec; };
 struct timezone { int tz_minuteswest; int tz_dsttime; };
@@ -184,40 +240,11 @@ FILE _iob[NFILE] = {
     { 1, _IOABF, _IOWRITE, false, BUFSIZ },
     { 2, _IONBF, _IOWRITE, false, 0 },
 };
-#define stdin  &_iob[0]
-#define stdout &_iob[1]
-#define stderr &_iob[2]
+#define stdin  (&_iob[0])
+#define stdout (&_iob[1])
+#define stderr (&_iob[2])
 #define EOF   (-1)
 
-int fflush(FILE *fp) {
-    size_t len = fp->pos;
-    unsigned char *p = fp->buf;
-    if ((fp->flags & _IOWRITE) && p && len) {
-        fp->pos = 0;
-        while (len) {
-            ssize_t wsz = write(fp->hd, p, len);
-            if (wsz < 0) {
-                if (p > fp->buf) memcpy(fp->buf, p, len);
-                fp->pos = len;
-                return -1;
-            }
-            p += wsz; len -= wsz;
-        }
-    }
-    return 0;
-}
-int fflushall(void) {
-    int res = 0; for (size_t i = 0; i < NFILE; i++) res |= fflush(&_iob[i]);
-    return res;
-}
-int fclose(FILE *fp) {
-    fflush(fp);
-    if (fp->alloc) { free(fp->buf); fp->alloc = false; }
-    if (!(fp->flags & (_IOREAD|_IOWRITE))) return 0;
-    int hd = fp->hd;
-    memset(fp, 0, sizeof(*fp));
-    return close(hd);
-}
 FILE *fopen(const char *filename, char *mode) {
     for (size_t i = 0; i < NFILE; i++) {
         FILE *fp = &_iob[i];
@@ -265,7 +292,8 @@ int _filbuf(FILE *fp) {
     if (read(fp->hd, &b, 1) == 1) return b & 255;
     return EOF;
 }
-#define getc(fp)  ((fp->pos < fp->len) ? fp->buf[fp->pos++] : _filbuf(fp))
+#define getc(fp)  (((fp)->pos < (fp)->len) ? (fp)->buf[(fp)->pos++] : _filbuf(fp))
+#define getchar(c)  getc(stdin)
 int fgetc(FILE *fp) { return getc(fp); }
 char *fgets(char *buf, size_t n, FILE *fp) {
     size_t i = 0;
@@ -305,72 +333,38 @@ size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
     size_t rlen = __fread(p, len, fp);
     if (rlen == len) return nmemb; else return rlen / size;
 }
-int _allocbuf(FILE *fp) {
-    if (!(fp->buf = malloc(fp->size))) { fp->bmode == _IONBF; return -1; }
-    fp->alloc = true;
-    if (fp->bmode == _IOABF) fp->bmode = isatty(fp->hd) ? _IOLBF : _IOFBF;
-    fp->cap = (fp->bmode == _IOFBF) ? fp->size : 0;
-    return 0;
-}
-// writing
-int _flsbuf(int c, FILE *fp) {
-    if (fp->pos < fp->size && fp->buf) {       // line buffered case
-        fp->buf[fp->pos++] = (unsigned char)c;
-        if (c != '\n') return (unsigned char)c;
-        return fflush(fp) ? EOF : '\n';
-    }
-    if (!(fp->flags & _IOWRITE)) return EOF; // XXX: should potentially reallocate memory buffer
-    if (fp->bmode != _IONBF) {
-        if (!fp->buf) {
-            if (_allocbuf(fp)) goto unbuf;
-        } else if (fflush(fp)) {
-            if (fp->pos >= fp->size) return EOF;
-        }
-        return fp->buf[fp->pos++] = (unsigned char)c;
-    }
-unbuf:
-    unsigned char b = (unsigned char)c;
-    if (write(fp->hd, &b, 1) == 1) return b;
-    return EOF;
-}
-#define putc(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)c : _flsbuf(c, fp))
+#define putc(c, fp)  (((fp)->pos < (fp)->cap) ? (fp)->buf[(fp)->pos++] = (unsigned char)(c) : _flsbuf(c, fp))
+#define putchar(c)  putc(c, stdout)
 int fputc(int c, FILE *fp) { return putc(c, fp); }
-// write bytes to a stream, return the number of bytes written or -1 on error
-ssize_t __fwrite(const void *pv, size_t len, FILE *fp) {
-    size_t nw = 0;
-    unsigned char *p = pv;
-    if (fp->pos < fp->cap) {
-        size_t n = fp->cap - fp->pos;
-        if (n > len) n = len;
-        memcpy(fp->buf + fp->pos, p, n);
-        p += n; nw += n; fp->pos += n;
-        len -= n;
-    }
-    if (fp->bmode != _IOFBF) { while (len-- && putc(*p++, fp)) nw++; return nw; }
-    while (len) {
-        if (fp->pos < fp->size && fp->buf) {
-            size_t n = fp->size - fp->pos;
-            if (n > len) n = len;
-            memcpy(fp->buf + fp->pos, p, n);
-            p += n; nw += n; fp->pos += n;
-            if (!(len -= n)) { if (fp->bmode == _IOLBF && p[-1] == '\n') fflush(fp); return nw; }
-        }
-        if (!(fp->flags & _IOWRITE)) return -1; // XXX: should potentially reallocate memory buffer
-        if (fp->bmode == _IONBF) break;
-        if (!fp->buf) {
-            if (_allocbuf(fp)) break;
-        } else {
-            if (fflush(fp)) return -1;
-            if (len >= fp->size) break;
-        }
-    }
-    while (len) {
-        ssize_t wsz = write(fp->hd, p, len);
-        if (wsz <= 0) break;
-        p += wsz; nw += wsz; len -= wsz;
-    }
-    return nw;
+
+#include "lib/nano-printf.h"
+
+int printf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int n = vfprintf(stdout, fmt, ap);
+    va_end(ap); return n;
 }
+
+int fprintf(FILE *fp, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int n = vfprintf(fp, fmt, ap);
+    va_end(ap); return n;
+}
+
+int fflushall(void) {
+    int res = 0; for (size_t i = 0; i < NFILE; i++) res |= fflush(&_iob[i]);
+    return res;
+}
+
+int fclose(FILE *fp) {
+    fflush(fp);
+    if (fp->alloc) { free(fp->buf); fp->alloc = false; }
+    if (!(fp->flags & (_IOREAD|_IOWRITE))) return 0;
+    int hd = fp->hd;
+    memset(fp, 0, sizeof(*fp));
+    return close(hd);
+}
+
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
     size_t len = size * nmemb;  // should check overflow
     ssize_t wlen = __fwrite(p, len, fp);
@@ -388,103 +382,6 @@ int puts(const char *s) {
     int res = (int)__fwrite(s, strlen(s), stdout);
     if (putc('\n', stdout) < 0) return EOF;
     return res + 1;
-}
-
-size_t _cvlong(char *p, unsigned long n, int bits) {
-    if (!bits) while (n) { *--p = '0' + n % 10; n = n / 10; }
-    else {
-        unsigned long mask = (1 << bits) - 1;
-        while (n) { *--p = "0123456789abcdef"[n & mask]; n >>= bits; }
-    }
-    return p;
-}
-
-// --- vfprintf: supports bcdosux formats and lzt modifiers ---
-int vfprintf(FILE *fp, const char *fmt, va_list ap) {
-    size_t total = 0;
-    const char *q = fmt;
-    for (;;) {
-        if (*fmt && *fmt != '%') { fmt++; continue; }
-        size_t len = fmt - q;
-        __fwrite(q, len, fp); total += len;
-        q = fmt;
-        if (!*fmt) return (int)total;
-        char buf[72], *s = buf;
-        unsigned long n, mask = 0xffffffff;
-        int bits = 0;
-        char pad = ' ', sign = 0;
-        bool left = false, zeroes = false, val64 = false;
-        int width = 1, prec = -1;
-        fmt++;  // past '%'
-    again:
-        unsigned long sbit = (mask >> 1) + 1;
-        switch (*fmt++) {
-        case 'x': bits += 1; // 4
-        case 'o': bits += 2; // 3
-        case 'b': bits += 1; // 1
-        case 'u': sbit = 0;
-        case 'd':
-            n = val64 ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
-            if (n & sbit) { sign = '-'; n = -n; }
-            width -= !!sign;
-            s = buf + sizeof(buf);
-            if (!(n &= mask)) { if (prec) *--s = '0'; }
-            else s = _cvlong(s, n, bits);
-            len = buf + sizeof(buf) - s;
-            goto out_str;
-        case 'c':
-            *buf = (char)va_arg(ap, int); len = 1;
-            goto out_str;
-        case 's':
-            s = va_arg(ap, char *);
-            if (!s) s = "(null)";
-            len = strlen(s);
-            if (len > prec) len = prec;
-        out_str:
-            while (left && width > len) { putc(' ', fp); width--; }
-            if (sign) putc(sign, fp);
-            if (zeroes) while (width > len) { putc('0', fp); width--; }
-            __fwrite(s, len, fp); total += len;
-            while (width > len) { putc(' ', fp); width--; }
-            q = fmt;
-            continue;
-        case '%':  q = fmt - 1; continue;
-        case '\0': fmt--;       continue;
-        case 'l': case 'z': case 't': val64 = true; mask = -1UL; goto again;
-        case 'h': mask = 0xffff; if (*fmt == 'h') { mask = 0xff; fmt++; } goto again;
-        case '0': left = zeroes = true; goto again;
-        case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
-            width = fmt[-1] - '0'; while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0'); goto again;
-        case '*': width = va_arg(ap, int); if (width < 0) { left = true; width = -width; } goto again;
-        case '.': if (*fmt == '*') { fmt++; prec = va_arg(ap, int); goto again; }
-                  prec = 0; while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); goto again;
-        case '-': left = true;  goto again;
-        case ' ': sign = ' ';   goto again;
-        case '+': sign = '+';   goto again;
-        }
-    }
-}
-
-int printf(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    int n = vfprintf(stdout, fmt, ap);
-    va_end(ap); return n;
-}
-
-int fprintf(FILE *fp, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    int n = vfprintf(fp, fmt, ap);
-    va_end(ap); return n;
-}
-
-int snprintf(char *buf, size_t size, const char *fmt, ...) {
-    FILE f; memset(&f, 0, sizeof(f)); f.buf = buf; f.cap = f.size = size;
-    va_list ap; va_start(ap, fmt);
-    int n = vfprintf(&f, fmt, ap);
-    va_end(ap);
-    if ((size_t)n < size) buf[n] = '\0';
-    else if (size) buf[size - 1] = '\0';
-    return n;
 }
 
 // sys_err.c
@@ -538,14 +435,5 @@ void perror(const char *s) {
     fprintf(stderr, "%s\n", strerror(errnum));
 }
 
-// examples ancillary functions
-void _puts(const char *s) { fputs(s, stdout); }
-void _print_int(long n) {
-    char buf[24];
-    if (n < 0) { fputc('-', stdout); n = -n; }
-    size_t len = _cvlong(buf + sizeof(buf), (unsigned long)n, 0);
-    fwrite(buf, buf, len, stdout);
-}
-
-#include "nano-malloc.h"
+#include "lib/nano-malloc.h"
 #endif

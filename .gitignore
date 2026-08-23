@@ -4,3 +4,6 @@
 nano
 nano_cc
 STATS.csv
+kernel/*.o
+kernel/*.elf
+kernel/*.bin

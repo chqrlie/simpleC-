@@ -70,10 +70,10 @@ static size_t skip_blanks(const char *s) {
     while (s[i] == ' ' || s[i] == '\t') i++;
     return i;
 }
-static size_t trim_len(const char *s) {
-    size_t i = strlen(s);
-    while (i && (s[i - 1] == ' ' || s[i - 1] == '\t')) i--;
-    return i;
+static size_t trailing_blanks(const char *s, size_t len) {
+    const char *p = s + len;
+    while (p > s && (p[-1] == ' ' || p[-1] == '\t')) p--;
+    return s + len - p;
 }
 static size_t skip_word(const char *s) {
     size_t i = 0;
@@ -250,7 +250,7 @@ enum {
     K_SWITCH, K_CASE, K_DEFAULT, K_GOTO,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
-    K_INCLUDE, K_LINE,
+    K_INCLUDE, K_LINE, ID__FILE__, ID__LINE__, ID__COUNTER__,
 
 #define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) < ID_START)
     ID__BUILTIN_VA_START, ID__BUILTIN_VA_ARG, ID__BUILTIN_VA_END,
@@ -276,7 +276,7 @@ static const char *token_name[T_count] = {
     "for", "do", "break", "continue", "sizeof",
     "switch", "case", "default", "goto",
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
-    "include", "line",
+    "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
     "__builtin_va_start", "__builtin_va_arg", "__builtin_va_end",
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
     "__builtin_clz", "__builtin_ctz",
@@ -285,11 +285,16 @@ static const char *token_name[T_count] = {
     "_start", "main", "printf", "puts", "strlen", "strcpy", "memcpy",
 };
 
+int counter;    // value of the last expansion of __COUNTER__
+
 static void lex_init(void) {
     for (atom_t i = 0; i < T_count; i++) {
         if (new_atom(token_name[i]) != i)
             die("atom definition failure for '%s'", token_name[i]);
     }
+    atom_flags(ID__FILE__) |= ATOM_MACRO;
+    atom_flags(ID__LINE__) |= ATOM_MACRO;
+    atom_flags(ID__COUNTER__) |= ATOM_MACRO;
 }
 
 // =====================================================================
@@ -305,10 +310,8 @@ typedef struct Macro {
 static Macro *macros;
 
 static Macro *macro_find(atom_t name) {
-    if (atom_flags(name) & ATOM_MACRO) {
-        for (Macro *m = macros; m; m = m->next) {
-            if (m->name == name) return m;
-        }
+    for (Macro *m = macros; m; m = m->next) {
+        if (m->name == name) return m;
     }
     return NULL;
 }
@@ -343,34 +346,29 @@ typedef struct MacroArguments {
     int argc;
 } MacroArguments;
 
-static int find_macro_param(const Macro *m, atom_t name) {
-    for (int i = 0; i < m->nparams; i++) if (m->params[i] == name) return i;
-    return -1;
+static bool find_macro_param(const Macro *m, atom_t name, int *pi) {
+    for (int i = 0; i < m->nparams; i++) if (m->params[i] == name) { *pi = i; return true; }
+    return false;
 }
 
-// Substitute a function-like macro body: copy m->def into out[], replacing
+// Substitute a function-like macro body: copy def into out[] replacing
 // each parameter name with the matching call argument text. ma->argv[k] holds the
 // (already whitespace-trimmed) text of the k-th argument of length ma->len[k].
-static size_t subst_macro_body(const Macro *m, MacroArguments *ma, char *out, size_t j, size_t cap) {
-    const char *p = m->def;
+static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, char *out, size_t size) {
     const char *q = p;
-    char vc;
-    while ((vc = *p) != 0) {
-        if (isalpha((unsigned char)vc) || vc == '_') {
-            size_t k = skip_word(p);
-            int pi = find_macro_param(m, new_atom_len(p, k));
-            if (pi >= 0) {
-                j += pmemcpy(out + j, cap - j, q, (size_t)(p - q));
-                j += pmemcpy(out + j, cap - j, ma->argv[pi], ma->len[pi]);
-                q = p += k;
-                continue;
-            }
-        }
-        p++;
+    size_t j = 0, k = 0;
+    int pi = -1;
+    for (char vc;;) {
+        if      ((vc = *p) == '\0') k = 0;
+        else if (isalpha((unsigned char)vc) || vc == '_') {
+            k = skip_word(p);
+            if (!m || m->nparams <= 0 || !find_macro_param(m, new_atom_len(p, k), &pi)) { p += k; continue; }
+        } else { p++; continue; }
+        j += pmemcpy(out + j, size - j, q, (size_t)(p - q));
+        if (pi >= 0) { j += pmemcpy(out + j, size - j, ma->argv[pi], ma->len[pi]); pi = -1; }
+        q = p += k;
+        if (!vc) return j;
     }
-    j += pmemcpy(out + j, cap - j, q, (size_t)(p - q));
-    if (j == cap && cap) out[cap - 1] = '\0';
-    return j;
 }
 
 // Expand object-like and simple function-like macros in one logical line.
@@ -380,29 +378,37 @@ static void expand_line(const char *in, sbuf_t *sb) {
     for (int pass = 0;; pass++) {
         char out[8192]; size_t j = 0; bool changed = false;
         const char *q = p;
+        char buf[256]; int len;
         char c;
         while ((c = *p) != '\0') {
             if (c == '"' || c == '\'') { p += skip_string(p, NULL); continue; }
             if (isalpha((unsigned char)c) || c == '_') {
                 size_t k = skip_word(p);
-                Macro *m = macro_find(new_atom_len(p, k));
+                atom_t name = new_atom_len(p, k);
+                if (!(atom_flags(name) & ATOM_MACRO)) { p += k; continue; }
                 size_t b = skip_blanks(p + k);
-                if (!m || (m->nparams >= 0 && p[k+b] != '(')) { p += k+b; continue; }
+                Macro *m = macro_find(name);
+                const char *def = m ? m->def : "";
+                if (!m || (m->nparams >= 0 && p[k+b] != '(')) {
+                    switch (name) {
+                    case ID__FILE__: *buf = '"'; len = 1;
+                                     len += pstrcpy(buf + 1, sizeof(buf) - 3, src_name[src_pos >> 24]);
+                                     buf[len++] = '"'; buf[len] = '\0'; break;
+                    case ID__LINE__: len = snprintf(buf, sizeof(buf), "%d", src_pos & 0xffffff); break;
+                    case ID__COUNTER__: len = snprintf(buf, sizeof(buf), "%d", counter++); break;
+                    default: p += k; continue;
+                    }
+                    def = buf;
+                }
                 j += pmemcpy(out + j, sizeof(out) - j, q, (size_t)(p - q));
                 q = p += k;
                 MacroArguments ma; ma.argc = 0;
-                if (m->nparams >= 0) {
+                if (m && m->nparams >= 0) {
                     // XXX: This does not work if macro arguments span multiple lines
-                    int depth = 1;
                     p += b + 1;   // past blanks and '('
                     const char *e = q = p += skip_blanks(p);
-                    if (*p == ')' && m->nparams == 0) {
-                        q = ++p;
-                        j += pmemcpy(out + j, sizeof(out) - j, m->def, m->len);
-                        changed = true;
-                        continue;
-                    }
-                    for (;;) {
+                    if (*p == ')') q = ++p;
+                    else for (int depth = 1;;) {
                         char cc = *p;
                         if (cc == '\0') die("macro '%s' argument list spans multiple lines", atom_str(m->name));
                         if ((cc == ')' && --depth == 0) || (cc == ',' && depth == 1)) { // end of argument
@@ -411,10 +417,7 @@ static void expand_line(const char *in, sbuf_t *sb) {
                             ma.len[ma.argc] = (size_t)(e - q);
                             ma.argc++;
                             q = ++p;   // past ')' or ','
-                            if (cc == ')') {
-                                if (ma.argc != m->nparams) die("missing arguments for macro '%s'", atom_str(m->name));
-                                break;
-                            }
+                            if (cc == ')') break;
                             e = q = p += skip_blanks(p);
                         } else {
                             if (cc == ' ' || cc == '\t') { p++; continue; }
@@ -423,8 +426,9 @@ static void expand_line(const char *in, sbuf_t *sb) {
                             e = p;
                         }
                     }
+                    if (ma.argc != m->nparams) die("missing arguments for macro '%s'", atom_str(m->name));
                 }
-                j = subst_macro_body(m, &ma, out, j, sizeof(out));
+                j += macro_expand(m, &ma, def, out + j, sizeof(out) - j);
                 changed = true;
             } else {
                 p++;
@@ -438,36 +442,54 @@ static void expand_line(const char *in, sbuf_t *sb) {
     }
 }
 
-// Strip // and /* */ comments (string/char aware) in place.
+// Strip // and /* */ comments, normalize spacing, handle escaped newlines
 static size_t strip_comments(char *s) {
-    char *dst = s, *out = dst;
-    const char *p = s, *q = p;
-    char c;
-    while ((c = *p) != '\0') {
-        if (c == '"' || c == '\'') {
-            p += skip_string(p, NULL);
-        } else {
-            p++;
-            if (c == '/' && (*p == '/' || *p == '*')) {
-                const char *e = p - 1;
-                while (q < e && isblank((unsigned char)e[-1])) e--;
-                while (q < e) *out++ = *q++;
-                if (*p == '/') {
-                    while (*p && *p != '\n') p++; q = p;
-                } else {
-                    while (*++p) {
-                        if (*p == '*' && p[1] == '/') { p += 2; break; }
-                        if (*p == '\n') *out++ = '\n';    // preserve line numbers
-                    }
-                    q = p += skip_blanks(p);
-                    if (*p != '\n' && out > dst && !isspace((unsigned char)out[-1])) *out++ = ' ';
-                }
-            }
-        }
+    char *q = s; const char *p = s; char c;
+    size_t need_lines = 0; bool bol = true;
+    // handle escaped newlines by shifting them to the end of line
+    while ((c = *q++ = *p++)) {
+        if (c == '\\' && *p == '\n') { q--; p++; need_lines++; }
+        if (c == '\n') while (need_lines) { *q++ = '\n'; need_lines--; }
     }
-    while (q < p) *out++ = *q++;
-    *out = '\0';
-    return out - dst;
+    // strip comments, extra blanks, preserve line numbers and indentation
+    p = q = s;
+    for (;;) {
+        switch (c = *q = *p++) {
+        case '\0': return q - s;
+        case '\n':
+            q -= trailing_blanks(s, q - s); need_lines++;
+            while (need_lines) { *q++ = '\n'; need_lines--; }
+            bol = true; continue;
+        case ' ': case '\t':
+            if (bol) q++; // keep indentation
+            else if (q[-1] != ' ') *q++ = ' '; // normalize spacing
+            continue;
+        case '\'': // char constant or bogus digit separator
+            if (isdigit((unsigned char)q[-1])) break;
+        case '"':;
+            size_t k = skip_string(--p, NULL);
+            while (k--) *q++ = *p++;
+            bol = false; continue;
+        case '/':
+            if (*p == '/') {
+                while (*p && *p != '\n') p++;
+                continue;
+            }
+            if (*p == '*') {
+                while (*++p) {
+                    if (*p == '*' && p[1] == '/') { p += 2; break; }
+                    if (*p == '\n') {    // preserve line numbers
+                        q -= trailing_blanks(s, q - s);
+                        *q++ = '\n'; bol = true;
+                    }
+                }
+                if (!bol && q[-1] != ' ') *q++ = ' ';
+                continue;
+            }
+            break;
+        }
+        q++; bol = false; continue;
+    }
 }
 
 static void preprocess(const char *path, sbuf_t *sb);
@@ -476,16 +498,15 @@ static void preprocess(const char *path, sbuf_t *sb);
 static void process_text(const char *text, sbuf_t *sb) {
     int cond_sp = 0; long skip = 0, seen_else = 0;
 
-    const char *cursor = text;
-    while (*cursor) {
+    const char *src = text;
+    while (*src) {
         char line[8192]; size_t li = 0;
-        while (*cursor && *cursor != '\r' && *cursor != '\n') {
-            if (li >= sizeof(line)) die("line too long");
-            line[li++] = *cursor++;
+        char c;
+        while ((c = line[li] = *src)) {
+            src++; if (c == '\n') break;
+            if (li++ >= sizeof(line)) die("line too long");
         }
         line[li] = 0;
-        if (*cursor == '\r') cursor++;
-        if (*cursor == '\n') cursor++;
 
         const char *p = line; p += skip_blanks(p);
         if (*p == '#') {
@@ -503,7 +524,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                     size_t k = skip_word(p);
                     if (!k) die("expected macro name after '#%s'", atom_str(dir));
                     atom_t nm = new_atom_len(p, k); p += k;
-                    int defined = macro_find(nm) != NULL;
+                    int defined = (atom_flags(nm) & ATOM_MACRO) != 0;
                     skip |= (dir == K_IFDEF) ? !defined : defined;
                 }
                 break;
@@ -555,7 +576,8 @@ static void process_text(const char *text, sbuf_t *sb) {
                     p++;
                 }
                 const char *def = p += skip_blanks(p);
-                size_t len = trim_len(p); p += len;
+                p = line + li;
+                size_t len = p - def; len -= trailing_blanks(def, len); // trim trailing whitespace
                 Macro *m = macro_find(nm);
                 if (m) {  // if macro already exists, check if definition is identical
                     if (m->nparams == nparams && !memcmp(m->params, params, sizeof(params))
@@ -587,7 +609,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                     //size_t k = skip_until(++p, '>');
                     //if (p[k] != '>') die("invalid include file name");
                     if (!has_library) {
-                        preprocess("nano-nolibc.h", sb);
+                        preprocess("lib/nano-libc.h", sb);
                         has_library = true;
                     }
                 }
@@ -614,9 +636,11 @@ static int update_pos(int pos, const char *path, int lineno) {
     }
     return (fn << 24) + lineno;
 }
-static void sharp_line(int pos, sbuf_t *sb) {
+static void sharp_line(int pos, int state, sbuf_t *sb) {
     if (pos) {
-        char buf[300]; int len = snprintf(buf, sizeof(buf), "# %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
+        char buf[300]; int len = snprintf(buf, sizeof(buf), "# %d \"%s\"", pos & 0xffffff, src_name[pos >> 24]);
+        if (state) len += snprintf(buf + len, sizeof(buf) - len, " %d", state);
+        buf[len++] = '\n'; buf[len] = '\0';
         sbuf_put(sb, buf, len);
     }
 }
@@ -630,11 +654,11 @@ static void preprocess(const char *path, sbuf_t *sb) {
     fclose(f);
     int save_pos = src_pos;
     src_pos = update_pos(src_pos, path, 1);
-    sharp_line(src_pos, sb);
+    sharp_line(src_pos, 1, sb);
     raw->len = strip_comments(sbuf_getptr(raw));
     if (verbose) printf("Stripped: %td bytes\n", raw->len);
     process_text(sbuf_getptr(raw), sb);   // may recurse (with its own buffers)
-    sharp_line(src_pos = save_pos, sb);
+    sharp_line(src_pos = save_pos, 2, sb);
     sbuf_deinit(raw);
     if (verbose) printf("Preprocessed: %zu bytes\n", sb->len);
 }
@@ -724,7 +748,7 @@ static size_t lex(const char *p) {
     for (;;) {
         p += skip_blanks(p);
         unsigned char c = *p++;
-        if (c == '\n') { src_pos++; }
+        if (c == '\n') { src_pos++; continue; }
         if (isspace(c)) continue;
 
         if (c == 0) {
@@ -1404,8 +1428,7 @@ static Type *parse_type_base_only(int *pflags) {
         default:
             if (t) return t;
             if (k == T_ID) {
-                Type *type = find_typedef(toks[P].text);
-                if (type) { P++; return type; }
+                if ((t = find_typedef(toks[P].text))) break;
             }
             error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
         }
@@ -2900,9 +2923,8 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
         if (pos) {
             if ((last_pos >> 24 != pos >> 24) || pos < last_pos || pos - last_pos > 5) {
                 if (last_pos) putc('\n', fp);
-                fprintf(fp, "#line %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
-                last_pos = pos;
-                bol = true;
+                fprintf(fp, "# %d \"%s\"\n", pos & 0xffffff, src_name[pos >> 24]);
+                last_pos = pos; bol = true;
             } else {
                 while (last_pos < pos) { putc('\n', fp); last_pos++; bol = true; }
             }

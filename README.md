@@ -1,37 +1,56 @@
 # simpleC++
 
-gcc -o nano_cc nano_cc.c          # build the compiler<br>
-./nano_cc kernel.c kernel.s       # compile your kernel<br>
-gcc -nostdlib -T linker.ld kernel.s -o kernel.elf   # link for bare metal<br>
+```
+make                    # build the compiler
+make -C kernel          # compile the kernel
+```
 
-i was hoping to compile this with chibicc ,8cc or lcc minimal kind of compiler <br>
+## The compiler supports a large subset of C.  Here is a list of limitations:
 
-## What the compiler supports
+- **Preprocessor:**
+  - no recursive macros
+  - no token pasting or stringization
+  - including from a relative path
+  - only 8 macro arguments supported
+  - no varargs macros
+  - macro invocations cannot span multiple unescaped lines
+- **Types:**
+  - no function pointers
+  - no anonymous sub structures
+  - no designated initializers
+  - no compound literals
+  - no bit-fields
+  - 2D arrays are defective
+  - no initializers for local structures
+  - no non trivial initializers (eg: `FILE *stdin = &_iob[0];`)
+  - `static`, `extern`, `const`, `volatile` are ignored
+  - no floating point types
+- **Expressions:**
+  - signed / unsigned promotions and arithmetics are broken
+  - noo check and convert function arguments according to prototype
+  - vararg ABI is proprietary
+  - only 6 function arguments
+  - no structure assignment, passing and returning
+- **Statements:**
+  - no `static_assert`
+  - no case ranges
+  - local scoping is partially broken
+  - `__asm__` syntax is direct pass-through, no argument processing
+  **Library**
+  - bare bone library is minimalistic in **lib/nano-nolibc.h**
+  - `printf` is complete except floating point conversions
+  - `malloc` uses a simplistic mark and release approach with a fixed arena
+  - standard C library is sufficient for the compiler to compile itself, but it is missing 90% of the standard functions (WIP)
+- **Codegen:**
+  - only x86_64 System V Intel syntax is supported
+  - need more backends: x86_64 binary backend, Arm64 mac backend (source and binary), Intel 32-bit backend (source and binary), Wasm backend, LLVM backend
+  - need a built-in assembler to generate binaries from .s files and inline assembly
 
-- **Preprocessor:** `#include "..."`, object-like `#define`, **function-like
-  `#define` macros** (e.g. `#define MAX(a,b) ((a)>(b)?(a):(b))` — argument
-  substitution with nested-paren handling), `#ifndef` / `#ifdef` / `#else` /
-  `#endif` include guards, `//` and `/* */` comments.
-- **Types:** `int`, `long`, `char`, `void`, pointers, arrays (of any element
-  type), `struct` and `union`, and the `const` / `unsigned` / `static` /
-  `inline` / `extern` qualifiers (parsed and ignored). Function prototypes /
-  `extern` declarations (`char getc();`) are accepted. *(Note: `int` and `long` are both
-  64-bit internally for now — a real 32-bit `int` is a planned next step.)*
-- **Expressions:** `+ - * / %`, `< > <= >= == !=`, `&& ||`, **bitwise
-  `& | ^ ~ << >>`** (full C precedence), unary `- ! ~ * &`, prefix and postfix
-  `++` / `--`, the ternary `?:` operator, `sizeof`, casts, function calls
-  (including functions that return pointers/strings), array indexing `a[i]`,
-  struct member access `.` and `->`, assignment and compound assignment
-  (`+= -= *= /= %=`), string/char literals with escapes.
-- **Variadic functions:** `type f(args, ...)` with `__builtin_va_start` /
-  `__builtin_va_arg` / `__builtin_va_end` (wrapped as `va_start`/`va_arg`/
-  `va_end`), enough to write a real `printf()` — see `printf.c`.
-- **Statements:** `if/else`, `while`, `for`, `do/while`, `break`, `continue`,
-  `return`, blocks, and `__asm__("...")` pass-through inline assembly.
-- **Codegen:** x86_64 System V, values in `rax`, up to 6 register arguments,
-  a freestanding `_start` that calls `main` and exits with its return value.
+# Authors:
+
+- Clay Shippy - original idea using AI
+- Charlie Gordon - extensive rewrite, the compiler compile itself
 
 ---
 =======
 https://github.com/R077A6r1an/stdlib/tree/main for stdlib <br>
-

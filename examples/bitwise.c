@@ -5,7 +5,7 @@
 //   ./nano_cc bitwise.c bitwise.s
 //   gcc -nostdlib -no-pie bitwise.s -o bitwise_prog
 //   ./bitwise_prog
-#include "nano-nolibc.h"
+#include "lib/nano-nolibc.h"
 
 // function-like macros (argument substitution + nested parens)
 #define MAX(a, b)     ((a) > (b) ? (a) : (b))
@@ -37,6 +37,5 @@ int main() {
     show("IS_ODD(7)        = ", IS_ODD(7));        // 1
     show("IS_ODD(8)        = ", IS_ODD(8));        // 0
 
-    exit(0);
     return 0;
 }

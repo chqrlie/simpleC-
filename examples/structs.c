@@ -5,7 +5,7 @@
 //   ./nano_cc structs.c structs.s
 //   gcc -nostdlib -no-pie structs.s -o structs_prog
 //   ./structs_prog
-#include "nano-nolibc.h"
+#include "lib/nano-nolibc.h"
 
 struct Point { int x; int y; };
 struct Rect  { struct Point tl; struct Point br; };   // nested struct
@@ -43,6 +43,5 @@ int main() {
     _puts("string return: ");
     _puts(label(1)); _puts(" / "); _puts(label(0)); _puts("\n");   // yes / no
 
-    exit(0);
     return 0;
 }

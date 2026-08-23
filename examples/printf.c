@@ -1,10 +1,11 @@
 // printf.c — demonstrates variadic functions: a real printf() written in
-// nano-nolibc.h and compiled by nano_cc.
+// nano-libc.h and compiled by nano_cc.
 //
 //   ./nano_cc printf.c printf.s
 //   gcc -nostdlib -no-pie printf.s -o printf_prog
 //   ./printf_prog
-#include "nano-nolibc.h"
+
+#include <stdio.h>
 
 int main() {
     printf("Hello, %s! You are %d years old.\n", "world", 28);

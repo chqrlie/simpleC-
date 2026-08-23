@@ -7,7 +7,8 @@
 // Shows: basic dispatch, the default arm, intentional fall-through (no break),
 // break, a switch nested inside another switch, and a switch inside a loop
 // (where break leaves the switch but continue belongs to the loop).
-#include "nano-nolibc.h"
+
+#include <stdio.h>
 
 // Classic dispatch: one arm per value, plus a default.
 char *day_name(int d) {
