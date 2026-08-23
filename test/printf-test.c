@@ -39,6 +39,7 @@ typedef struct FILE {
     unsigned char *buf;
 } FILE;
 #define fflush nano_fflush
+#undef snprintf
 #define snprintf nano_snprintf
 #define vfprintf nano_vfprintf
 #undef putc
@@ -59,7 +60,7 @@ typedef struct FILE {
 #define ALT_FUNC     subc_snprintf
 #endif
 
-#if defined(__CYGWIN__) || defined(__DARWIN__)
+#if defined(__CYGWIN__) || defined(__APPLE__)
 #define TEST_ALT_NUMBERS  0
 #else
 #define TEST_ALT_NUMBERS  1

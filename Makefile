@@ -89,13 +89,14 @@ test-printf: Makefile
 nano-printf: $(BIN) Makefile
 	$(BIN) $(FLAGS) test/printf-test.c -o printf-test_prog_g.s -g
 	$(AS) -nostdlib printf-test_prog_g.s -o printf-test_prog_g
-	./printf-test_prog_g
+	$(RUN) ./printf-test_prog_g
 
 examples: test demo structs bitwise printf switch hello
 test-all: examples test-printf nano-printf nano
 
 clean:
-	rm -f $(BIN) sample.s *_g *_g.s *_prog *_prog.s nano*.s
+	rm -f $(BIN) sample.s *_g *_g.s *_prog *_prog.s nano*.s a.out
+	rm -rf *.dSYM
 
 distclean: clean
 	rm -f $(BIN) $(BIN)_g
