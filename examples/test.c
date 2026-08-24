@@ -1,4 +1,4 @@
-#include "lib/nano-nolibc.h"
+#include <nano-nolibc.h>
 
 void msg(const char *s, int n) {
     _puts(s); _print_int(n); _putc('\n');

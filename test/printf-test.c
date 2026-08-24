@@ -23,33 +23,14 @@
 #define STD_FUNC_name  "snprintf"
 //#endif
 
-#if 1
-#include <stdbool.h>
-#include <unistd.h>
-#define LIBSYM(sym)  nano_##sym
-#define FILE nano_FILE
-#define _IOABF   3
-#define _IOREAD  1
-#define _IOWRITE 2
-typedef struct FILE {
-    int hd;
-    unsigned char bmode, flags;
-    bool alloc;
-    size_t size, pos, cap, len;
-    unsigned char *buf;
-} FILE;
-#define fflush nano_fflush
+#ifndef NANO_LIBC_H
 #undef snprintf
 #define snprintf nano_snprintf
 #define vfprintf nano_vfprintf
-#undef putc
-#define putc(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)(c) : _flsbuf(c, fp))
 #include "../lib/nano-printf.h"
-#undef FILE
-#undef fflush
 #undef snprintf
 #undef vfprintf
-#undef putc
+#define LIBSYM(sym)  nano_##sym
 #define ALT_FUNC  nano_snprintf
 #define ALT_FUNC_name  "nano_snprintf"
 #endif
@@ -58,6 +39,7 @@ typedef struct FILE {
 #define LIBSYM(sym)  subc_##sym
 #include "printf.h"
 #define ALT_FUNC     subc_snprintf
+#define ALT_FUNC_name  "subc_snprintf"
 #endif
 
 #if defined(__CYGWIN__) || defined(__APPLE__)

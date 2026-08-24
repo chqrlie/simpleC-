@@ -82,6 +82,7 @@ long strtol(const char *s, char **endp, int base) {
     if (endp) *endp = (char*)s;
     return n;
 }
+int atoi(const char *s) { return (int)strtol(s, 0, 0); }
 
 // string.h
 void *memcpy(void *d, const void *s, size_t n) {
@@ -99,6 +100,7 @@ int memcmp(const void *p1, const void *p2, size_t n) {
 size_t strlen(const char *s) { size_t i = 0; while (s[i]) i++; return i; }
 size_t strnlen(const char *s, size_t n) { size_t i = 0; while (i < n && s[i]) i++; return i; }
 char *strchr(const char *s, int c) { while (*s != (char)c) if (!*s++) return NULL; return (char*)s; }
+char *strrchr(const char *s, int c) { char *e = NULL; while (*s) if (*s == (char)c) e = (char*)s; return e; }
 char *strcpy(char *d, const char *s) { for (size_t i = 0; d[i] = s[i]; i++); return d; }
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
@@ -245,9 +247,12 @@ FILE _iob[NFILE] = {
 #define stderr (&_iob[2])
 #define EOF   (-1)
 
+//#define _check_fp(fp) if (!(fp) || (fp) < _iob || (fp) >= &_iob[NFILE]) { errno = EINVAL; return -1; }
+#define _check_fp(fp) if (!(fp)) { errno = EINVAL; return -1; }
+//#define _check_fp(fp)
+
 FILE *fopen(const char *filename, char *mode) {
-    for (size_t i = 0; i < NFILE; i++) {
-        FILE *fp = &_iob[i];
+    for (FILE *fp = _iob; fp < _iob + NFILE; fp++) {
         if (!fp->flags) {
             int hd, mode; unsigned char flags;
             if      (*mode == 'r') { flags = _IOREAD;  mode = O_RDONLY; }
@@ -317,6 +322,7 @@ size_t __fread(void *pv, size_t len, FILE *fp) {
         }
         if (len <= fp->size) {
             if (_filbuf(fp) < 0) break;
+            fp->pos = 0; // unget the first byte
         } else {
             ssize_t rsz = read(fp->hd, p, len);
             if (rsz <= 0) break;
@@ -337,7 +343,89 @@ size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
 #define putchar(c)  putc(c, stdout)
 int fputc(int c, FILE *fp) { return putc(c, fp); }
 
-#include "lib/nano-printf.h"
+int fflush(FILE *fp) {
+    _check_fp(fp);
+    size_t len = fp->pos;
+    unsigned char *p = fp->buf;
+    if ((fp->flags & _IOWRITE) && p && len) {
+        fp->pos = 0;
+        while (len) {
+            ssize_t wsz = write(fp->hd, p, len);
+            if (wsz <= 0) {
+                if (p > fp->buf) memcpy(fp->buf, p, len);
+                fp->pos = len;
+                return -1;
+            }
+            p += wsz; len -= wsz;
+        }
+    }
+    return 0;
+}
+
+int _allocbuf(FILE *fp) {
+    if (!(fp->buf = malloc(fp->size))) { fp->bmode = _IONBF; return -1; }
+    fp->alloc = true;
+    if (fp->bmode == _IOABF) fp->bmode = isatty(fp->hd) ? _IOLBF : _IOFBF;
+    fp->cap = (fp->bmode == _IOFBF) ? fp->size : 0;
+    return 0;
+}
+// writing
+int _flsbuf(int c, FILE *fp) {
+    if (fp->pos < fp->size && fp->buf) {       // line buffered case
+        fp->buf[fp->pos++] = (unsigned char)c;
+        if (c != '\n') return (unsigned char)c;
+        return fflush(fp) ? EOF : '\n';
+    }
+    if (!(fp->flags & _IOWRITE)) return EOF; // XXX: should potentially reallocate memory buffer
+    if (fp->bmode != _IONBF) {
+        if (!fp->buf) {
+            if (_allocbuf(fp)) goto unbuf;
+        } else if (fflush(fp)) {
+            if (fp->pos >= fp->size) return EOF;
+        }
+        return fp->buf[fp->pos++] = (unsigned char)c;
+    }
+unbuf:;
+    unsigned char b = (unsigned char)c;
+    if (write(fp->hd, &b, 1) == 1) return b;
+    return EOF;
+}
+
+// write bytes to a stream, return the number of bytes written or -1 on error
+ssize_t __fwrite(const void *pv, size_t len, FILE *fp) {
+    const unsigned char *p = pv;
+    size_t nw = fp->cap - fp->pos; if (nw > len) nw = len;
+    if (nw) {
+        memcpy(fp->buf + fp->pos, p, nw);
+        p += nw; fp->pos += nw;
+        len -= nw;
+    }
+    while (len) {
+        if (fp->pos < fp->size && fp->buf) {
+            size_t n = fp->size - fp->pos;
+            if (n > len) n = len;
+            memcpy(fp->buf + fp->pos, p, n);
+            p += n; nw += n; fp->pos += n;
+            if (!(len -= n)) { if (fp->bmode == _IOLBF && p[-1] == '\n') fflush(fp); return nw; }
+        }
+        if (!(fp->flags & _IOWRITE)) return -1; // XXX: should potentially reallocate memory buffer
+        if (fp->bmode == _IONBF) break;
+        if (!fp->buf) {
+            if (_allocbuf(fp)) break;
+        } else {
+            if (fflush(fp)) return -1;
+            if (len >= fp->size) break;
+        }
+    }
+    while (len) {
+        ssize_t wsz = write(fp->hd, p, len);
+        if (wsz <= 0) break;
+        p += wsz; nw += wsz; len -= wsz;
+    }
+    return nw;
+}
+
+#include "nano-printf.h"
 
 int printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -352,17 +440,17 @@ int fprintf(FILE *fp, const char *fmt, ...) {
 }
 
 int fflushall(void) {
-    int res = 0; for (size_t i = 0; i < NFILE; i++) res |= fflush(&_iob[i]);
-    return res;
+    int rc = 0; for (FILE *fp = _iob; fp < _iob + NFILE; fp++) rc |= fflush(fp);
+    return rc;
 }
 
 int fclose(FILE *fp) {
-    fflush(fp);
-    if (fp->alloc) { free(fp->buf); fp->alloc = false; }
-    if (!(fp->flags & (_IOREAD|_IOWRITE))) return 0;
-    int hd = fp->hd;
+    _check_fp(fp);
+    int rc = fflush(fp);
+    if (fp->alloc) free(fp->buf);
+    if (fp->flags & (_IOREAD|_IOWRITE)) rc |= close(fp->hd);
     memset(fp, 0, sizeof(*fp));
-    return close(hd);
+    return rc;
 }
 
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp) {
@@ -379,9 +467,9 @@ int fputs(const char *s, FILE *fp) {
 
 // return the number of bytes written or EOF on error
 int puts(const char *s) {
-    int res = (int)__fwrite(s, strlen(s), stdout);
+    int len = (int)__fwrite(s, strlen(s), stdout);
     if (putc('\n', stdout) < 0) return EOF;
-    return res + 1;
+    return len + 1;
 }
 
 // sys_err.c
@@ -435,5 +523,5 @@ void perror(const char *s) {
     fprintf(stderr, "%s\n", strerror(errnum));
 }
 
-#include "lib/nano-malloc.h"
+#include "nano-malloc.h"
 #endif

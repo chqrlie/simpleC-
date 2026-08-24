@@ -4,7 +4,7 @@
 //   ./nano_cc features.c features.s
 //   gcc -nostdlib -no-pie features.s -o features_prog
 //   ./features_prog
-#include "lib/nano-nolibc.h"
+#include <nano-nolibc.h>
 
 int main() {
     int sum;

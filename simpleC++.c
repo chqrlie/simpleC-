@@ -41,12 +41,17 @@ static void malloc_stats(void) {
 const char *progname;
 static bool has_library;
 static const char *src_name[32];
+static char include_path[1024];
 static int src_pos;
 static int optimize;
 static bool debug, verbose;
+static const char *get_filename(int pos) {
+    return pos ? src_name[pos >> 24] : NULL;
+}
+#define get_lineno(pos) ((pos) & 0xffffff)
 static void err_message(int pos, const char *kind, const char *fmt, va_list ap) {
-    int fn = pos >> 24, lineno = pos & 0xffffff;
-    if (pos && src_name[fn]) fprintf(stderr, "%s:%d: %s: ", src_name[fn], lineno, kind);
+    const char *filename = get_filename(pos);
+    if (filename) fprintf(stderr, "%s:%d: %s: ", filename, get_lineno(pos), kind);
     else fprintf(stderr, "%s: %s: ", progname, kind);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
@@ -60,6 +65,9 @@ static void warning(int pos, const char *fmt, ...) attr_printf(2,3);
 static void warning(int pos, const char *fmt, ...) {
     va_list a; va_start(a, fmt); err_message(pos, "warning", fmt, a); va_end(a);
 }
+struct Node;
+static void error(struct Node *n, const char *fmt, ...) attr_printf(2,3);
+
 static int xdigit(int d) {
     if (d >= '0' && d <= '9') return d - '0';
     if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
@@ -102,6 +110,10 @@ static size_t pstrcpy(char *dest, size_t size, const char *src) {
     }
     return size;
 }
+size_t pstrcat(char *dest, size_t size, const char *src) {
+    size_t i = strnlen(dest, size);
+    return pstrcpy(dest + i, size - i, src);
+}
 #if 0
 // safe limited string copy with truncation and detection
 static size_t pstrncpy(char *dest, size_t size, const char *src, size_t n) {
@@ -114,11 +126,21 @@ static size_t pstrncpy(char *dest, size_t size, const char *src, size_t n) {
     return size;
 }
 #endif
-// safe fixed string copy with truncation and detection
+// safe fixed block with truncation and detection (no null termination)
 static size_t pmemcpy(char *dest, size_t size, const char *src, size_t n) {
     size_t i = 0;
     for (i = 0; i < size && n; i++, n--) dest[i] = src[i];
     return i;
+}
+static bool strstart(const char *s, const char *p, size_t *pk) {
+    for (size_t k = 0; s[k] == p[k]; k++) if (!p[k]) { if (pk) *pk = k; return true; }
+    return false;
+}
+static bool strend(const char *s, const char *p, size_t *pk) {
+    size_t k = strlen(s), kp = strlen(p);
+    if (k < kp) return false;
+    for (s -= kp, p -= kp; kp--;) { if (*s++ != *p++) return false; }
+    if (pk) *pk = k; return true;
 }
 
 static void *alloc(size_t nelems, size_t size) {
@@ -174,6 +196,9 @@ static size_t sbuf_load_file(sbuf_t *sb, FILE *f) {
         if (!nread) return sb->len;
         sb->len += nread;
     }
+}
+static void sbuf_trim_empty_lines(sbuf_t *sb) {
+    while (sb->len >= 2 && sb->buf[sb->len - 1] == '\n' && sb->buf[sb->len - 2] == '\n') sb->len--;
 }
 
 // =====================================================================
@@ -392,9 +417,9 @@ static void expand_line(const char *in, sbuf_t *sb) {
                 if (!m || (m->nparams >= 0 && p[k+b] != '(')) {
                     switch (name) {
                     case ID__FILE__: *buf = '"'; len = 1;
-                                     len += pstrcpy(buf + 1, sizeof(buf) - 3, src_name[src_pos >> 24]);
+                                     len += pstrcpy(buf + 1, sizeof(buf) - 3, get_filename(src_pos));
                                      buf[len++] = '"'; buf[len] = '\0'; break;
-                    case ID__LINE__: len = snprintf(buf, sizeof(buf), "%d", src_pos & 0xffffff); break;
+                    case ID__LINE__: len = snprintf(buf, sizeof(buf), "%d", get_lineno(src_pos)); break;
                     case ID__COUNTER__: len = snprintf(buf, sizeof(buf), "%d", counter++); break;
                     default: p += k; continue;
                     }
@@ -492,7 +517,59 @@ static size_t strip_comments(char *s) {
     }
 }
 
-static void preprocess(const char *path, sbuf_t *sb);
+static void preprocess(const char *path, bool sys, sbuf_t *sb);
+
+static bool can_read(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;
+    fclose(fp); return true;
+}
+
+static bool set_parent(char *path) {
+    if (!*path) return false;
+    char *p = strchr(path, 0);
+    // ignore trailing /, scan for previous /, stop at path
+    while (p > path && (*--p != '/' || !p[1])) continue;
+    // parent of root is root
+    p += (*p == '/'); *p = '\0'; return true;
+}
+
+static const char *find_file(char *buf, size_t size, const char *name, const char *curfile, const char *path) {
+    if (*name == '/') return name;
+    if (curfile) {
+        pstrcpy(buf, size, curfile); set_parent(buf);
+        for (size_t k = 0;; name += k) {
+            if (strstart(name, "./", &k)) continue;
+            if (strstart(name, "../", &k) && set_parent(buf)) continue;
+            size_t pos = pstrcat(buf, size, name);
+            if (pos < size && can_read(buf)) return buf;
+            break;
+        }
+    }
+    for (;;) {
+        size_t k = skip_until(path, ':');
+        if (k) {
+            size_t pos = pmemcpy(buf, size, path, k);
+            pos += pstrcpy(buf + pos, size - pos, name);
+            if (pos < size && can_read(buf)) return buf;
+        }
+        path += k; if (!*path++) return NULL;
+    }
+}
+
+static void process_include(const char *name, bool sys, sbuf_t *sb) {
+    char path[256];
+    const char *curfile = sys ? NULL : get_filename(src_pos);
+    const char *filename = find_file(path, sizeof(path), name, curfile, include_path);
+    if (!filename && sys) {
+        if (has_library) return;
+        has_library = true;  // at least has tried!
+        filename = find_file(path, sizeof(path), "nano-libc.h", NULL, include_path);
+        if (!filename) error(NULL, "cannot find standard library");
+    }
+    if (filename) { preprocess(filename, sys, sb); }
+    else warning(src_pos, "cannot find include file '%s'", name);
+}
 
 // Process already-comment-stripped text of one file.
 static void process_text(const char *text, sbuf_t *sb) {
@@ -597,23 +674,16 @@ static void process_text(const char *text, sbuf_t *sb) {
             case K_LINE:
                 if (skip) break;
                 sbuf_put(sb, "# ", 2); sbuf_put(sb, p, li - (p - line)); break;
-            case K_INCLUDE:
+            case K_INCLUDE: {
                 if (skip) break;
-                if (*p == '"') {
-                    size_t k = skip_until(++p, '"');
-                    if (p[k] != '"') die("invalid include file name");
-                    atom_t name = new_atom_len(p, k);
-                    preprocess(atom_str(name), sb);
-                } else
-                if (*p == '<') {  // standard header: ignore and include nano libc
-                    //size_t k = skip_until(++p, '>');
-                    //if (p[k] != '>') die("invalid include file name");
-                    if (!has_library) {
-                        preprocess("lib/nano-libc.h", sb);
-                        has_library = true;
-                    }
-                }
+                char sep = '"'; bool sys = false;
+                if (*p == '"' || (sep = '>', sys = true, *p == '<')) {
+                    size_t k = skip_until(++p, sep);
+                    if (p[k] != sep) die("invalid include file name");
+                    process_include(atom_str(new_atom_len(p, k)), sys, sb); p += k + 1;
+                } else { die("missing include file name"); }
                 break;
+            }
             default:
                 if (skip) break;
                 if (isdigit((unsigned char)*p)) sbuf_put(sb, line, li); break;
@@ -636,29 +706,37 @@ static int update_pos(int pos, const char *path, int lineno) {
     }
     return (fn << 24) + lineno;
 }
-static void sharp_line(int pos, int state, sbuf_t *sb) {
-    if (pos) {
-        char buf[300]; int len = snprintf(buf, sizeof(buf), "# %d \"%s\"", pos & 0xffffff, src_name[pos >> 24]);
-        if (state) len += snprintf(buf + len, sizeof(buf) - len, " %d", state);
-        buf[len++] = '\n'; buf[len] = '\0';
+static void sharp_line(int pos, int state, bool sys, sbuf_t *sb) {
+    const char *filename = get_filename(pos);
+    if (filename) {
+        char buf[300]; size_t len = snprintf(buf, sizeof(buf), "# %d \"%s\"", get_lineno(pos), filename);
+        if (state && len < sizeof(buf)) {
+            len += snprintf(buf + len, sizeof(buf) - len, " %d", state);
+            if (sys && len < sizeof(buf)) len += pstrcpy(buf + len, sizeof(buf) - len, " 3 4");
+        }
+        if (len < sizeof(buf) - 1) { buf[len++] = '\n'; buf[len] = '\0'; }
+        sbuf_trim_empty_lines(sb);
         sbuf_put(sb, buf, len);
     }
 }
 
-static void preprocess(const char *path, sbuf_t *sb) {
-    FILE *f = fopen(path, "r");
-    if (!f) { die("cannot open %s: %s\n", path, strerror(errno)); }
-    sbuf_t raw[1]; sbuf_init(raw, 64 * 1024);
+static void preprocess(const char *path, bool sys, sbuf_t *sb) {
+    FILE *f = stdin;
+    if (!strcmp(path, "-")) { path = "<stdin>"; }
+    else if (!(f = fopen(path, "r"))) { die("cannot open %s: %s\n", path, strerror(errno)); }
+    // XXX: should use stat to get the exact size!
+    sbuf_t raw[1]; sbuf_init(raw, 65537);
     size_t n = sbuf_load_file(raw, f);
     if (verbose) printf("Read %s: %zu bytes\n", path, n);
     fclose(f);
     int save_pos = src_pos;
     src_pos = update_pos(src_pos, path, 1);
-    sharp_line(src_pos, 1, sb);
+    sharp_line(src_pos, !!save_pos, sys, sb);
     raw->len = strip_comments(sbuf_getptr(raw));
-    if (verbose) printf("Stripped: %td bytes\n", raw->len);
+    if (verbose) printf("Stripped: %zu bytes\n", raw->len);
     process_text(sbuf_getptr(raw), sb);   // may recurse (with its own buffers)
-    sharp_line(src_pos = save_pos, 2, sb);
+    sharp_line(src_pos, 2, sys, sb);
+    sharp_line(src_pos = save_pos, 0, sys, sb);
     sbuf_deinit(raw);
     if (verbose) printf("Preprocessed: %zu bytes\n", sb->len);
 }
@@ -976,7 +1054,6 @@ static Node *new_num_node(long ival, Type *t) { Node *n = new_node(N_NUM); n->iv
 static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
 static int node_length(Node *n) { int len = 0; while (n) { len++; n = n->next; } return len; }
 
-static void error(Node *n, const char *fmt, ...) attr_printf(2,3);
 static void error(Node *n, const char *fmt, ...) {
     int pos = n ? n->pos : cur()->pos;
     va_list a; va_start(a, fmt); err_message(pos, "error", fmt, a); va_end(a);
@@ -2479,6 +2556,7 @@ static Type *gen_expr(Node *n) {
             emit_jmp(n, "jge", end1);
             emit("neg rax");
             emit("mov [rip + errno], rax");
+            emit("mov rax, -1");
             emit_label(end1);
             return ty_long();
         case ID_ABS:
@@ -2979,8 +3057,9 @@ static _Noreturn void usage(bool full) {
                 "  -time          show timings\n"
                 "  -E             output preprocessed test\n"
                 "  -ET            output preprocessed tokens\n"
+                "  -I DIR         add DIR to the end of the include path\n"
                 "  -O             perform optimizations\n"
-                "  -o <output>    set the output filename\n"
+                "  -o FILE        set the output filename\n"
                 "  -v  --verbose  output progress messages\n");
     }
     exit(1);
@@ -2991,66 +3070,15 @@ static _Noreturn void arg_error(const char *msg, const char *arg) {
     usage(false);
 }
 
-int main(int argc, char **argv) {
-    // Optional flags may precede the file names.  --kernel suppresses the
-    // Linux _start/exit stub so a bare-metal boot stub can provide the entry
-    // point and simply call main() (no Linux syscalls exist in a kernel).
-    long t0 = now();
-    progname = argv[0];
-    if (argc == 1) usage(true);
-    int preprocess_mode = 0, timings = 0;
-    bool kernel_mode = false, libc_mode = false, mem_stats = false;
-    const char *inpath = NULL, *outpath = NULL;
-    for (int i = 1; i < argc; i++) {
-        char *arg = argv[i];
-        if      (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
-        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(true);
-        else if (!strcmp(arg, "--libc")) libc_mode = true;
-        else if (!strcmp(arg, "-E")) preprocess_mode = 1;
-        else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
-        else if (!strcmp(arg, "-O")) optimize++;
-        else if (!strcmp(arg, "-g")) debug = out_comments = true;
-        else if (!strcmp(arg, "-time")) timings++;
-        else if (!strcmp(arg, "-memory")) mem_stats = true;
-        else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
-        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) arg_error("missing output filename", ""); outpath = argv[++i]; }
-        else if (*arg == '-') arg_error("invalid option: ", arg);
-        else if (!inpath)  inpath  = arg;
-        else if (!outpath) outpath = arg;
-        else arg_error("too many arguments", "");
-    }
-    if (!inpath) arg_error("missing filename", "");
+static FILE *open_output(const char *path, FILE *def) {
+    if (!strcmp(path, "-")) return fout = stdout;
+    if ((fout = fopen(path, "w"))) return fout;
+    if (def) return fout = def;
+    die("cannot open output file '%s': %s", path, strerror(errno));
+    return NULL;
+}
 
-    lex_init();
-    sbuf_t src[1]; sbuf_init(src, 128 * 1024);
-    preprocess(inpath, src);
-    if (preprocess_mode == 1) { fputs(sbuf_getptr(src), stdout); return 0; }
-    lex(sbuf_getptr(src));
-    sbuf_deinit(src);
-
-    if (!preprocess_mode) { while (!at(T_EOF)) parse_toplevel(); }
-    if (!outpath) {
-        if (preprocess_mode) { fout = stdout; }
-        else {
-            size_t len = strlen(inpath);
-            if (len > 2 && !memcmp(inpath + len - 2, ".c", 2)) len -= 2;
-            char *p = alloc(len + 3, 1);
-            memcpy(p, inpath, len); strcpy(p + len, ".s"); outpath = p;
-        }
-    }
-    if (!fout) {
-        if (!strcmp(outpath, "-")) fout = stdout;
-        else fout = fopen(outpath, "w");
-        if (!fout) { die("cannot open %s: %s", outpath, strerror(errno)); }
-    }
-    if (preprocess_mode) {
-        int status = output_tokens(fout, toks, ntok);
-        if (fout != stdout) fclose(fout);
-        return status;
-    }
-
-    check_used_func(ID_MAIN);
-
+static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
     emit(".intel_syntax noprefix");
     emit_section(".text", 0);
 
@@ -3094,11 +3122,82 @@ int main(int argc, char **argv) {
     for (atom_t s = 0; s < natoms; s++) {
         if (atom_flags(s) & ATOM_USED) gen_string_def(s);
     }
-
-    fclose(fout);
-    if (verbose) printf("Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
-    t0 = now() - t0;
-    if (timings) printf("total time: %ld.%03ld ms\n", t0 / 1000, t0 % 1000);
-    if (mem_stats) malloc_stats();
     return 0;
+}
+
+static bool add_path(char *buf, size_t size, const char *path) {
+    if (!path) arg_error("missing path argument", "");
+    if (*buf) pstrcat(buf, size, ":");
+    size_t len = pstrcpy(buf, size, path);
+    if (buf[len - 1] != '/') len = pstrcat(buf, size, "/");
+    return len < size;
+}
+
+int main(int argc, char **argv) {
+    // Optional flags may precede the file names.  --kernel suppresses the
+    // Linux _start/exit stub so a bare-metal boot stub can provide the entry
+    // point and simply call main() (no Linux syscalls exist in a kernel).
+    progname = argv[0];
+    if (argc == 1) usage(true);
+    int preprocess_mode = 0, timings = 0, status = 0;
+    bool kernel_mode = false, libc_mode = false, mem_stats = false;
+    const char *inpath = NULL, *outpath = NULL;
+    long t0 = now();
+    strcpy(include_path, "lib/");   // should find nano_cc directory
+    for (int i = 1; i < argc; i++) {
+        char *arg = argv[i];
+        if      (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
+        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(true);
+        else if (!strcmp(arg, "--libc")) libc_mode = true;
+        else if (!strcmp(arg, "-E")) preprocess_mode = 1;
+        else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
+        else if (!strcmp(arg, "-g")) debug = out_comments = true;
+        else if (strstart(arg, "-I", NULL)) add_path(include_path, sizeof(include_path), arg[2] ? arg + 2 : argv[i++]);
+        else if (!strcmp(arg, "-memory")) mem_stats = true;
+        else if (!strcmp(arg, "-O")) optimize++;
+        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) arg_error("missing output filename", ""); outpath = argv[++i]; }
+        else if (!strcmp(arg, "-time")) timings++;
+        else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
+        else if (*arg == '-' && arg[1]) arg_error("invalid option: ", arg);
+        else if (!inpath)  inpath  = arg;
+        else if (!outpath) outpath = arg;
+        else arg_error("too many arguments", "");
+    }
+    if (!inpath) arg_error("missing filename", "");
+
+    lex_init();
+    sbuf_t src[1]; sbuf_init(src, 128 * 1024);
+    preprocess(inpath, false, src);
+    if (preprocess_mode == 1) {
+        open_output(outpath, stdout);
+        fputs(sbuf_getptr(src), fout);
+        fclose(fout);
+        return status;
+    }
+    lex(sbuf_getptr(src));
+    sbuf_deinit(src);
+
+    if (preprocess_mode) {
+        open_output(outpath, stdout);
+        status = output_tokens(fout, toks, ntok);
+        fclose(fout);
+        return status;
+    }
+
+    while (!at(T_EOF)) parse_toplevel();
+    check_used_func(ID_MAIN);
+
+    if (!outpath) {
+        size_t len = strlen(inpath); strend(inpath, ".c", &len);
+        char *p = alloc(len + 3, 1);
+        outpath = memcpy(p, inpath, len); strcpy(p + len, ".s");
+    }
+    open_output(outpath, NULL);
+    status = emit_x86_intel(kernel_mode, libc_mode);
+    if (fout != stdout) fclose(fout);
+
+    if (!status && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
+    if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %ld.%03ld ms\n", t0 / 1000, t0 % 1000); }
+    if (mem_stats) malloc_stats();
+    return status;
 }

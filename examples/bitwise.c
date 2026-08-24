@@ -5,7 +5,7 @@
 //   ./nano_cc bitwise.c bitwise.s
 //   gcc -nostdlib -no-pie bitwise.s -o bitwise_prog
 //   ./bitwise_prog
-#include "lib/nano-nolibc.h"
+#include <nano-nolibc.h>
 
 // function-like macros (argument substitution + nested parens)
 #define MAX(a, b)     ((a) > (b) ? (a) : (b))

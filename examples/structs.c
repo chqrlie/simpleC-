@@ -5,7 +5,7 @@
 //   ./nano_cc structs.c structs.s
 //   gcc -nostdlib -no-pie structs.s -o structs_prog
 //   ./structs_prog
-#include "lib/nano-nolibc.h"
+#include <nano-nolibc.h>
 
 struct Point { int x; int y; };
 struct Rect  { struct Point tl; struct Point br; };   // nested struct
