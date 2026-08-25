@@ -360,7 +360,7 @@ static void macro_undef(atom_t name) {
 
 typedef struct MacroArguments {
     const char *argv[8];
-    size_t len[8];
+    int len[8];
     int argc;
 } MacroArguments;
 
@@ -744,8 +744,12 @@ typedef struct {
     bool  is_long;       // T_NUM
     unsigned char base;  // T_NUM
     int   pos;
-    long  ival;          // T_NUM / T_CHAR
-    atom_t text;         // T_ID, T_STR (decoded bytes)
+    union {
+        long ival;      // T_NUM / T_CHAR
+        atom_t text;    // T_ID
+        atom_t str;     // T_STR (decoded bytes)
+        unsigned long uval;  // T_NUM / T_CHAR
+    };
 } Token;
 
 #define MAX_TOK 60000
@@ -829,7 +833,7 @@ static size_t lex(const char *p) {
         }
         if (isdigit(c)) {
             Token *t = add_tok(T_NUM);
-            long v = c - '0';
+            unsigned long v = c - '0';
             int base = 10, d;
             if (c == '0') {
                 switch (*p | 0x20) {  // lowercase if letter
@@ -841,7 +845,7 @@ static size_t lex(const char *p) {
             }
             while ((d = xdigit(c = *p)) < base) { v = v * base + d; p++; }
             t->base = base;
-            t->ival = v;
+            t->uval = v;
             if (isdigit(c)) die("invalid digit '%c' for base %d", c, base);
             if (c == '.' || (c | 0x20) == 'e') die("floating point not supported");
             for (;; c = *++p) {
@@ -919,20 +923,33 @@ enum { TY_INT, TY_CHAR, TY_SHORT, TY_LONG, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT,
 typedef struct Type Type;
 typedef struct Member { atom_t name; int offset, align, pad; Type *type; struct Node *init; struct Member *next; } Member;
 struct Type {
-    unsigned char kind, align; bool is_unsigned; int pos; int arr_len; Type *ptr; struct Node *arr_len_expr;
-    Member *members; int struct_size; atom_t tag;  // TY_STRUCT / TY_UNION
+    unsigned char kind, align; bool is_unsigned; int pos;
+    union {
+        int size;         // all types
+        struct {          // TY_ARRAY / TY_PTR
+            int arr_size__; // TY_ARRAY
+            int arr_len;  // TY_ARRAY
+            Type *ptr;    // TY_ARRAY / TY_PTR
+            struct Node *arr_len_expr; // TY_ARRAY
+        };
+        struct {          // TY_STRUCT / TY_UNION
+            int struct_size;
+            atom_t tag;
+            Member *members; // TY_STRUCT / TY_UNION
+        };
+    };
 };
 
-static Type ty_char_s   = { TY_CHAR,  1, false, 0, 0, 0, 0, 0, 0, 0 };
-static Type ty_schar_s  = { TY_CHAR,  1, false, 0, 0, 0, 0, 0, 0, 0 };
-static Type ty_uchar_s  = { TY_CHAR,  1, true,  0, 0, 0, 0, 0, 0, 0 };
-static Type ty_short_s  = { TY_SHORT, 2, false, 0, 0, 0, 0, 0, 0, 0 };
-static Type ty_ushort_s = { TY_SHORT, 2, true,  0, 0, 0, 0, 0, 0, 0 };
-static Type ty_int_s    = { TY_INT,   4, false, 0, 0, 0, 0, 0, 0, 0 };
-static Type ty_uint_s   = { TY_INT,   4, true,  0, 0, 0, 0, 0, 0, 0 };
-static Type ty_long_s   = { TY_LONG,  8, false, 0, 0, 0, 0, 0, 0, 0 };
-static Type ty_ulong_s  = { TY_LONG,  8, true,  0, 0, 0, 0, 0, 0, 0 };
-static Type ty_void_s   = { TY_VOID,  1, false, 0, 0, 0, 0, 0, 0, 0 };
+static Type ty_char_s   = { TY_CHAR,  1, false, 0, { 0 }}; // should be unsigned
+static Type ty_schar_s  = { TY_CHAR,  1, false, 0, { 0 }};
+static Type ty_uchar_s  = { TY_CHAR,  1, true,  0, { 0 }};
+static Type ty_short_s  = { TY_SHORT, 2, false, 0, { 0 }};
+static Type ty_ushort_s = { TY_SHORT, 2, true,  0, { 0 }};
+static Type ty_int_s    = { TY_INT,   4, false, 0, { 0 }};
+static Type ty_uint_s   = { TY_INT,   4, true,  0, { 0 }};
+static Type ty_long_s   = { TY_LONG,  8, false, 0, { 0 }};
+static Type ty_ulong_s  = { TY_LONG,  8, true,  0, { 0 }};
+static Type ty_void_s   = { TY_VOID,  1, false, 0, { 0 }};
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -959,7 +976,16 @@ static int ty_size(Type *t) {
 static int ty_align(Type *t) { return t->align; }
 static Member *find_member(Type *st, atom_t name) {
     if (st->kind == TY_PTR) st = st->ptr;
-    for (Member *m = st->members; m; m = m->next) if (m->name == name) return m;
+    for (Member *m = st->members; m; m = m->next) {
+        if (m->name == name) return m;
+        if (!m->name) {
+            Type *mt = m->type;
+            if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
+                Member *mm = find_member(mt, name);
+                if (mm) return mm;
+            }
+        }
+    }
     return NULL;
 }
 // element size for pointer/array arithmetic (bytes per step); 0 if not a pointer
@@ -1015,22 +1041,29 @@ enum {
     N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
 };
 
-#define HAS_BREAK     1     // bits in n->ival
-#define HAS_CONTINUE  2
-#define HAS_DEFAULT   4
 typedef struct Node Node;
 struct Node {
     unsigned char kind;
     unsigned char op;       // token kind for N_BIN / N_POST (T_INC/T_DEC)
-#define DISCARD   1         // expression value is discarded: no need to preserve reg value
-#define CONST_VAL 2         // expression is integer constant, value in n->ival
+#define DISCARD       1     // expression value is discarded: no need to preserve reg value
+#define CONST_VAL     2     // expression is integer constant, value in n->ival
+#define HAS_BREAK     4     // N_SWITCH, N_FOR, N_DO, N_WHILE
+#define HAS_CONTINUE  8     // N_FOR, N_DO, N_WHILE
+#define HAS_DEFAULT   16    // N_SWITCH
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
     int   pos;
-    long  ival;             // N_NUM, N_CASE, N_DEFAULT, N_LABEL, N_FOR, N_DO, N_WHILE, N_SWITCH
-    atom_t str;             // N_STR, N_ASM decoded text
-    atom_t name;            // N_VAR / N_CALL / N_DECL
+    union {
+        long ival;          // N_NUM, N_EXPR, N_VAR?, N_CALL? expression nodes
+        unsigned long uval; // same
+        int lab;            // N_CASE, N_DEFAULT, N_LABEL
+        int decl_flags;     // N_DECL, N_DECLIST
+    };
+    union {
+        atom_t str;         // N_STR, N_ASM decoded text
+        atom_t name;        // N_VAR / N_CALL / N_DECL
+    };
     Type *type;             // result / declared type
     Node *lhs, *rhs, *cond, *init, *next;
 };
@@ -1154,6 +1187,16 @@ static Type *parse_array(Type *t) {
     return array_of(t, len_expr);
 }
 
+static void shift_members(Member *m) {
+    Type *mt = m->type;
+    if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
+        for (Member *mm = mt->members; mm; mm = mm->next) {
+            mm->offset += m->offset;
+            if (!m->name) shift_members(mm);
+        }
+    }
+}
+
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
 static Type *parse_struct(int kind) {
     int pos = cur()->pos; P++;
@@ -1170,8 +1213,16 @@ static Type *parse_struct(int kind) {
             for (;;) {
                 Type *mt = mbase;
                 while (eat(T_STAR)) mt = ptr_to(mt);
-                atom_t mnm = getid();
-                if (eat(T_LBRK)) mt = parse_array(mt);
+                atom_t mnm = 0;
+                if (at(T_ID)) {
+                    mnm = getid();
+                    if (eat(T_LBRK)) mt = parse_array(mt);
+                } else {
+                    // accept unnamed members, but reject pointers and tagged aggregate types
+                    if (mt->kind == TY_PTR) error(NULL, "anonymous members cannot be pointers");
+                    if ((mt->kind == TY_STRUCT || mt->kind == TY_UNION) && mt->tag)
+                        error(NULL, "anonymous struct/union cannot have a tag");
+                }
                 int msz = ty_size(mt);
                 int align = ty_align(mt);
                 if (align > st->align) st->align = (unsigned char)align;
@@ -1191,6 +1242,7 @@ static Type *parse_struct(int kind) {
                 } else {
                     m->offset = off; off += msz;
                 }
+                if (!mnm) shift_members(m);
                 if (!eat(T_COMMA)) break;
             }
             expect(T_SEMI);
@@ -1444,7 +1496,7 @@ static Node *parse_decl_stmt(void) {
     int flags;
     Type *base = parse_type_base_only(&flags);   // fwd-declared below
     Node *n = new_node(N_DECLIST);
-    n->ival = flags;
+    n->decl_flags = flags;
     switch (base->kind) {  // check for bare struct/union/enum Foo { ... };
     case TY_STRUCT: case TY_UNION: case TY_ENUM: if (eat(T_SEMI)) return n;
     }
@@ -1454,7 +1506,7 @@ static Node *parse_decl_stmt(void) {
         while (eat(T_STAR)) t = ptr_to(t);
         atom_t nm = getid();
         if (eat(T_LBRK)) t = parse_array(t);
-        Node *d = new_node(N_DECL); d->name = nm; d->type = t; n->ival = flags;
+        Node *d = new_node(N_DECL); d->name = nm; d->type = t; n->decl_flags = flags;
         if (eat(T_ASSIGN)) {
             Node *init = d->init = parse_init();
             if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
@@ -1615,10 +1667,10 @@ static Node *parse_stmt(void) {
     if (at(K_DEFAULT))  {
         if (!this_switch) error(NULL, "'default' outside a 'switch' statement");
         else {
-            if (this_switch->ival & HAS_DEFAULT) {
+            if (this_switch->flags & HAS_DEFAULT) {
                 error(NULL, "duplicate 'default' in 'switch' statement");
             }
-            this_switch->ival |= HAS_DEFAULT;
+            this_switch->flags |= HAS_DEFAULT;
         }
         n = new_node(N_DEFAULT); P++;
         n->name = K_DEFAULT;
@@ -1660,13 +1712,13 @@ static Node *parse_stmt(void) {
         return n;
     }
     if (at(K_BREAK)) {
-        if (this_switch) { this_switch->ival |= HAS_BREAK; }
-        else if (this_loop) { this_loop->ival |= HAS_BREAK; }
+        if (this_switch) { this_switch->flags |= HAS_BREAK; }
+        else if (this_loop) { this_loop->flags |= HAS_BREAK; }
         else { error(NULL, "'break' outside a loop or 'switch' statement"); }
         n = new_node(N_BREAK); P++; expect(T_SEMI); return n;
     }
     if (at(K_CONTINUE)) {
-        if (this_loop) { this_loop->ival |= HAS_CONTINUE; }
+        if (this_loop) { this_loop->flags |= HAS_CONTINUE; }
         else error(NULL, "'continue' outside a loop statement");
         n = new_node(N_CONTINUE); P++; expect(T_SEMI); return n;
     }
@@ -1956,7 +2008,7 @@ static bool check_rewrite(Node *n) {
         Node *arg = n->rhs; if (arg->kind != N_STR) break;
         const char *s = atom_str(arg->str);
         size_t len = strlen(s); // do not use atom len to allow embedded nuls
-        n->kind = N_NUM; n->ival = (long)len; n->type = ty_ulong();
+        n->kind = N_NUM; n->uval = len; n->type = ty_ulong();
         return true;
     }
     case ID_STRCPY: {   // optimize strcpy(dest, "str");
@@ -2020,8 +2072,8 @@ static bool has_flow(Node *n) {
     case N_RETURN: return false;
     case N_BLOCK:  return has_flow(node_last(n->rhs));
     case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
-    case N_FOR:    return n->cond || (n->ival & HAS_BREAK);
-    case N_SWITCH: if ((n->ival & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
+    case N_FOR:    return n->cond || (n->flags & HAS_BREAK);
+    case N_SWITCH: if ((n->flags & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
                    return has_flow(n->rhs);
     //case N_WHILE: case N_DOWHILE: // XXX: check constant loop condition and break
     //case N_CALL:    // XXX: check for _Noreturn attribute
@@ -2150,7 +2202,7 @@ static Type *gen_addr(Node *n) {
     if (n->kind == N_MEMBER) {                     // &(s.field)
         Type *st = gen_addr(n->lhs);               // rax = &struct
         Member *m = find_member(st, n->name);
-        if (!m) error(n, "no such struct member: %s", atom_str(n->name));
+        if (!m) error(n, "no such struct member: %s.%s", atom_str(st->tag), atom_str(n->name));
         emit_comment(atom_str(n->name));
         if (m->offset) { emit("add rax, %d", m->offset); }
         return m->type;
@@ -2174,7 +2226,7 @@ static Type *gen_addr2(Node *n, bool save_rax) {
     if (n->kind == N_MEMBER) {                     // &(s.field)
         Type *st = gen_addr2(n->lhs, save_rax);    // rax = &struct
         Member *m = find_member(st, n->name);
-        if (!m) error(n, "no such struct member: %s", atom_str(n->name));
+        if (!m) error(n, "no such struct member: %s.%s", atom_str(st->tag), atom_str(n->name));
         emit_comment(atom_str(n->name));
         if (m->offset) { emit("add rcx, %d", m->offset); }
         return m->type;
@@ -2697,18 +2749,18 @@ static void gen_switch(Node *n) {
     int def = 0, end = 0;
     for (Node *e = n->lhs; e; e = e->lhs) {
         long val;
-        e->ival = label_id++;
+        e->lab = label_id++;
         if (e->kind == N_CASE) {
             if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
             e->cond->ival = val;
             gen_case_comment(e);
             emit("cmp rax, %ld", val);
-            emit_jmp(n, "jz", (int)e->ival);
+            emit_jmp(n, "jz", e->lab);
         } else {
-            def = (int)e->ival;
+            def = e->lab;
         }
     }
-    if ((n->ival & HAS_BREAK) || !def) end = label_id++;
+    if ((n->flags & HAS_BREAK) || !def) end = label_id++;
     emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
 
     // break exits the switch; continue passes through to the enclosing loop
@@ -2762,8 +2814,8 @@ static void gen_stmt(Node *n) {
     }
     case N_DOWHILE: {
         int top = label_id++, cont = 0, end = 0;
-        if (n->ival & HAS_CONTINUE) cont = label_id++;
-        if (n->ival & HAS_BREAK) end = label_id++;
+        if (n->flags & HAS_CONTINUE) cont = label_id++;
+        if (n->flags & HAS_BREAK) end = label_id++;
         emit_label(top);
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
         emit_label(cont);
@@ -2773,8 +2825,8 @@ static void gen_stmt(Node *n) {
     }
     case N_FOR: {
         int top = label_id++, cont = top, end = 0;
-        if (n->rhs && (n->ival & HAS_CONTINUE)) cont = label_id++;
-        if (n->cond || (n->ival & HAS_BREAK)) end = label_id++;
+        if (n->rhs && (n->flags & HAS_CONTINUE)) cont = label_id++;
+        if (n->cond || (n->flags & HAS_BREAK)) end = label_id++;
         if (n->init) gen_stmt(n->init);
         emit_label(top);
         if (n->cond) { gen_expr(n->cond); emit("test rax, rax"); emit_jmp(n, "jz", end); }
@@ -2791,9 +2843,9 @@ static void gen_stmt(Node *n) {
     case N_BREAK:    emit_jmp(n, "jmp", brk_lbl[loop_sp]);  break;
     case N_CONTINUE: emit_jmp(n, "jmp", cont_lbl[loop_sp]); break;
     case N_SWITCH:   gen_switch(n); break;
-    case N_CASE:     gen_case_comment(n); emit_label((int)n->ival); break;
+    case N_CASE:     gen_case_comment(n); emit_label(n->lab); break;
     case N_DEFAULT:
-    case N_LABEL:    emit_comment(atom_str(n->name)); emit_label((int)n->ival); break;
+    case N_LABEL:    emit_comment(atom_str(n->name)); emit_label(n->lab); break;
     case N_GOTO: {
         Label *lab = find_label(n->name);
         if (!lab) {
@@ -2801,7 +2853,7 @@ static void gen_stmt(Node *n) {
             break;
         }
         lab->used = true;
-        emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", (int)lab->n->ival);
+        emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", lab->n->lab);
         break;
     }
     case N_ASM: gen_asm(n);  break;
@@ -2812,7 +2864,7 @@ static void gen_stmt(Node *n) {
 static void gen_func(Func *fn) {
     if (!fn->body) return;  // external function prototype
     this_fn = fn;
-    for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->ival = label_id++; }
+    for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->lab = label_id++; }
     locals = NULL; frame_size = 0;
     // params first (so they get the lowest offsets, in declared order)
     for (Node *param = fn->param; param; param = param->next) add_local(param->name, param->pos, param->type);
@@ -2965,7 +3017,7 @@ static int output_token(FILE *fp, Token *t) {
     switch (t->kind) {
     case T_NUM: {
             char *p = buf + 68; *--p = '\0';
-            unsigned long val = (unsigned long)t->ival;
+            unsigned long val = t->uval;
             unsigned char base = t->base;
             if (t->is_unsigned) *--p = 'U';
             if (t->is_long) *--p = 'L';
