@@ -48,7 +48,7 @@
 #define TEST_ALT_NUMBERS  1
 #endif
 
-typedef struct {
+typedef struct sprint_int_type {
     int line;
     long value;
     const char *result;
@@ -57,7 +57,7 @@ typedef struct {
 
 #define _(value, format, res)   { __LINE__, value, res, format },
 
-static sprint_int_type const sprint_ints[] = {
+static struct sprint_int_type const sprint_ints[] = {
 
     _( 0x00008000,  "%hu",      "32768"          )
     _( 0x00000000,  "%+ d",     "+0"             )
@@ -5103,7 +5103,7 @@ static sprint_int_type const sprint_ints[] = {
     { 0, 0, 0, 0 },
 };
 
-typedef struct {
+typedef struct sprint_ll_type {
     int line;
     long long int value;
     const char *result;
