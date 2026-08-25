@@ -34,12 +34,24 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
         __fwrite(q, len, fp); total += len;
         q = fmt;
         if (!*fmt) return (int)total;
-        char buf[72], *s = buf, *e = buf + sizeof(buf);
-        unsigned long n, mask = 0xffffffff, sbit = 0;
+        char buf[72], *e, *s = e = buf + sizeof(buf) - 8;
+        unsigned long n;
+        fmt++;  // past '%'
+#ifndef SMALL
+        switch (*fmt) {
+        case 'd':;
+            int n1 = va_arg(ap, int); n = n1;  // force sign extension
+            if (n1 < 0) { total++; put1('-', fp); n = -n; }
+            do { *--s = '0' + n % 10; } while (n /= 10);
+            total += e - s;
+            while (s < e) put1(*s++, fp);
+            q = ++fmt; continue;
+        }
+#endif
+        unsigned long mask = 0xffffffff, sbit = 0;
         unsigned char cc, pref[2], sign = 0;
         bool minus = false, zero = false, val64 = false;
         int width = 0, shft = 0, zeroes = 0, plen = 0, prec = -1;
-        fmt++;  // past '%'
     again:;
         switch (cc = *fmt++) {
         case 'o': plen >>= 1; shft -= 1; // 3
@@ -64,7 +76,7 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
         //case 'C': val64 = true; // Unix standard
         case 'c':
             // could support utf-8 conversion if val64 and escape encode if #
-            *buf = (char)va_arg(ap, int); len = 1; plen = 0;
+            *s = (char)va_arg(ap, int); len = 1; plen = 0;
             goto out_str;
         //case 'S': val64 = true; // Unix standard
         case 's':

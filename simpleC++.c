@@ -9,6 +9,7 @@
 // =====================================================================
 
 //#define NO_REALLOC
+#define SMALL
 
 #include <ctype.h>
 #include <errno.h>
@@ -114,18 +115,6 @@ size_t pstrcat(char *dest, size_t size, const char *src) {
     size_t i = strnlen(dest, size);
     return pstrcpy(dest + i, size - i, src);
 }
-#if 0
-// safe limited string copy with truncation and detection
-static size_t pstrncpy(char *dest, size_t size, const char *src, size_t n) {
-    if (size) {
-        size_t i;
-        for (i = 0; i < size && n; i++, n--) if ((dest[i] = src[i]) == 0) return i;
-        if (i < size) { dest[i] = 0; return i; }
-        dest[size - 1] = 0;
-    }
-    return size;
-}
-#endif
 // safe fixed block with truncation and detection (no null termination)
 static size_t pmemcpy(char *dest, size_t size, const char *src, size_t n) {
     size_t i = 0;
@@ -154,7 +143,7 @@ static void *allocz(size_t nelems, size_t size) {
     return ptr;
 }
 static void *reallocate(void *ptr, size_t *nelems, size_t size) {
-    size_t new_nelems = *nelems + (*nelems >> 1);
+    size_t new_nelems = *nelems + (*nelems >> 1) + 1024;
 #ifndef NO_REALLOC    // use realloc if available
     void *new_ptr = realloc(ptr, new_nelems * size);
     if (!new_ptr) die("out of memory");
@@ -199,6 +188,10 @@ static size_t sbuf_load_file(sbuf_t *sb, FILE *f) {
 }
 static void sbuf_trim_empty_lines(sbuf_t *sb) {
     while (sb->len >= 2 && sb->buf[sb->len - 1] == '\n' && sb->buf[sb->len - 2] == '\n') sb->len--;
+}
+static void sbuf_trim(sbuf_t *sb) {
+    char *p = realloc(sb->buf, sb->len + 1);
+    if (p) { sb->buf = p; sb->cap = sb->len + 1; }
 }
 
 // =====================================================================
@@ -728,15 +721,15 @@ static void preprocess(const char *path, bool sys, sbuf_t *sb) {
     sbuf_t raw[1]; sbuf_init(raw, 65537);
     size_t n = sbuf_load_file(raw, f);
     if (verbose) printf("Read %s: %zu bytes\n", path, n);
+    raw->len = strip_comments(sbuf_getptr(raw));
+    if (verbose) printf("Stripped: %zu bytes\n", raw->len);
+    sbuf_trim(raw);
     fclose(f);
     int save_pos = src_pos;
     src_pos = update_pos(src_pos, path, 1);
     sharp_line(src_pos, !!save_pos, sys, sb);
-    raw->len = strip_comments(sbuf_getptr(raw));
-    if (verbose) printf("Stripped: %zu bytes\n", raw->len);
     process_text(sbuf_getptr(raw), sb);   // may recurse (with its own buffers)
-    sharp_line(src_pos, 2, sys, sb);
-    sharp_line(src_pos = save_pos, 0, sys, sb);
+    sharp_line(src_pos = save_pos, 2, 0, sb);
     sbuf_deinit(raw);
     if (verbose) printf("Preprocessed: %zu bytes\n", sb->len);
 }
@@ -3071,9 +3064,9 @@ static _Noreturn void arg_error(const char *msg, const char *arg) {
 }
 
 static FILE *open_output(const char *path, FILE *def) {
+    if (!path) return def;
     if (!strcmp(path, "-")) return fout = stdout;
     if ((fout = fopen(path, "w"))) return fout;
-    if (def) return fout = def;
     die("cannot open output file '%s': %s", path, strerror(errno));
     return NULL;
 }
@@ -3139,7 +3132,7 @@ int main(int argc, char **argv) {
     // point and simply call main() (no Linux syscalls exist in a kernel).
     progname = argv[0];
     if (argc == 1) usage(true);
-    int preprocess_mode = 0, timings = 0, status = 0;
+    int preprocess_mode = 0, timings = 0, rc = 0;
     bool kernel_mode = false, libc_mode = false, mem_stats = false;
     const char *inpath = NULL, *outpath = NULL;
     long t0 = now();
@@ -3172,16 +3165,16 @@ int main(int argc, char **argv) {
         open_output(outpath, stdout);
         fputs(sbuf_getptr(src), fout);
         fclose(fout);
-        return status;
+        return rc;
     }
     lex(sbuf_getptr(src));
     sbuf_deinit(src);
 
     if (preprocess_mode) {
         open_output(outpath, stdout);
-        status = output_tokens(fout, toks, ntok);
+        rc = output_tokens(fout, toks, ntok);
         fclose(fout);
-        return status;
+        return rc;
     }
 
     while (!at(T_EOF)) parse_toplevel();
@@ -3193,11 +3186,11 @@ int main(int argc, char **argv) {
         outpath = memcpy(p, inpath, len); strcpy(p + len, ".s");
     }
     open_output(outpath, NULL);
-    status = emit_x86_intel(kernel_mode, libc_mode);
+    rc = emit_x86_intel(kernel_mode, libc_mode);
     if (fout != stdout) fclose(fout);
 
-    if (!status && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
+    if (!rc && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
     if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %ld.%03ld ms\n", t0 / 1000, t0 % 1000); }
     if (mem_stats) malloc_stats();
-    return status;
+    return rc;
 }

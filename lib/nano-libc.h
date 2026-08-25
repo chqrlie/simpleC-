@@ -176,9 +176,10 @@ int isatty(int fd) {
     return 0;
 }
 
-int fflushall(void);    // should use an atexit function table
+struct FILE;
+int fflush(struct FILE *f);    // should use an atexit function table
 _Noreturn void exit(int code) {
-    fflushall();
+    fflush(NULL);
     __syscall(SYS_exit, code);
     while(1);
 }
@@ -320,7 +321,7 @@ size_t __fread(void *pv, size_t len, FILE *fp) {
             p += n; nread += n; fp->pos += n;
             if (!(len -= n)) break;
         }
-        if (len <= fp->size) {
+        if (len <= fp->size && fp->buf) {
             if (_filbuf(fp) < 0) break;
             fp->pos = 0; // unget the first byte
         } else {
@@ -344,22 +345,26 @@ size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
 int fputc(int c, FILE *fp) { return putc(c, fp); }
 
 int fflush(FILE *fp) {
-    _check_fp(fp);
-    size_t len = fp->pos;
-    unsigned char *p = fp->buf;
-    if ((fp->flags & _IOWRITE) && p && len) {
-        fp->pos = 0;
-        while (len) {
-            ssize_t wsz = write(fp->hd, p, len);
-            if (wsz <= 0) {
-                if (p > fp->buf) memcpy(fp->buf, p, len);
-                fp->pos = len;
-                return -1;
+    FILE *fp1 = fp + 1;
+    if (!fp) { fp = _iob; fp1 = fp + NFILE; }
+    int rc = 0;
+    for (; fp < fp1; fp++) {
+        size_t len = fp->pos;
+        unsigned char *p = fp->buf;
+        if ((fp->flags & _IOWRITE) && p && len) {
+            fp->pos = 0;
+            while (len) {
+                ssize_t wsz = write(fp->hd, p, len);
+                if (wsz <= 0) {
+                    if (p > fp->buf) memcpy(fp->buf, p, len);
+                    fp->pos = len;
+                    rc = -1; break;
+                }
+                p += wsz; len -= wsz;
             }
-            p += wsz; len -= wsz;
         }
     }
-    return 0;
+    return rc;
 }
 
 int _allocbuf(FILE *fp) {
@@ -437,11 +442,6 @@ int fprintf(FILE *fp, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int n = vfprintf(fp, fmt, ap);
     va_end(ap); return n;
-}
-
-int fflushall(void) {
-    int rc = 0; for (FILE *fp = _iob; fp < _iob + NFILE; fp++) rc |= fflush(fp);
-    return rc;
 }
 
 int fclose(FILE *fp) {
