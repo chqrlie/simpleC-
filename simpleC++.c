@@ -1706,6 +1706,19 @@ static void e_load_sbyte(void) {
     emit("    sar rax, 56");
 }
 
+// Narrow a value in rax to a signed 8-bit one, sign-extended back out.
+//
+// A cast has to CONVERT, not just relabel. `(char)129` is -127, and until this
+// existed the cast was a no-op, so `(char)129 != c` was true even when c held
+// exactly that byte -- a comparison between a value that had been through a
+// char and one that had not.
+static void e_trunc_char(void) {
+    if (!g_minimal) { emit("    movsx rax, al"); return; }
+    emit("    and rax, 255");
+    emit("    shl rax, 56");
+    emit("    sar rax, 56");
+}
+
 static int g_need_divmod = 0;
 
 // A comparison has already been emitted; leave 1 or 0 in rax.
@@ -1976,7 +1989,17 @@ static Type *gen_expr(Node *n) {
         emit("    mov rax, %d", ty_size(t));
         return ty_long();
     }
-    case N_CAST: gen_expr(n->lhs); return n->type;
+    case N_CAST:
+        gen_expr(n->lhs);
+        // `int` and `long` are both 64-bit here, and a cast to a pointer only
+        // changes what the arithmetic scales by -- neither needs a conversion.
+        // `char` does: it is the one narrower type this compiler has.
+        //
+        // NOTE: `unsigned` is parsed and ignored, so `(unsigned char)200`
+        // sign-extends to -56 rather than staying 200. Mask with `& 255` when
+        // that matters, which is what the byte-emitting code here does.
+        if (n->type && n->type->kind == TY_CHAR) e_trunc_char();
+        return n->type;
     case N_DEREF: {
         Type *t = gen_expr(n->lhs);
         Type *pt = is_ptrish(t) ? t->ptr : ty_long();
