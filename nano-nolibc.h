@@ -2,72 +2,15 @@
 #ifndef NANO_NOLIBC_H
 #define NANO_NOLIBC_H
 
-// --- String functions (pure C) ---
-long strlen(const char *s) { long n=0; while(s[n]) n++; return n; }
-void *memcpy(void *d, const void *s, long n) {
-    char *a=(char*)d; const char *b=(const char*)s;
-    while(n--) *a++=*b++; return d;
-}
-void *memset(void *d, int c, long n) {
-    char *a=(char*)d; while(n--) *a++=(char)c; return d;
-}
-int strcmp(const char *a, const char *b) {
-    while(*a && *a==*b){a++;b++;} return (unsigned char)*a-(unsigned char)*b;
-}
-
-// --- Syscall trampoline ---
-// All syscalls go through this one naked asm function.
-// Args are passed via globals to avoid needing extended asm syntax.
-long _a1, _a2, _a3, _a4, _a5, _a6, _n, _ret;
-
-void _do_syscall() {
-    // nano_cc passes the __asm__ body straight through to the assembler
-    // (GNU as, .intel_syntax noprefix). Globals are addressed RIP-relative.
-    __asm__(
-        "mov rax, [rip + _n]\n"
-        "mov rdi, [rip + _a1]\n"
-        "mov rsi, [rip + _a2]\n"
-        "mov rdx, [rip + _a3]\n"
-        "mov r10, [rip + _a4]\n"
-        "mov r8,  [rip + _a5]\n"
-        "mov r9,  [rip + _a6]\n"
-        "syscall\n"
-        "mov [rip + _ret], rax\n"
-    );
-}
-
-static inline long syscall1(long n, long a1) {
-    _n=n; _a1=a1; _do_syscall(); return _ret;
-}
-static inline long syscall2(long n, long a1, long a2) {
-    _n=n; _a1=a1; _a2=a2; _do_syscall(); return _ret;
-}
-static inline long syscall3(long n, long a1, long a2, long a3) {
-    _n=n; _a1=a1; _a2=a2; _a3=a3; _do_syscall(); return _ret;
-}
-
-// --- Syscall numbers ---
-#define SYS_read   0
-#define SYS_write  1
-#define SYS_open   2
-#define SYS_close  3
-#define SYS_mmap   9
-#define SYS_exit   60
-
-// --- POSIX wrappers ---
-long write(int fd, const char *buf, long len) {
-    return syscall3(SYS_write, fd, (long)buf, len);
-}
-int  open(const char *path, int flags) {
-    return syscall2(SYS_open, (long)path, flags);
-}
-int  close(int fd) {
-    return syscall1(SYS_close, fd);
-}
-void exit(int code) {
-    syscall1(SYS_exit, code);
-    while(1);
-}
+// The syscall layer, the string/memory routines and the stdarg macros now live
+// in nano-base.h, shared with nano-libc.h. Everything below is what makes this
+// header the SMALL one: a bare puts, an integer printer, and a printf that
+// handles %d %x %c %s and %%.
+//
+// If you want a real C library — FILE, fopen, malloc, a full formatter —
+// include nano-libc.h INSTEAD of this file. Note that this puts() does not
+// append a newline and C's does; nano-libc.h follows C.
+#include "nano-base.h"
 
 void puts(const char *s) { write(1, s, strlen(s)); }
 

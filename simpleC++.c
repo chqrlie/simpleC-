@@ -148,7 +148,10 @@ static void expand_line(const char *in) {
                         i = t;                     // consume through ')'
                         changed = 1;
                     } else {                       // name not followed by '(' -> literal
-                        for (int q = 0; word[q]; q++) OPUT(word[q]);
+                        // `wi`, not `q`: a `char q` is already live in this
+                        // function for the quote character, and locals here
+                        // are one slot per NAME per function
+                        for (int wi = 0; word[wi]; wi++) OPUT(word[wi]);
                     }
                 } else if (m) {                    // object-like macro
                     for (const char *p = m->value; *p; p++) OPUT(*p);
@@ -318,7 +321,7 @@ enum {
     T_KSTRUCT, T_KUNION, T_KSIZEOF,
     T_KSWITCH, T_KCASE, T_KDEFAULT,
     T_KTYPEDEF, T_KENUM,
-    T_KGOTO,
+    T_KGOTO, T_KSTATIC,
     T_EOF
 };
 
@@ -389,6 +392,11 @@ static void lex(void) {
             } else {
                 while (sp < SRC_LEN && isdigit((unsigned char)SRC[sp])) v = v * 10 + (SRC[sp++] - '0');
             }
+            // integer suffixes: 100L, 1U, 5UL, 7ll. Everything is 64-bit
+            // and signed here, so they carry no information -- but they are
+            // legal C and a lexer that stops at the digits reports a syntax
+            // error two tokens later, pointing at the wrong thing.
+            while (sp < SRC_LEN && (SRC[sp]=='u'||SRC[sp]=='U'||SRC[sp]=='l'||SRC[sp]=='L')) sp++;
             toks[ntok].ival = v; add_tok(T_NUM); continue;
         }
         if (isalpha((unsigned char)c) || c == '_') {
@@ -418,9 +426,15 @@ static void lex(void) {
             else if (!strcmp(buf, "typedef"))  k = T_KTYPEDEF;
             else if (!strcmp(buf, "enum"))     k = T_KENUM;
             else if (!strcmp(buf, "goto"))     k = T_KGOTO;
+            // `static` used to be dropped with the other qualifiers. At file
+            // scope that is harmless -- it only changes linkage. Inside a
+            // function it changes STORAGE DURATION, and dropping it silently
+            // put the object on the stack, so `return &t;` handed back a
+            // pointer into a dead frame.
+            else if (!strcmp(buf, "static"))   k = T_KSTATIC;
             else if (!strcmp(buf, "__asm__") || !strcmp(buf, "asm")) k = T_KASM;
             else if (!strcmp(buf, "const") || !strcmp(buf, "unsigned") ||
-                     !strcmp(buf, "signed") || !strcmp(buf, "static") ||
+                     !strcmp(buf, "signed") ||
                      !strcmp(buf, "inline") || !strcmp(buf, "register") ||
                      !strcmp(buf, "volatile") || !strcmp(buf, "extern")) continue;   // qualifier: drop
             if (k == T_ID) snprintf(toks[ntok].text, sizeof(toks[ntok].text), "%s", buf);
@@ -618,6 +632,26 @@ static void typedef_add(const char *name, Type *t) {
     e->type = t; e->next = typedefs; typedefs = e;
 }
 
+// ---- static locals ----
+// A function-scope `static` is a GLOBAL that only one function can name. It is
+// given a global of its own, called `<function>.<name>` -- the dot cannot occur
+// in a C identifier, so the generated name can never collide with a real one --
+// and uses of the name inside that function are rewritten to it while parsing.
+// `global` is sized like Sym.name: that is the real limit on a symbol name here.
+typedef struct SAlias { char name[256]; char global[256]; struct SAlias *next; } SAlias;
+static SAlias *saliases = NULL;
+static char cur_fn[256] = "";
+static const char *salias_find(const char *name) {
+    for (SAlias *a = saliases; a; a = a->next) if (!strcmp(a->name, name)) return a->global;
+    return NULL;
+}
+static void salias_add(const char *name, const char *global) {
+    SAlias *a = calloc(1, sizeof(SAlias));
+    snprintf(a->name, sizeof(a->name), "%s", name);
+    snprintf(a->global, sizeof(a->global), "%s", global);
+    a->next = saliases; saliases = a;
+}
+
 // ---- enum constant table ----
 // An enumerator is a compile-time integer constant, not a variable, so it is
 // resolved in the parser and never reaches codegen as a name.
@@ -639,7 +673,8 @@ static void enum_add(const char *name, long v) {
 static int is_type_start_at(int idx) {
     int k = toks[idx].kind;
     if (k == T_KINT || k == T_KLONG || k == T_KCHAR || k == T_KVOID ||
-        k == T_KSTRUCT || k == T_KUNION || k == T_KENUM || k == T_KTYPEDEF) return 1;
+        k == T_KSTRUCT || k == T_KUNION || k == T_KENUM || k == T_KTYPEDEF ||
+        k == T_KSTATIC) return 1;
     return k == T_ID && typedef_find(toks[idx].text) != NULL;
 }
 static int is_type_start(void) { return is_type_start_at(P); }
@@ -683,6 +718,8 @@ static Node *parse_stmt(void);
 static Type *parse_type_base_only(void);
 static Type *parse_array_suffix(Type *base);
 static void  parse_typedef(void);
+static void  global_init(Sym *g, Node *init);
+static Sym  *add_global(const char *name, Type *t);
 static long  eval_const(Node *n);
 
 // A constant expression: the conditional-expression grammar, folded now.
@@ -785,7 +822,10 @@ static Node *parse_primary(void) {
         if (enum_find(nm, &ev)) {          // an enumerator folds to its value
             Node *n = new_node(N_NUM); n->ival = ev; n->type = ty_int(); return n;
         }
-        Node *n = new_node(N_VAR); snprintf(n->name, sizeof(n->name), "%s", nm); return n;
+        const char *sa = salias_find(nm);  // a static local lives under its own name
+        Node *n = new_node(N_VAR);
+        snprintf(n->name, sizeof(n->name), "%s", sa ? sa : nm);
+        return n;
     }
     die_at(P, "expression expected"); return 0;
 }
@@ -977,8 +1017,36 @@ static Node *parse_decl_stmt(void) {
         parse_typedef();
         return new_node(N_BLOCK);
     }
+    int is_static = eat(T_KSTATIC);
     Type *base = parse_type_base_only();   // fwd-declared below
     Node *blk = new_node(N_BLOCK);
+
+    if (is_static) {
+        // Static storage, not automatic: one object for the whole program,
+        // initialised once at load time from a constant expression. It becomes
+        // a global under a private name and emits no code here at all.
+        for (;;) {
+            Type *t = base;
+            while (eat(T_STAR)) t = ptr_to(t);
+            char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
+            t = parse_array_suffix(t);
+            // Half the budget each, so a pathologically long function name
+            // cannot push the variable name out of the generated symbol.
+            char gname[256];
+            snprintf(gname, sizeof gname, "%.120s.%.120s",
+                     cur_fn[0] ? cur_fn : "_file", nm);
+            Sym *g = add_global(gname, t);
+            if (eat(T_ASSIGN)) {
+                Node *init = parse_initializer();
+                infer_array_len(t, init);
+                global_init(g, init);
+            }
+            salias_add(nm, gname);
+            if (!eat(T_COMMA)) break;
+        }
+        expect(T_SEMI);
+        return blk;
+    }
     if (eat(T_SEMI)) return blk;           // bare  struct Foo { ... };  (type only)
     for (;;) {
         Type *t = base;
@@ -1251,6 +1319,15 @@ static void flatten_init(Sym *g, Node *init, Type *t, int off) {
         add_reloc(g, off, init->lhs->name);
         return;
     }
+    // `struct Tok *p = toks;` -- an array name used on its own is its address,
+    // the same relocation as &toks[0], with no & written
+    if (init->kind == N_VAR) {
+        Sym *src = sym_find(globals, init->name);
+        if (src && src->type && src->type->is_array) {
+            add_reloc(g, off, init->name);
+            return;
+        }
+    }
     put_int(g->initdata, off, eval_const(init), ty_size(t));
 }
 
@@ -1263,6 +1340,8 @@ static void global_init(Sym *g, Node *init) {
 
 static void parse_toplevel(void) {
     if (at(T_KTYPEDEF)) { parse_typedef(); return; }
+    eat(T_KSTATIC);        // at file scope this is linkage only; everything is
+                           // one translation unit here, so it changes nothing
     Type *base = parse_type_base_only();
     if (eat(T_SEMI)) return;                // bare  struct Foo { ... };  /  enum { A };
     Type *t = base;
@@ -1298,7 +1377,10 @@ static void parse_toplevel(void) {
         }
         expect(T_RP);
         if (eat(T_SEMI)) return;                       // prototype / extern decl — no body to emit
+        saliases = NULL;                               // static locals are per function
+        snprintf(cur_fn, sizeof cur_fn, "%s", nm);
         fn->body = parse_block();
+        cur_fn[0] = 0;
         if (!funcs) funcs = funcs_tail = fn; else { funcs_tail->next = fn; funcs_tail = fn; }
         return;
     }
@@ -1335,10 +1417,27 @@ static void collect_locals(Node *n) {
         case N_BLOCK: case N_INIT:
                       for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]);
                       break;
-        case N_DECL:
-            if (!sym_find(locals, n->name)) add_local(n->name, n->type);
+        case N_DECL: {
+            // Locals are per FUNCTION, not per block: every declaration of a
+            // name shares one stack slot. Two `int i` loop counters are fine
+            // and idiomatic, but a name reused at a DIFFERENT type would alias
+            // two different objects onto the same bytes -- silently. Refuse
+            // that rather than miscompile it.
+            Sym *prev = sym_find(locals, n->name);
+            if (!prev) add_local(n->name, n->type);
+            else if (ty_size(prev->type) != ty_size(n->type) ||
+                     prev->type->kind != n->type->kind ||
+                     prev->type->is_array != n->type->is_array) {
+                char m[512];
+                snprintf(m, sizeof m,
+                         "local '%s' is declared twice at different types in one "
+                         "function; block-scoped shadowing is not supported, "
+                         "rename one of them", n->name);
+                die_node(n, m);
+            }
             if (n->init) collect_locals(n->init);
             break;
+        }
         case N_IF: case N_TERNARY:
         // N_SWITCH was missing here, so a variable declared inside a switch
         // body never got a stack slot and lookup() later returned NULL.
@@ -1498,7 +1597,12 @@ static void emit_global(Sym *g, int nasm) {
         for (int k = i; k < end; k++) {
             if (col == 0) fputs(nasm ? " db " : "    .byte ", fout);
             else          fputs(", ", fout);
-            fprintf(fout, "%d", g->initdata[k]);
+            // `& 255` explicitly: this compiler accepts `unsigned` and
+            // ignores it, so a self-built nano_cc reads initdata[k] as a
+            // SIGNED char and would print -1 where gcc prints 255. Same
+            // byte to the assembler, different text -- which breaks a
+            // byte-for-byte comparison of the two compilers' output.
+            fprintf(fout, "%d", g->initdata[k] & 255);
             if (++col >= 32) { fputc('\n', fout); col = 0; }
         }
         if (col) fputc('\n', fout);
@@ -1511,14 +1615,15 @@ static void emit_db_bytes(const char *label, const unsigned char *b, int len, in
     if (label) fprintf(fout, "%s:", label);
     fprintf(fout, " db ");
     for (i = 0; i < len; i++) {
-        int printable = b[i] >= 32 && b[i] <= 126 && b[i] != '"';
+        int by = b[i] & 255;                  // see the note in emit_global
+        int printable = by >= 32 && by <= 126 && by != '"';
         if (printable) {
             if (!inq) { if (!first) fputs(", ", fout); fputc('"', fout); inq = 1; }
-            fputc(b[i], fout);
+            fputc(by, fout);
         } else {
             if (inq) { fputc('"', fout); inq = 0; }
             if (!first) fputs(", ", fout);
-            fprintf(fout, "%d", b[i]);
+            fprintf(fout, "%d", by);
         }
         first = 0;
         if (++col >= 60) { if (inq) { fputc('"', fout); inq = 0; } fputs("\n db ", fout); col = 0; first = 1; }
@@ -1743,7 +1848,15 @@ static Type *gen_addr(Node *n) {
     if (n->kind == N_MEMBER) {                      // &(s.field)
         Type *st = gen_addr(n->lhs);               // rax = &struct
         Member *m = find_member(st, n->name);
-        if (!m) die_node(n, "no such struct member");
+        if (!m) {
+            // Kept to three arguments: this compiler allows six per call, and
+            // it has to be able to compile itself.
+            char msg[512];
+            snprintf(msg, sizeof msg, "no member '%.60s' in type kind %d tag '%.60s'",
+                     n->name, st ? st->kind : -1,
+                     st && st->tag[0] ? st->tag : "(untagged)");
+            die_node(n, msg);
+        }
         if (m->offset) emit("    add rax, %d", m->offset);
         return m->type;
     }
@@ -1756,10 +1869,30 @@ static Type *static_typeof(Node *n) {
         case N_NUM:    return n->type ? n->type : ty_long();
         case N_STR:    return ptr_to(ty_char());
         case N_CAST:   return n->type;
-        case N_VAR:  { Sym *s = lookup(n->name); return s ? s->type : ty_long(); }
+        case N_VAR:  { Sym *s = lookup(n->name);
+                       if (!s) die_node(n, "sizeof an undeclared identifier");
+                       return s->type; }
         case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
-                         return m ? m->type : ty_long(); }
-        case N_DEREF: { Type *t = static_typeof(n->lhs); return is_ptrish(t) ? t->ptr : ty_long(); }
+                         // Returning `long` here when the member is unknown is
+                         // how `sizeof(toks[i].text)` quietly became 8 instead
+                         // of 256: the wrong ANSWER, not an error. A wrong
+                         // sizeof is far worse than a stopped build.
+                         if (!m) die_node(n, "sizeof a member that does not exist");
+                         return m->type; }
+        case N_DEREF: { Type *t = static_typeof(n->lhs);
+                        if (!is_ptrish(t)) die_node(n, "sizeof a dereference of a non-pointer");
+                        return t->ptr; }
+        // Pointer arithmetic keeps the pointer's type -- without this,
+        // `a[i]` (which is `*(a + i)`) had no type at all, and every sizeof
+        // through an indexed array silently answered 8.
+        case N_BIN: { Type *lt = static_typeof(n->lhs);
+                      if (is_ptrish(lt)) return lt;
+                      Type *rt = static_typeof(n->rhs);
+                      if (is_ptrish(rt)) return rt;
+                      return ty_long(); }
+        case N_ASSIGN: return static_typeof(n->lhs);
+        case N_PRE: case N_POST: return static_typeof(n->lhs);
+        case N_TERNARY: return static_typeof(n->lhs);
         case N_ADDR:   return ptr_to(static_typeof(n->lhs));
         case N_CALL: { Type *rt = fnsig_find(n->name); return rt ? rt : ty_long(); }
         default:       return ty_long();
@@ -1777,7 +1910,7 @@ static void gen_string(Node *n) {
     emit("    .section .rodata");
     fprintf(fout, ".LC%d: .string \"", id);
     for (int i = 0; i < n->slen; i++) {
-        unsigned char ch = (unsigned char)n->str[i];
+        int ch = n->str[i] & 255;             // see the note in emit_global
         switch (ch) {
             case '\n': fputs("\\n", fout); break;  case '\t': fputs("\\t", fout); break;
             case '\r': fputs("\\r", fout); break;  case '"':  fputs("\\\"", fout); break;
@@ -1945,9 +2078,10 @@ static Type *gen_expr(Node *n) {
         int op = n->op;
         if (op == T_PLUS || op == T_MINUS) {
             if (is_ptrish(lt) && !is_ptrish(rt)) {
-                int s = elem_size(lt); if (s > 1) e_imul_const("rcx", s);
+                // `esz`, not `s`: a `Sym *s` is already live in this function
+                int esz = elem_size(lt); if (esz > 1) e_imul_const("rcx", esz);
             } else if (!is_ptrish(lt) && is_ptrish(rt) && op == T_PLUS) {
-                int s = elem_size(rt); if (s > 1) e_imul_const("rax", s);
+                int esz = elem_size(rt); if (esz > 1) e_imul_const("rax", esz);
             }
             emit(op == T_PLUS ? "    add rax, rcx" : "    sub rax, rcx");
             return is_ptrish(lt) ? lt : (is_ptrish(rt) ? rt : ty_long());
@@ -2332,6 +2466,15 @@ int main(int argc, char **argv) {
         // hosted freestanding entry point: run main, then exit(rax)
         emit(g_nasm ? "global _start" : "    .globl _start");
         emit("_start:");
+        // The kernel leaves argc at [rsp] and argv immediately above it, in
+        // memory -- not in registers. Without this main() reads whatever was
+        // left in rdi/rsi. No demo takes arguments, so nothing caught it, but
+        // nano_cc itself reads argv. `add` rather than `lea`: the minimal
+        // instruction set has no lea.
+        emit("    mov rdi, [rsp]");        // argc
+        emit("    mov rax, rsp");
+        emit("    add rax, 8");
+        emit("    mov rsi, rax");          // argv
         emit("    call main");
         emit("    mov rdi, rax");
         emit("    mov rax, 60");
@@ -2381,7 +2524,7 @@ int main(int argc, char **argv) {
             for (DataStr *d = datastrs; d; d = d->next) {
                 fprintf(fout, ".LD%d: .string \"", d->id);
                 for (int i = 0; i < d->len; i++) {
-                    unsigned char ch = (unsigned char)d->bytes[i];
+                    int ch = d->bytes[i] & 255;   // see the note in emit_global
                     switch (ch) {
                         case '\n': fputs("\\n", fout); break;  case '\t': fputs("\\t", fout); break;
                         case '\r': fputs("\\r", fout); break;  case '"':  fputs("\\\"", fout); break;
