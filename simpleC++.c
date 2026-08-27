@@ -727,6 +727,7 @@ static void fnsig_add(const char *name, Type *ret) {
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_ternary(void);
+static Node *parse_unary(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(void);
 static Type *parse_array_suffix(Type *base);
@@ -812,7 +813,13 @@ static Node *parse_primary(void) {
         if (is_type_start()) {
             Type *t = parse_type();
             expect(T_RP);
-            Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_assign();
+            // A cast binds to a UNARY-expression, not to whatever follows.
+            // With parse_assign here, `(char *)b + 40` parsed as
+            // `(char *)(b + 40)` -- so the addition scaled by sizeof(*b)
+            // instead of by one, and the result was 40 times too far along.
+            // It only ever looked correct when the element size happened to
+            // be 0 or 1.
+            Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_unary();
             return n;
         }
         Node *n = parse_expr(); expect(T_RP); return n;
