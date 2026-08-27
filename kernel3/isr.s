@@ -1,0 +1,222 @@
+/* isr.s — 256 interrupt stubs, and the machinery C cannot express.
+ *
+ * An IDT entry holds the ADDRESS of a handler, and the CPU arrives there with
+ * a hardware stack frame it expects to leave with `iretq` — neither of which a
+ * C function can do. So every vector gets a two-instruction stub here that
+ * normalises the frame and jumps to one common path, which saves the register
+ * file and calls a single C dispatcher with a pointer to it.
+ *
+ * Two things the stubs exist to even out:
+ *
+ *   - Only vectors 8, 10..14 and 17, 21, 29, 30 push an error code. The rest do
+ *     not. If the handler is going to treat every frame the same way, the ones
+ *     without have to push a zero in its place, or the stack layout differs by
+ *     eight bytes depending on which fault happened.
+ *
+ *   - The vector number is nowhere in the hardware frame. The only way to know
+ *     which interrupt fired is for the stub that was entered to say so.
+ *
+ * The dispatcher is chosen by NUMBER, not by a function pointer table, because
+ * nano_cc has no function pointers. `isr_table` below is a plain array of
+ * addresses that C reads to fill in the IDT.
+ */
+.code64
+.section .text
+
+.extern isr_dispatch
+
+/* The frame the dispatcher sees, from its pointer downwards:
+ *
+ *   +0   r15 r14 r13 r12 r11 r10 r9 r8              (8 * 8 bytes)
+ *   +64  rbp rdi rsi rdx rcx rbx rax                (7 * 8)
+ *   +120 vector
+ *   +128 error code
+ *   +136 rip cs rflags rsp ss                       (the CPU's own frame)
+ *
+ * The C side has the same layout written out as a struct; if one changes the
+ * other has to, and the fault report is the thing that would go quietly wrong.
+ */
+isr_common:
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    mov %rsp, %rdi              /* one argument: a pointer to the frame */
+    cld                         /* the ABI wants DF clear on entry to C */
+    call isr_dispatch
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+
+    add $16, %rsp               /* drop the vector and the error code */
+    iretq
+
+/* isr_noerr N: the CPU pushed no error code, so push a zero in its place. */
+.macro isr_noerr n
+.globl isr\n
+isr\n:
+    push $0
+    push $\n
+    jmp isr_common
+.endm
+
+/* isr_err N: the CPU already pushed an error code. */
+.macro isr_err n
+.globl isr\n
+isr\n:
+    push $\n
+    jmp isr_common
+.endm
+
+/* Exceptions 0..31: only these push an error code. */
+isr_noerr 0
+isr_noerr 1
+isr_noerr 2
+isr_noerr 3
+isr_noerr 4
+isr_noerr 5
+isr_noerr 6
+isr_noerr 7
+isr_err   8
+isr_noerr 9
+isr_err   10
+isr_err   11
+isr_err   12
+isr_err   13
+isr_err   14
+isr_noerr 15
+isr_noerr 16
+isr_err   17
+isr_noerr 18
+isr_noerr 19
+isr_noerr 20
+isr_err   21
+isr_noerr 22
+isr_noerr 23
+isr_noerr 24
+isr_noerr 25
+isr_noerr 26
+isr_noerr 27
+isr_noerr 28
+isr_err   29
+isr_err   30
+isr_noerr 31
+
+/* Everything above 31 is a device or software interrupt: no error code. */
+.altmacro
+.set vec, 32
+.rept 224
+    isr_noerr %vec
+    .set vec, vec + 1
+.endr
+
+/* A plain array of the 256 stub addresses, so the C side can fill in the IDT
+ * without needing function pointers. */
+.section .rodata
+.align 8
+.globl isr_table
+isr_table:
+/* `.quad isr%vec` does not work directly: %-substitution only happens on macro
+ * ARGUMENTS, so the address has to be emitted from inside a macro. */
+.macro tblent n
+    .quad isr\n
+.endm
+.set vec, 0
+.rept 256
+    tblent %vec
+    .set vec, vec + 1
+.endr
+
+.section .text
+
+/* long isr_table_addr(void) — hand C the address of that array. */
+.globl isr_table_addr
+isr_table_addr:
+    lea isr_table(%rip), %rax
+    ret
+
+/* void idt_load(long descriptor_address) */
+.globl idt_load
+idt_load:
+    lidt (%rdi)
+    ret
+
+.globl cli_
+cli_:
+    cli
+    ret
+
+.globl sti_
+sti_:
+    sti
+    ret
+
+/* void cpu_idle(void) — enable interrupts and stop the core until one
+ * arrives. `sti` does not take effect until after the NEXT instruction, which
+ * is what makes this pair atomic: an interrupt cannot slip in between the two
+ * and leave the CPU halted with nothing left to wake it. Writing it the other
+ * way round is the classic lost-wakeup hang. */
+.globl cpu_idle
+cpu_idle:
+    sti
+    hlt
+    ret
+
+/* void cpu_halt_forever(void) */
+.globl cpu_halt_forever
+cpu_halt_forever:
+    cli
+1:  hlt
+    jmp 1b
+
+/* long read_cr2(void) — the faulting address, for a page fault. */
+.globl read_cr2
+read_cr2:
+    mov %cr2, %rax
+    ret
+
+/* long read_cr3(void) */
+.globl read_cr3
+read_cr3:
+    mov %cr3, %rax
+    ret
+
+/* long read_rsp(void) */
+.globl read_rsp
+read_rsp:
+    mov %rsp, %rax
+    ret
+
+/* void io_wait(void) — a throwaway write to an unused port, the traditional
+ * short delay the 8259s need between initialisation words on old hardware. */
+.globl io_wait
+io_wait:
+    mov $0x80, %dx
+    xor %eax, %eax
+    out %al, %dx
+    ret

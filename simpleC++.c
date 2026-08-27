@@ -570,7 +570,10 @@ struct Node {
     Type *type;             // result / declared type
     Node *lhs, *rhs, *cond, *els, *init;
     Node *args[8]; int nargs;
-    Node *body[512]; int nbody;   // N_BLOCK statements
+    // N_BLOCK statements / N_INIT elements. A growable list, not a fixed
+    // array: a data table like a bitmap font is thousands of initialisers, and
+    // a fixed 512 also made every Node 4 KB whether it needed the room or not.
+    Node **body; int nbody; int bodycap;
     char *asmtext;                // N_ASM decoded text
     int   tok;                    // token index, for error messages
 };
@@ -581,6 +584,16 @@ static int P = 0;                        // token cursor (declared early: nodes 
 // after parsing -- can still point at a line of source instead of at nothing.
 static Node *new_node(int k) { Node *n = calloc(1, sizeof(Node)); n->kind = k; n->ival = -1; n->tok = P; return n; }
 static void die_node(Node *n, const char *msg) { die_at(n ? n->tok : -1, msg); }
+
+static void node_push(Node *n, Node *child) {
+    if (n->nbody >= n->bodycap) {
+        int cap = n->bodycap ? n->bodycap * 2 : 8;
+        Node **nb = calloc((size_t)cap, sizeof(Node *));
+        for (int i = 0; i < n->nbody; i++) nb[i] = n->body[i];
+        n->body = nb; n->bodycap = cap;
+    }
+    n->body[n->nbody++] = child;
+}
 
 // ---- symbols ----
 // A global's initialiser is flattened at compile time into a byte image plus a
@@ -959,9 +972,7 @@ static Node *parse_initializer(void) {
     if (eat(T_LBRACE)) {
         Node *n = new_node(N_INIT);
         while (!at(T_RBRACE) && !at(T_EOF)) {
-            if (n->nbody >= (int)(sizeof n->body / sizeof n->body[0]))
-                die("too many initialisers in one brace list");
-            n->body[n->nbody++] = parse_initializer();
+            node_push(n, parse_initializer());
             if (!eat(T_COMMA)) break;
         }
         expect(T_RBRACE);
@@ -1056,7 +1067,7 @@ static Node *parse_decl_stmt(void) {
         Node *d = new_node(N_DECL); snprintf(d->name, sizeof(d->name), "%s", nm); d->type = t;
         if (eat(T_ASSIGN)) d->init = parse_initializer();
         infer_array_len(t, d->init);
-        blk->body[blk->nbody++] = d;
+        node_push(blk, d);
         if (!eat(T_COMMA)) break;
     }
     expect(T_SEMI);
@@ -1101,7 +1112,7 @@ static void parse_typedef(void) {
 static Node *parse_block(void) {
     expect(T_LBRACE);
     Node *n = new_node(N_BLOCK);
-    while (!at(T_RBRACE) && !at(T_EOF)) n->body[n->nbody++] = parse_stmt();
+    while (!at(T_RBRACE) && !at(T_EOF)) node_push(n, parse_stmt());
     expect(T_RBRACE);
     return n;
 }
@@ -2393,6 +2404,11 @@ static void gen_func(Func *fn) {
     cur_va_off = va_off; cur_named = fn->nparams;
     int fs = (frame_size + 15) & ~15;
 
+    // Every function gets external linkage, which is what C says a
+    // non-static function has. Only `main` and `_start` used to be exported,
+    // so a second object file could not call anything here -- the kernel's
+    // assembly stubs could not reach their own C dispatcher.
+    emit(g_nasm ? "global %s" : "    .globl %s", asm_sym(fn->name));
     emit("%s:", asm_sym(fn->name));
     e_push("rbp");
     emit("    mov rbp, rsp");
