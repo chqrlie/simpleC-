@@ -1,0 +1,19 @@
+# Build products. The two screenshots are kept because the READMEs show them.
+*.o
+*.ppm
+*.log
+*.clean
+shell.s
+gfx.s
+gfxshell.s
+blob-gfx.s
+blob-gshell.s
+kernel64.elf
+kernel64.bin
+kernel.elf
+gfx64.elf
+gfx64.bin
+gfx.elf
+gshell64.elf
+gshell64.bin
+gshell.elf
