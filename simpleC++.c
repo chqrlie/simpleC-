@@ -13,6 +13,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -919,37 +920,59 @@ static size_t lex(const char *p) {
 // =====================================================================
 // 3. TYPES
 // =====================================================================
-enum { TY_INT, TY_CHAR, TY_SHORT, TY_LONG, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM };
-typedef struct Type Type;
-typedef struct Member { atom_t name; int offset, align, pad; Type *type; struct Node *init; struct Member *next; } Member;
-struct Type {
-    unsigned char kind, align; bool is_unsigned; int pos;
-    union {
-        int size;         // all types
-        struct {          // TY_ARRAY / TY_PTR
-            int arr_size__; // TY_ARRAY
-            int arr_len;  // TY_ARRAY
-            Type *ptr;    // TY_ARRAY / TY_PTR
-            struct Node *arr_len_expr; // TY_ARRAY
-        };
-        struct {          // TY_STRUCT / TY_UNION
-            int struct_size;
-            atom_t tag;
-            Member *members; // TY_STRUCT / TY_UNION
-        };
-    };
+enum {
+    TY_INT, TY_SCHAR, TY_SHORT, TY_LONG, // signed types
+    TY_UINT, TY_UCHAR, TY_USHORT, TY_ULONG, // unsigned types
+    TY_CHAR, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM
+};
+const char *type_name[] = {
+    "int", "signed char", "short", "long",
+    "unsigned int", "unsigned char", "unsigned short", "unsigned long",
+    "char", "void", "ptr", "array", "struct", "union", "enum"
 };
 
-static Type ty_char_s   = { TY_CHAR,  1, false, 0, { 0 }}; // should be unsigned
-static Type ty_schar_s  = { TY_CHAR,  1, false, 0, { 0 }};
-static Type ty_uchar_s  = { TY_CHAR,  1, true,  0, { 0 }};
-static Type ty_short_s  = { TY_SHORT, 2, false, 0, { 0 }};
-static Type ty_ushort_s = { TY_SHORT, 2, true,  0, { 0 }};
-static Type ty_int_s    = { TY_INT,   4, false, 0, { 0 }};
-static Type ty_uint_s   = { TY_INT,   4, true,  0, { 0 }};
-static Type ty_long_s   = { TY_LONG,  8, false, 0, { 0 }};
-static Type ty_ulong_s  = { TY_LONG,  8, true,  0, { 0 }};
-static Type ty_void_s   = { TY_VOID,  1, false, 0, { 0 }};
+typedef struct Type {
+    unsigned char kind, align; bool is_unsigned; int pos;
+    union {
+        struct {            // TY_INT ... TY_ULONG
+            int size__;
+            long min; unsigned long max;
+        };
+        struct {            // TY_ENUM
+            int enum_size;
+            int enum_count;
+            struct Type *enum_type;
+            struct Sym *enum_syms;
+        };
+        struct {            // TY_ARRAY / TY_PTR
+            int arr_size__; // TY_ARRAY
+            int arr_len;    // TY_ARRAY
+            struct Type *ptr;  // TY_ARRAY / TY_PTR
+            struct Node *arr_len_expr; // TY_ARRAY
+        };
+        struct {            // TY_STRUCT / TY_UNION
+            int struct_size;
+            atom_t tag;
+            struct Member *members; // TY_STRUCT / TY_UNION
+        };
+        int size;           // all types
+    };
+} Type;
+typedef struct Member {
+    atom_t name; unsigned char align, pad; int offset;
+    Type *type; struct Node *init; struct Member *next;
+} Member;
+
+static Type ty_char_s   = { TY_CHAR,   1, false, 0, {{ 1, -128, 127 }}}; // should be unsigned
+static Type ty_schar_s  = { TY_SCHAR,  1, false, 0, {{ 1, -128, 127 }}};
+static Type ty_short_s  = { TY_SHORT,  2, false, 0, {{ 2, -32768, 32768 }}};
+static Type ty_int_s    = { TY_INT,    4, false, 0, {{ 4, INT_MIN, INT_MAX }}};
+static Type ty_long_s   = { TY_LONG,   8, false, 0, {{ 8, LONG_MIN, LONG_MAX }}};
+static Type ty_uchar_s  = { TY_UCHAR,  1, true,  0, {{ 1, 0, 255 }}};
+static Type ty_ushort_s = { TY_USHORT, 2, true,  0, {{ 2, 0, 65535 }}};
+static Type ty_uint_s   = { TY_UINT,   4, true,  0, {{ 4, 0, UINT_MAX }}};
+static Type ty_ulong_s  = { TY_ULONG,  8, true,  0, {{ 8, 0, ULONG_MAX }}};
+static Type ty_void_s   = { TY_VOID,   1, false, 0, {{ 0, 0, 0 }}};
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -961,6 +984,12 @@ static Type ty_void_s   = { TY_VOID,  1, false, 0, { 0 }};
 #define ty_long()    &ty_long_s
 #define ty_ulong()   &ty_ulong_s
 #define ty_void()    &ty_void_s
+
+static const char *type_str(const Type *t) {
+    if (!t) return "<null>";
+    if ((unsigned)t->kind > TY_ENUM) return "<invalid>";
+    return type_name[t->kind];
+}
 
 static Type *ptr_to(Type *base) {
     Type *t = allocz(1, sizeof(Type)); t->align = 8; t->kind = TY_PTR; t->ptr = base; return t;
@@ -1077,7 +1106,8 @@ static Node *new_node(int k) {
 }
 static Node *new_node1(int k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
 static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
-static Node *new_num_node(long ival, Type *t) { Node *n = new_node(N_NUM); n->ival = ival; n->type = t; return n; }
+static Node *set_num_node(Node *n, Type *t, long ival) { n->kind = N_NUM; n->flags |= CONST_VAL; n->type = t; n->ival = ival; return n; }
+static Node *new_num_node(Type *t, long ival) { return set_num_node(new_node(N_NUM), t, ival); }
 static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
 static int node_length(Node *n) { int len = 0; while (n) { len++; n = n->next; } return len; }
 
@@ -1125,6 +1155,55 @@ static Type *find_typedef(atom_t name) {
         if (typedefs[i]->name == name) return typedefs[i]->type;
     }
     return NULL;
+}
+
+// ---- values ----
+typedef struct Value {
+    union { long ival; unsigned long uval; };
+    Type *type;
+} Value;
+
+static bool value_init(Value *vp, Type *t, long ival) {
+    vp->type = t;
+    vp->ival = ival;
+    return true;
+}
+static char *value_str(Value *vp, char *buf, size_t size) {
+    if (vp->type->is_unsigned) snprintf(buf, size, "%lu", vp->uval);
+    else snprintf(buf, size, "%ld", vp->ival);
+    return buf;
+}
+static bool value_check_range(Value *vp, Type *t) {
+    while (t) {
+        switch (t->kind) {
+        case TY_ENUM: t = t->enum_type; break;
+        case TY_CHAR:
+        case TY_INT: case TY_SCHAR: case TY_SHORT: case TY_LONG:
+            return vp->ival >= t->min && vp->ival <= (long)t->max;
+        case TY_UINT: case TY_UCHAR: case TY_USHORT: case TY_ULONG:
+            return vp->uval <= t->max;
+        default:      return false;
+        }
+    }
+    return false;
+}
+static bool value_cast(Value *vp, Type *t) {
+    while (t) {
+        switch (t->kind) {
+        case TY_CHAR:
+        case TY_SCHAR: case TY_SHORT:  case TY_INT:  case TY_LONG:
+            if (vp->ival & t->min) vp->ival |= ~t->max; vp->type = t; return true;
+        case TY_UCHAR: case TY_USHORT: case TY_UINT: case TY_ULONG:
+            vp->uval &= t->max; vp->type = t; return true;
+        case TY_VOID:  case TY_PTR:
+            vp->type = t; return true;
+        case TY_ARRAY: case TY_STRUCT: case TY_UNION: // error?
+            return false;
+        case TY_ENUM:    t = t->enum_type; continue;
+        default: return false;
+        }
+    }
+    return false;
 }
 
 // =====================================================================
@@ -1179,7 +1258,7 @@ static struct Label *add_label(Node *n);
 static struct Label *find_label(atom_t name);
 static Node *parse_const_expr(void);
 static Node *parse_init(void);
-static bool eval_expr(Node *n, long *vp);
+static bool eval_const_expr(Node *n, Value *vp, const char *context);
 
 static Type *parse_ptr_to(Type *base) {
     while (eat(T_STAR)) {
@@ -1267,42 +1346,76 @@ static Type *parse_struct(int kind) {
     return st;
 }
 
-// enum specifier:  enum [tag] [ { members [= value], } ]
+// enum specifier:  enum [tag] [ : impl-type] [ { members [= value], } ]
 static Type *parse_enum(void) {
     int pos = cur()->pos; P++;
+    Type *et = NULL;
+    if (eat(T_COLON)) {
+        int flags;
+        et = parse_type_base_only(&flags);
+        if (et->kind >= TY_VOID) error(NULL, "invalid enum underlying type");
+    }
     atom_t tag = at(T_ID) ? getid() : 0;
     Type *st = tag_get(tag, TY_ENUM, pos);
-    if (eat(T_LBRACE)) {                           // definition
-        Member **tailp = &st->members;
-        long off = 0;
-        int align = 4;
+    if (st->enum_type) {
+        if (at(T_LBRACE)) warning(pos, "enum type already defined");
+        if (et && st->enum_type != et) warning(pos, "enum type inconsistent with previous declaration");
+    } else {
+        st->enum_type = et;
+    }
+    if (eat(T_LBRACE)) {  // definition
+        Sym **tailp = &st->enum_syms; // XXX: should be a list of DECL
+        bool has_negative = false;
+        unsigned long max_val = 0;
+        Value v;
+        value_init(&v, ty_int(), -1);
         while (!at(T_RBRACE) && !at(T_EOF)) {
             int pos = toks[P].pos;
             atom_t name = getid();
-            Member *m = allocz(1, sizeof(Member));
-            m->name = name;
-            if (eat(T_ASSIGN)) {
-                m->init = parse_const_expr();
-                if (!eval_expr(m->init, &off))
-                    error(m->init, "expression is not constant");
-            }
-            if (align < 2 && (off < -128 || off > -127)) align = 2;
-            if (align < 4 && (off < -32768 || off > -32767)) align = 4;
-            if (off < -2147483648 || off > -2147483647) align = 8;
-            m->offset = (int)off;   // m->offset should be a long
-            *tailp = m;
-            tailp = &m->next;
             Sym *s = add_global(name, pos, st);
+            s->name = name;
+            if (eat(T_ASSIGN)) {
+                s->init = parse_const_expr();
+                eval_const_expr(s->init, &v, "enum value");
+                if (value_check_range(&v, ty_int())) v.type = ty_int();
+            } else {
+                if (v.type == ty_int() && v.ival == INT_MAX) v.type = ty_long();
+                else if (v.type == ty_uint() && v.uval == UINT_MAX) v.type = ty_ulong();
+                else if ((v.type == ty_long() && v.ival == LONG_MAX)
+                     ||  (v.type == ty_ulong() && v.uval == ULONG_MAX))
+                    error(NULL, "enum value cannot exceed the range of possible types");
+                v.uval++;
+            }
+            if (et) {
+                if (!value_check_range(&v, st->enum_type)) {
+                    warning(pos, "enum value exceeds range of underlying type %s", type_str(et));
+                }
+                value_cast(&v, et);
+            } else {
+                if (v.type->is_unsigned) { if (v.uval > max_val) max_val = v.uval; }
+                else if (v.ival >= 0) { if ((unsigned long)v.ival > max_val) max_val = v.ival; }
+                else  { has_negative = true; if (~(unsigned long)v.ival > max_val) max_val = ~(unsigned long)v.ival; }
+            }
+            s->type = v.type;
+            s->ival = v.ival;
             s->is_global = 1;
             s->is_constant = 1;
-            s->ival = off;
-            s->init = m->init;
-            off++;
+            *tailp = s;
+            tailp = &s->next;
+            st->enum_count++;
             if (!eat(T_COMMA)) break;
         }
-        st->align = align;
+        if (!et) {
+            if (max_val <= INT_MAX) st->enum_type = ty_int();
+            else if (max_val <= UINT_MAX && !has_negative) st->enum_type = ty_uint();
+            else if (max_val <= LONG_MAX) st->enum_type = ty_long();
+            else if (!has_negative) st->enum_type = ty_ulong();
+            else error(NULL, "no available type to accommodate all enum values");
+        }
         expect(T_RBRACE);
     }
+    st->align = st->enum_type->align;
+    st->enum_size = st->enum_type->size;
     return st;
 }
 
@@ -1342,11 +1455,17 @@ static Node *parse_primary(void) {
         }
         Node *n = parse_expr(); expect(T_RP); return n;
     }
-    if (at(T_NUM))  { Node *n = new_num_node(cur()->ival, cur()->is_unsigned ?
-                                             (cur()->is_long ? ty_ulong() : ty_uint()) :
-                                             (cur()->is_long ? ty_long() : ty_int()));
-                      P++; return n; }
-    if (at(T_CHAR)) { Node *n = new_num_node(cur()->ival, ty_int());  P++; return n; }
+    if (at(T_NUM))  {
+        Token *tp = cur();
+        Type *t = ty_int();
+        unsigned long mask = tp->uval;
+        if (tp->is_long) mask |= LONG_MAX;
+        if (mask > LONG_MAX) t = ty_ulong();
+        else if (mask > UINT_MAX) t = tp->is_unsigned ? ty_ulong() : ty_long();
+        else if (mask > INT_MAX) t = (tp->is_unsigned || tp->base != 10) ? ty_uint() : ty_long();
+        Node *n = new_num_node(t, tp->ival); P++; return n;
+    }
+    if (at(T_CHAR)) { Node *n = new_num_node(ty_int(), cur()->ival);  P++; return n; }
     if (at(T_STR))  { return parse_string(); }
     if (at(T_ID)) {
         atom_t nm = getid();
@@ -1406,6 +1525,7 @@ static Node *parse_unary(void) {
         }
         return n;
     }
+    case T_PLUS:
     case T_MINUS:
     case T_NOT:
     case T_BITNOT: { Node *n = new_node(N_UNARY); P++; n->lhs = parse_unary(); return n; }
@@ -1758,78 +1878,119 @@ static Node *parse_stmt(void) {
 static Sym *lookup(atom_t name, Node *n);
 static Type *static_typeof(Node *n);
 
-static bool eval_expr(Node *n, long *vp) {
-    long v1, v2;
+static bool eval_expr(Node *n, Value *vp) {
+    if (n->flags & CONST_VAL) { return value_init(vp, n->type, n->ival); }
+    Value v1; v1.type = NULL; v1.uval = 0;
     switch (n->kind) {
-    case N_EXPR: return eval_expr(n->lhs, vp);
-    case N_NUM:  *vp = n->ival; return true;
+    case N_EXPR:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        break;
+    //case N_NUM: value_init(&v1, n->type, n->ival); break; // always has CONST_VAL
     case N_VAR: {
         Sym *s = lookup(n->name, n);
-        if (!s->is_constant) {
-            s->is_constant = eval_expr(s->init, &s->ival);
-            if (!s->is_constant) error(n, "symbol is not constant: '%s'", atom_str(n->name));
+        // const qualified variables should be accepted too
+        if (!s->is_constant) return false;
+#if 0 // XXX: done at parse time for now
+        if (s->init) {
+            if (!eval_expr(s->init, &v1)) {
+                error(n, "symbol is not constant: '%s'", atom_str(n->name));
+                return false;
+            }
+            if (!s->type) s->type = v1.type;
+            s->ival = v1.ival;
         }
-        *vp = s->ival; return true;
+#endif
+        value_init(&v1, s->type, s->ival);
+        break;
     }
     case N_SIZEOF: {
         Type *t = n->type ? n->type : static_typeof(n->lhs);
-        *vp = ty_size(t);
-        return true;
+        value_init(&v1, t, ty_size(t)); break;
     }
     case N_CAST:
-        if (!eval_expr(n->lhs, vp)) return false;
-        // XXX: should apply cast
-        return true;
+        if (!eval_expr(n->lhs, &v1)) return false;
+        value_cast(&v1, n->type); break;    // XXX: check return value and complain
     case N_TERNARY:
         if (!eval_expr(n->cond, &v1)) return false;
-        return eval_expr(v1 ? n->lhs : n->rhs, vp);
+        if (!eval_expr(v1.uval ? n->lhs : n->rhs, &v1)) return false;
+        // XXX: should find common type
+        break;
     case N_UNARY:
         if (!eval_expr(n->lhs, &v1)) return false;
         switch (n->op) {
-        case T_MINUS: *vp = -v1; return true;
-        case T_PLUS: *vp = v1; return true;
-        case T_BITNOT: *vp = ~v1; return true;
-        default: break;
+        case T_MINUS:  v1.uval = -v1.uval; break;
+        case T_PLUS:   break;
+        case T_BITNOT: v1.uval = ~v1.uval; value_cast(&v1, v1.type); break;
+        case T_NOT:    v1.uval = !v1.uval; break;
+        default: return false;
         }
         break;
     case N_LOGAND:
         if (!eval_expr(n->lhs, &v1)) return false;
-        if (v1 && !eval_expr(n->rhs, &v1)) return false;
-        *vp = (v1 != 0);
-        return true;
+        if (v1.uval && !eval_expr(n->rhs, &v1)) return false;
+        v1.uval = (v1.uval != 0); break;
     case N_LOGOR:
         if (!eval_expr(n->lhs, &v1)) return false;
-        if (!v1 && !eval_expr(n->rhs, &v1)) return false;
-        *vp = (v1 != 0);
-        return true;
+        if (!v1.uval && !eval_expr(n->rhs, &v1)) return false;
+        v1.uval = (v1.uval != 0); break;
     case N_BIN:
         if (!eval_expr(n->lhs, &v1)) return false;
+        Value v2; v2.type = NULL; v2.uval = 0;
         if (!eval_expr(n->rhs, &v2)) return false;
+        // XXX: should find common type except for T_COMMA. T_COMMA should be a different node kind
+        // XXX: signed/unsigned arithmetics still not correct in case of different sizes
+        bool is_unsigned = v1.type->is_unsigned | v2.type->is_unsigned;
         switch (n->op) {
-        case T_PLUS:    *vp = v1 + v2;  return true;
-        case T_MINUS:   *vp = v1 - v2;  return true;
-        case T_STAR:    *vp = v1 * v2;  return true;
-        case T_SLASH:   *vp = v2 ? v1 / v2 : 0;  return true;   // XXX: check overflow
-        case T_PERCENT: *vp = v2 ? v1 % v2 : 0;  return true;   // XXX: check overflow
-        case T_AMP:     *vp = v1 & v2;  return true;
-        case T_BITOR:   *vp = v1 | v2;  return true;
-        case T_BITXOR:  *vp = v1 ^ v2;  return true;
-        case T_SHL:     *vp = v1 << v2; return true;
-        case T_SHR:     *vp = v1 >> v2; return true;
-        case T_LT:      *vp = v1 < v2;  return true;
-        case T_GT:      *vp = v1 > v2;  return true;
-        case T_LE:      *vp = v1 <= v2; return true;
-        case T_GE:      *vp = v1 >= v2; return true;
-        case T_EQ:      *vp = v1 == v2; return true;
-        case T_NE:      *vp = v1 != v2; return true;
-        case T_COMMA:   *vp = v2; return true;
+        case T_PLUS:    v1.uval += v2.uval; break;
+        case T_MINUS:   v1.uval -= v2.uval; break;
+        case T_STAR:    v1.uval *= v2.uval; break;
+        case T_SLASH:   if (is_unsigned) { if (!v2.uval) goto overflow; v1.uval /= v2.uval; }
+                        else { if (!v2.ival || (v1.ival == LONG_MIN && v2.ival == -1)) goto overflow; v1.ival /= v2.ival; }
+                        break;
+        case T_PERCENT: if (is_unsigned) { if (!v2.uval) goto overflow; v1.uval %= v2.uval; }
+                        else { if (!v2.ival || (v1.ival == LONG_MIN && v2.ival == -1)) goto overflow; v1.ival %= v2.ival; }
+                        break;
+        case T_AMP:     v1.uval &= v2.uval; break;
+        case T_BITOR:   v1.uval |= v2.uval; break;
+        case T_BITXOR:  v1.uval ^= v2.uval; break;
+        case T_SHL:     v1.uval <<= v2.uval & 63; break;
+        case T_SHR:     v1.uval >>= (v2.uval &= 63);   // emulate signed right shift
+                        if (!v1.type->is_unsigned) v1.uval |= ~((1UL << (63 - v2.uval)) - 1); break;
+        case T_LT:      if (is_unsigned) v1.uval = v1.uval < v2.uval;  else v1.uval = v1.ival < v2.ival;  break;
+        case T_GT:      if (is_unsigned) v1.uval = v1.uval > v2.uval;  else v1.uval = v1.ival > v2.ival;  break;
+        case T_LE:      if (is_unsigned) v1.uval = v1.uval <= v2.uval; else v1.uval = v1.ival <= v2.ival; break;
+        case T_GE:      if (is_unsigned) v1.uval = v1.uval >= v2.uval; else v1.uval = v1.ival >= v2.ival; break;
+        case T_EQ:      v1.uval = v1.uval == v2.uval; break;
+        case T_NE:      v1.uval = v1.uval != v2.uval; break;
+        case T_COMMA:   v1.uval = v2.uval; break;
         default:
-            error(n, "bad binary operator '%s'", token_name[n->op]);
-            break;
+            error(n, "bad binary operator '%s'", token_name[n->op]); return false;
+        overflow:
+            error(n, "division overflow in constant expression"); return false;
         }
         break;
+    default:
+        error(n, "invalid expression"); return false;
     }
-    return false;
+    if (!n->type) n->type = v1.type;
+    if (!value_check_range(&v1, n->type)) {
+        char buf[32];
+        warning(n->pos, "%s is too large for type %s",
+                value_str(&v1, buf, sizeof(buf)), type_str(n->type));
+    }
+    value_cast(&v1, n->type);
+    vp->type = v1.type;
+    vp->uval = v1.uval;
+    n->flags |= CONST_VAL;
+    return true;
+}
+
+static bool eval_const_expr(Node *n, Value *vp, const char *context) {
+    if (!eval_expr(n, vp) || !(n->flags & CONST_VAL)) {
+        if (context) error(n, "%s is not constant", context);
+        return false;
+    }
+    return true;
 }
 
 // ---- top level ----
@@ -1999,7 +2160,7 @@ static bool check_rewrite(Node *n) {
         if (n->nargs != 1 || !(n->flags & DISCARD)) break;
         Node *arg = n->rhs; if (arg->kind != N_STR) break;
         const char *fmt = atom_str(arg->str);
-        if (!*fmt) { n->kind = N_NUM; n->ival = 0; n->type = ty_int(); return true; }
+        if (!*fmt) { set_num_node(n, ty_int(), 0); return true; }
         size_t len = strlen(fmt);
         if (strchr(fmt, '%') || fmt[len-1] != '\n') break;
         n->name = ID_PUTS;
@@ -2010,8 +2171,8 @@ static bool check_rewrite(Node *n) {
         if (n->nargs != 1) break;
         Node *arg = n->rhs; if (arg->kind != N_STR) break;
         const char *s = atom_str(arg->str);
-        size_t len = strlen(s); // do not use atom len to allow embedded nuls
-        n->kind = N_NUM; n->uval = len; n->type = ty_ulong();
+        // do not use atom len to allow embedded nuls
+        set_num_node(n, ty_ulong(), strlen(s));
         return true;
     }
     case ID_STRCPY: {   // optimize strcpy(dest, "str");
@@ -2020,7 +2181,7 @@ static bool check_rewrite(Node *n) {
         const char *s = atom_str(arg2->str);
         long len = (long)strlen(s); // do not use atom len to allow embedded nuls
         n->name = ID_MEMCPY;
-        arg2->next = new_num_node(len + 1, ty_ulong());
+        arg2->next = new_num_node(ty_ulong(), len + 1);
         arg2->next->pos = arg2->pos;
         n->nargs = 3;
         return true;
@@ -2449,7 +2610,9 @@ static bool all_simple_load(Node *n) {
 
 static Type *gen_expr(Node *n, int r, bool save_rax) {
     const char *reg = reg64[r];
+    if (n->flags & CONST_VAL) goto has_num;
     switch (n->kind) {
+    has_num:
     case N_NUM:  emit("mov %s, %ld", reg, n->ival); return n->type ? n->type : ty_long();
     case N_STR:  return load_string(n, r);
     case N_VAR:  return load_var(n, r);
@@ -2731,13 +2894,17 @@ static void gen_switch(Node *n) {
     // XXX: should check for duplicates
     int def = 0, end = 0;
     for (Node *e = n->lhs; e; e = e->lhs) {
-        long val;
         e->lab = label_id++;
         if (e->kind == N_CASE) {
-            if (!eval_expr(e->cond, &val)) error(e->cond, "'case' expression is not constant");
-            e->cond->ival = val;
+            Value v;
+            eval_const_expr(e->cond, &v, "'case' expression");
             gen_case_comment(e);
-            emit("cmp rax, %ld", val);
+            if (value_check_range(&v, ty_int())) {
+                emit("cmp rax, %ld", v.ival);
+            } else {
+                emit("mov rdx, %ld", v.ival);
+                emit("cmp rax, rdx");
+            }
             emit_jmp(n, "jz", e->lab);
         } else {
             def = e->lab;
@@ -2889,22 +3056,20 @@ static void gen_func(Func *fn) {
 
 static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
     if (init) {
-        long ival;
+        Value v;
         switch (t->kind) {
         case TY_VOID:
             break;
-        case TY_INT:
-        case TY_CHAR:
-        case TY_SHORT:
-        case TY_LONG:
-        case TY_ENUM:
-            if (eval_expr(init, &ival)) {
+        case TY_INT: case TY_SCHAR: case TY_SHORT: case TY_LONG:
+        case TY_UINT: case TY_UCHAR: case TY_USHORT: case TY_ULONG:
+        case TY_CHAR: case TY_ENUM:
+            if (eval_const_expr(init, &v, "initializer")) {
                 emit_comment(mname);
                 switch (t->align) {
-                case 1: emit(".byte %ld", ival); return;
-                case 2: emit(".short %ld", ival); return;
-                case 4: emit(".long %ld", ival); return;
-                case 8: emit(".quad %ld", ival); return;
+                case 1: emit(".byte %ld", v.ival); return;
+                case 2: emit(".short %ld", v.ival); return;
+                case 4: emit(".long %ld", v.ival); return;
+                case 8: emit(".quad %ld", v.ival); return;
                 default: warning(t->pos, "invalid alignment %d for type %d", t->align, t->kind); exit(1);
                 }
             }
@@ -2917,11 +3082,9 @@ static void gen_init(Type *t, atom_t name, Node *init, const char *mname) {
                     return;
                 }
             }
-            if (init->kind == N_NUM) {
-                if (eval_expr(init, &ival)) {
-                    emit_comment(mname); emit(".quad %ld", ival);
-                    return;
-                }
+            if (eval_const_expr(init, &v, NULL)) {
+                emit_comment(mname); emit(".quad %ld", v.ival);
+                return;
             }
             // XXX: support other initializers: char buf[100], *p = buf;
             break;

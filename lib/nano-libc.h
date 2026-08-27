@@ -29,9 +29,9 @@ typedef long va_list;
 #define INT_MAX 2147483647
 #define INT_MIN (-INT_MAX-1)
 #define UINT_MAX 0xffffffffU
-#define LONG_MAX 9223372036854775807
+#define LONG_MAX 9223372036854775807L
 #define LONG_MIN (-LONG_MAX-1)
-#define LOMG_MAX 0xffffffffffffffffUL
+#define ULONG_MAX 0xffffffffffffffffUL
 
 // ctype.h
 // should use a byte table

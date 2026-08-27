@@ -41,9 +41,9 @@ INC = lib/nano-nolibc.h lib/nano-libc.h lib/nano-malloc.h lib/nano-printf.h
 
 all: $(BIN)
 
-$(BIN): $(SRC) $(INC)
-	$(CC) $(CFLAGS)    '$(SRC)' -o $@
-	$(CC) $(CFLAGS) -g '$(SRC)' -o $@_g
+$(BIN): $(SRC) $(INC) Makefile
+	$(CC) $(CFLAGS) '$(SRC)' -o $@
+	$(CC) $(CFLAGS) -O0 -g '$(SRC)' -o $@_g
 
 build:
 	@mkdir -p $(TMP)
