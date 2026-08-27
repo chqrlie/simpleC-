@@ -1,8 +1,18 @@
 # simpleC++
 
-gcc -o nano_cc nano_cc.c          # build the compiler<br>
+gcc -o nano_cc simpleC++.c          # build the compiler<br>
 ./nano_cc kernel.c kernel.s       # compile your kernel<br>
 gcc -nostdlib -T linker.ld kernel.s -o kernel.elf   # link for bare metal<br>
+
+<br>
+v2 designed to work with this selfHostingAssembler https://github.com/netpipe/SelfHostedAssembler/ with --minimal flag
+<br>
+$ ./nano_cc --minimal --nasm printf.c prog.asm $ ./mini_asm # reads prog.asm, writes a.out $ ./a.out
+<br>
+
+
+
+
 
 i was hoping to compile this with chibicc ,8cc or lcc minimal kind of compiler <br>
 

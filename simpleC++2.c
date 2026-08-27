@@ -490,6 +490,11 @@ static int ty_size(Type *t) {
         default:        return 8;
     }
 }
+// An array aligns like its element, not like its total size.
+static int ty_align(Type *t) {
+    if (t->is_array) return ty_align(t->ptr);
+    return t->kind == TY_CHAR ? 1 : 8;
+}
 static Member *find_member(Type *st, const char *name) {
     if (st->kind == TY_PTR) st = st->ptr;
     for (Member *m = st->members; m; m = m->next) if (!strcmp(m->name, name)) return m;
@@ -512,7 +517,8 @@ enum {
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
     N_MEMBER, N_SIZEOF,
-    N_SWITCH, N_CASE, N_DEFAULT
+    N_SWITCH, N_CASE, N_DEFAULT,
+    N_INIT                      // brace initializer list; elements in body[]
 };
 
 typedef struct Node Node;
@@ -532,7 +538,15 @@ struct Node {
 static Node *new_node(int k) { Node *n = calloc(1, sizeof(Node)); n->kind = k; n->ival = -1; return n; }
 
 // ---- symbols ----
-typedef struct Sym { char name[256]; Type *type; int is_global; int offset; struct Sym *next; } Sym;
+// A global's initialiser is flattened at compile time into a byte image plus a
+// list of "put this symbol's address here" fixups, because an initialiser like
+//   char *ARGREG[6] = { "rdi", "rsi", ... }
+// is part bytes and part relocations and the two have to be emitted in order.
+typedef struct Reloc { int offset; char label[64]; struct Reloc *next; } Reloc;
+
+typedef struct Sym { char name[256]; Type *type; int is_global; int offset;
+                     unsigned char *initdata; int initlen; Reloc *relocs;
+                     struct Sym *next; } Sym;
 static Sym *globals = NULL;
 
 // per-function local table (params + locals), built during offset pass
@@ -582,6 +596,7 @@ static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(void);
+static Type *parse_array_suffix(Type *base);
 
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
 static Type *parse_struct_specifier(void) {
@@ -600,13 +615,12 @@ static Type *parse_struct_specifier(void) {
                 Type *mt = mbase;
                 while (eat(T_STAR)) mt = ptr_to(mt);
                 char mnm[256]; snprintf(mnm, sizeof(mnm), "%s", cur()->text); expect(T_ID);
-                if (eat(T_LBRK)) {                 // array member
-                    long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-                    Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = mt;
-                    arr->is_array = 1; arr->arr_len = (int)len; mt = arr;
-                }
+                mt = parse_array_suffix(mt);       // buf[8], grid[2][2], ...
                 int msz = ty_size(mt);
-                int align = msz < 8 ? (msz ? msz : 1) : 8;
+                // An array aligns like its ELEMENT. Using its total size gave
+                // char buf[3] an alignment of 3, which is not a power of two
+                // and made the mask in the line below round to nonsense.
+                int align = ty_align(mt);
                 Member *m = calloc(1, sizeof(Member));
                 snprintf(m->name, sizeof(m->name), "%s", mnm); m->type = mt;
                 if (is_union) { m->offset = 0; if (msz > maxsz) maxsz = msz; }
@@ -783,6 +797,62 @@ static Node *parse_assign(void) {
 }
 static Node *parse_expr(void) { return parse_assign(); }
 
+// An initialiser is either a brace list (possibly nested, possibly with a
+// trailing comma) or an ordinary assignment-expression.
+static Node *parse_initializer(void) {
+    if (eat(T_LBRACE)) {
+        Node *n = new_node(N_INIT);
+        while (!at(T_RBRACE) && !at(T_EOF)) {
+            if (n->nbody >= (int)(sizeof n->body / sizeof n->body[0]))
+                die("too many initialisers in one brace list");
+            n->body[n->nbody++] = parse_initializer();
+            if (!eat(T_COMMA)) break;
+        }
+        expect(T_RBRACE);
+        return n;
+    }
+    return parse_assign();
+}
+
+// A declarator's array suffixes: `[]`, `[3]`, `[2][3]`, ... Built innermost
+// first, so `long m[2][3]` is array-2-of(array-3-of long) and ty_size falls
+// out of the recursion. Only the outermost length may be left open.
+static Type *parse_array_suffix(Type *base) {
+    int dims[8], nd = 0;
+    while (eat(T_LBRK)) {
+        long len = -1;                          // -1 = infer from the initialiser
+        if (!at(T_RBRK)) { len = cur()->ival; expect(T_NUM); }
+        expect(T_RBRK);
+        if (nd >= (int)(sizeof dims / sizeof dims[0])) die("too many array dimensions");
+        dims[nd++] = (int)len;
+    }
+    for (int i = nd - 1; i >= 0; i--) {
+        if (dims[i] < 0 && i != 0) die("only the first array dimension may be omitted");
+        Type *arr = calloc(1, sizeof(Type));
+        arr->kind = TY_PTR; arr->ptr = base;
+        arr->is_array = 1; arr->arr_len = dims[i];
+        base = arr;
+    }
+    return base;
+}
+
+// How many elements an initialiser supplies, for `int t[] = { ... }`.
+static int init_extent(Node *init, Type *elem) {
+    if (!init) return 0;
+    if (init->kind == N_INIT) return init->nbody;
+    if (init->kind == N_STR && elem && elem->kind == TY_CHAR) return init->slen + 1;
+    return 1;
+}
+
+// `int t[] = {1,2,3}` / `char s[] = "hi"` — fill in the length the declarator
+// left open. Only the outermost dimension can be inferred, as in C.
+static void infer_array_len(Type *t, Node *init) {
+    if (t && t->is_array && t->arr_len < 0) {
+        t->arr_len = init_extent(init, t->ptr);
+        if (t->arr_len == 0) die("array needs an explicit size or a non-empty initialiser");
+    }
+}
+
 // a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
 static Node *parse_decl_stmt(void) {
     Type *base = parse_type_base_only();   // fwd-declared below
@@ -792,13 +862,10 @@ static Node *parse_decl_stmt(void) {
         Type *t = base;
         while (eat(T_STAR)) t = ptr_to(t);
         char nm[256]; snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
-        if (eat(T_LBRK)) {                          // array: char buf[24];
-            long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-            Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = t;
-            arr->is_array = 1; arr->arr_len = (int)len; t = arr;
-        }
+        t = parse_array_suffix(t);                  // char buf[24]; buf[]; m[2][3];
         Node *d = new_node(N_DECL); snprintf(d->name, sizeof(d->name), "%s", nm); d->type = t;
-        if (eat(T_ASSIGN)) d->init = parse_assign();
+        if (eat(T_ASSIGN)) d->init = parse_initializer();
+        infer_array_len(t, d->init);
         blk->body[blk->nbody++] = d;
         if (!eat(T_COMMA)) break;
     }
@@ -901,6 +968,136 @@ typedef struct Func { char name[256]; Node *params[8]; int nparams; Type *ptype[
                       int is_variadic; Node *body; struct Func *next; } Func;
 static Func *funcs = NULL, *funcs_tail = NULL;
 
+// =====================================================================
+// 5b. GLOBAL INITIALISERS
+//
+// A global's initialiser has to become bytes in the object file, not code, so
+// it is folded at compile time into a byte image plus a list of relocations.
+// Strings referenced from a global initialiser get their own pool (.LD*) so
+// they can be emitted next to the data rather than through the code path.
+// =====================================================================
+typedef struct DataStr { int id; char *bytes; int len; struct DataStr *next; } DataStr;
+static DataStr *datastrs = NULL, *datastr_tail = NULL;
+static int datastr_count = 0;
+
+static int intern_datastr(const char *bytes, int len) {
+    DataStr *d = calloc(1, sizeof(DataStr));
+    d->id = datastr_count++; d->len = len;
+    d->bytes = malloc(len ? (size_t)len : 1);
+    memcpy(d->bytes, bytes, (size_t)len);
+    if (datastr_tail) datastr_tail->next = d; else datastrs = d;
+    datastr_tail = d;
+    return d->id;
+}
+
+static long eval_const(Node *n) {
+    if (!n) die("empty constant expression");
+    switch (n->kind) {
+    case N_NUM: return n->ival;
+    case N_CAST: return eval_const(n->lhs);
+    case N_SIZEOF:
+        if (n->type) return ty_size(n->type);
+        die("sizeof an expression is not allowed in a global initialiser");
+        break;
+    case N_UNARY:
+        switch (n->op) {
+        case T_MINUS:  return -eval_const(n->lhs);
+        case T_NOT:    return !eval_const(n->lhs);
+        case T_BITNOT: return ~eval_const(n->lhs);
+        }
+        break;
+    case N_BIN: {
+        long a = eval_const(n->lhs), b = eval_const(n->rhs);
+        switch (n->op) {
+        case T_PLUS:   return a + b;   case T_MINUS:  return a - b;
+        case T_STAR:   return a * b;
+        case T_SLASH:  return b ? a / b : 0;
+        case T_PERCENT:return b ? a % b : 0;
+        case T_AMP:    return a & b;   case T_BITOR:  return a | b;
+        case T_BITXOR: return a ^ b;   case T_SHL:    return a << b;
+        case T_SHR:    return a >> b;
+        case T_EQ:     return a == b;  case T_NE:     return a != b;
+        case T_LT:     return a <  b;  case T_GT:     return a >  b;
+        case T_LE:     return a <= b;  case T_GE:     return a >= b;
+        }
+        break;
+    }
+    case N_LOGAND: return eval_const(n->lhs) && eval_const(n->rhs);
+    case N_LOGOR:  return eval_const(n->lhs) || eval_const(n->rhs);
+    case N_TERNARY:return eval_const(n->cond) ? eval_const(n->lhs) : eval_const(n->rhs);
+    }
+    die("a global initialiser must be a compile-time constant");
+    return 0;
+}
+
+static void put_int(unsigned char *buf, int off, long v, int size) {
+    for (int i = 0; i < size; i++) buf[off + i] = (unsigned char)((v >> (8 * i)) & 0xff);
+}
+
+static void add_reloc(Sym *g, int off, const char *label) {
+    Reloc *r = calloc(1, sizeof(Reloc));
+    r->offset = off;
+    snprintf(r->label, sizeof r->label, "%s", label);
+    // keep the list sorted by offset: the emitter walks the image in order
+    Reloc **pp = &g->relocs;
+    while (*pp && (*pp)->offset < off) pp = &(*pp)->next;
+    r->next = *pp; *pp = r;
+}
+
+static void flatten_init(Sym *g, Node *init, Type *t, int off) {
+    if (!init) return;
+
+    // char buf[N] = "text"  — the bytes go straight in, NUL included if it fits
+    if (init->kind == N_STR && t->is_array && t->ptr->kind == TY_CHAR) {
+        int room = t->arr_len, n = init->slen < room ? init->slen : room;
+        for (int i = 0; i < n; i++) g->initdata[off + i] = (unsigned char)init->str[i];
+        return;                                   // the rest stays zero
+    }
+    // char *p = "text"  — a pointer to a pooled copy of the string
+    if (init->kind == N_STR) {
+        char lbl[64];
+        snprintf(lbl, sizeof lbl, ".LD%d", intern_datastr(init->str, init->slen));
+        add_reloc(g, off, lbl);
+        return;
+    }
+    if (init->kind == N_INIT) {
+        if (t->is_array) {
+            int esz = ty_size(t->ptr);
+            if (init->nbody > t->arr_len)
+                die("too many initialisers for this array");
+            for (int i = 0; i < init->nbody; i++)
+                flatten_init(g, init->body[i], t->ptr, off + i * esz);
+            return;
+        }
+        if (t->kind == TY_STRUCT) {
+            Member *m = t->members;
+            for (int i = 0; i < init->nbody; i++) {
+                if (!m) die("too many initialisers for this struct");
+                flatten_init(g, init->body[i], m->type, off + m->offset);
+                m = m->next;
+            }
+            return;
+        }
+        // { x } initialising a scalar
+        if (init->nbody == 0) return;             // { } / {0} on a scalar
+        flatten_init(g, init->body[0], t, off);
+        return;
+    }
+    // &global / a bare array or function name used as an address
+    if (init->kind == N_ADDR && init->lhs && init->lhs->kind == N_VAR) {
+        add_reloc(g, off, init->lhs->name);
+        return;
+    }
+    put_int(g->initdata, off, eval_const(init), ty_size(t));
+}
+
+static void global_init(Sym *g, Node *init) {
+    int sz = ty_size(g->type); if (sz < 1) sz = 8;
+    g->initdata = calloc(1, (size_t)sz);
+    g->initlen = sz;
+    flatten_init(g, init, g->type, 0);
+}
+
 static void parse_toplevel(void) {
     Type *base = parse_type_base_only();
     if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
@@ -927,13 +1124,15 @@ static void parse_toplevel(void) {
         if (!funcs) funcs = funcs_tail = fn; else { funcs_tail->next = fn; funcs_tail = fn; }
         return;
     }
-    // global variable(s):  type name [= ...] (, ...) ;   (initialisers ignored -> .bss)
+    // global variable(s):  type name [= ...] (, ...) ;
     for (;;) {
-        if (eat(T_LBRK)) { long len = cur()->ival; expect(T_NUM); expect(T_RBRK);
-            Type *arr = calloc(1, sizeof(Type)); arr->kind = TY_PTR; arr->ptr = t;
-            arr->is_array = 1; arr->arr_len = (int)len; add_global(nm, arr); }
-        else add_global(nm, t);
-        if (eat(T_ASSIGN)) parse_assign();             // parsed & discarded (zero-init in bss)
+        Type *vt = parse_array_suffix(t);
+        Sym *g = add_global(nm, vt);
+        if (eat(T_ASSIGN)) {
+            Node *init = parse_initializer();
+            infer_array_len(vt, init);
+            global_init(g, init);                  // flatten to bytes + relocations
+        }
         if (!eat(T_COMMA)) break;
         t = base; while (eat(T_STAR)) t = ptr_to(t);
         snprintf(nm, sizeof(nm), "%s", cur()->text); expect(T_ID);
@@ -955,7 +1154,9 @@ static Sym *add_local(const char *name, Type *t) {
 static void collect_locals(Node *n) {
     if (!n) return;
     switch (n->kind) {
-        case N_BLOCK: for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]); break;
+        case N_BLOCK: case N_INIT:
+                      for (int i = 0; i < n->nbody; i++) collect_locals(n->body[i]);
+                      break;
         case N_DECL:
             if (!sym_find(locals, n->name)) add_local(n->name, n->type);
             if (n->init) collect_locals(n->init);
@@ -1007,6 +1208,93 @@ static void  gen_stmt(Node *n);
 // operation. char, strings and printf all depend on it.
 static int g_minimal = 0;
 
+// --nasm emits the NASM subset the bootstrap assembler reads instead of GNU-as
+// Intel: `section`/`global` rather than `.section`/`.globl`, `db` rather than
+// `.string`/`.zero`, no `ptr` size keywords and no `offset`.
+//
+// The assembler produces one flat PT_LOAD, so there is nowhere to put a .rodata
+// section. String literals therefore cannot be emitted inline the way they are
+// in GNU-as mode - they would sit in the instruction stream and be executed.
+// They are pooled here and written out after the last function instead.
+static int g_nasm = 0;
+
+typedef struct StrLit { int id; char *bytes; int len; struct StrLit *next; } StrLit;
+static StrLit *strlits = NULL, *strlit_tail = NULL;
+
+static void strlit_add(int id, const char *bytes, int len) {
+    StrLit *sl = calloc(1, sizeof(StrLit));
+    sl->id = id; sl->len = len;
+    sl->bytes = malloc(len ? len : 1);
+    memcpy(sl->bytes, bytes, len);
+    if (strlit_tail) strlit_tail->next = sl; else strlits = sl;
+    strlit_tail = sl;
+}
+
+// Emit a byte run as `db`, keeping printable runs readable as quoted strings.
+// The assembler's db has no escape handling, so a quote or any non-printable
+// byte is emitted numerically.
+// Emit one global's storage. An initialised global is a byte image with
+// relocations punched through it, so the two have to come out interleaved in
+// offset order — a pointer element is `dq label`, everything else is raw bytes.
+static void emit_global(Sym *g, int nasm) {
+    int sz = ty_size(g->type); if (sz < 1) sz = 8;
+    if (!g->initdata) {
+        if (!nasm) { emit("%s: .zero %d", g->name, sz); return; }
+        fprintf(fout, "%s:", g->name);
+        for (int i = 0; i < sz; i++) {
+            if (i % 32 == 0) fputs(i ? "\n db " : " db ", fout);
+            else fputs(", ", fout);
+            fputc('0', fout);
+        }
+        fputc('\n', fout);
+        return;
+    }
+    fprintf(fout, "%s:\n", g->name);
+    Reloc *r = g->relocs;
+    int i = 0;
+    while (i < sz) {
+        while (r && r->offset < i) r = r->next;          // defensive: never walk backwards
+        if (r && r->offset == i) {
+            fprintf(fout, nasm ? " dq %s\n" : "    .quad %s\n", r->label);
+            i += 8; r = r->next;
+            continue;
+        }
+        int end = r && r->offset < sz ? r->offset : sz;
+        int col = 0;
+        for (int k = i; k < end; k++) {
+            if (col == 0) fputs(nasm ? " db " : "    .byte ", fout);
+            else          fputs(", ", fout);
+            fprintf(fout, "%d", g->initdata[k]);
+            if (++col >= 32) { fputc('\n', fout); col = 0; }
+        }
+        if (col) fputc('\n', fout);
+        i = end;
+    }
+}
+
+static void emit_db_bytes(const char *label, const unsigned char *b, int len, int nul) {
+    int i = 0, col = 0, inq = 0, first = 1;
+    if (label) fprintf(fout, "%s:", label);
+    fprintf(fout, " db ");
+    for (i = 0; i < len; i++) {
+        int printable = b[i] >= 32 && b[i] <= 126 && b[i] != '"';
+        if (printable) {
+            if (!inq) { if (!first) fputs(", ", fout); fputc('"', fout); inq = 1; }
+            fputc(b[i], fout);
+        } else {
+            if (inq) { fputc('"', fout); inq = 0; }
+            if (!first) fputs(", ", fout);
+            fprintf(fout, "%d", b[i]);
+        }
+        first = 0;
+        if (++col >= 60) { if (inq) { fputc('"', fout); inq = 0; } fputs("\n db ", fout); col = 0; first = 1; }
+    }
+    if (inq) fputc('"', fout);
+    if (nul) { if (!first) fputs(", ", fout); fputs("0", fout); }
+    else if (first) fputs("0", fout);          // empty run still needs an operand
+    fputc('\n', fout);
+}
+
 static void e_push(const char *r) {
     if (!g_minimal) { emit("    push %s", r); return; }
     emit("    sub rsp, 8");
@@ -1019,7 +1307,7 @@ static void e_pop(const char *r) {
 }
 // test rax, rax  ->  cmp rax, 0   (same flags for the zero test)
 static void e_test_rax(void) {
-    if (!g_minimal) { e_test_rax(); return; }
+    if (!g_minimal) { emit("    test rax, rax"); return; }
     emit("    cmp rax, 0");
 }
 static void e_neg_rax(void) {
@@ -1044,7 +1332,8 @@ static void e_lea_rip(const char *sym) {
     if (!g_minimal) { emit("    lea rax, [rip + %s]", sym); return; }
     // GAS Intel syntax reads a bare symbol as memory CONTENTS, so the address
     // has to be asked for explicitly. In NASM syntax this is plain `mov rax, sym`.
-    emit("    mov rax, offset %s", sym);
+    if (g_nasm) emit("    mov rax, %s", sym);
+    else        emit("    mov rax, offset %s", sym);
 }
 static void e_lea_local(int off) {          // rax = rbp - off
     if (!g_minimal) { emit("    lea rax, [rbp - %d]", off); return; }
@@ -1244,6 +1533,12 @@ static Type *static_typeof(Node *n) {
 
 static void gen_string(Node *n) {
     int id = label_id++;
+    if (g_nasm) {
+        strlit_add(id, n->str, n->slen);
+        char b[64]; snprintf(b, sizeof b, ".LC%d", id);
+        e_lea_rip(b);
+        return;
+    }
     emit("    .section .rodata");
     fprintf(fout, ".LC%d: .string \"", id);
     for (int i = 0; i < n->slen; i++) {
@@ -1287,6 +1582,10 @@ static Type *gen_expr(Node *n) {
     case N_DEREF: {
         Type *t = gen_expr(n->lhs);
         Type *pt = is_ptrish(t) ? t->ptr : ty_long();
+        // An array element that is itself an array does not get loaded: for
+        // `long m[2][3]`, m[0] is the ADDRESS of row 0, which the next index
+        // then walks. Loading here would treat m[0][0] as a pointer.
+        if (pt->is_array) return pt;
         load_rax(ty_size(pt));
         return pt;
     }
@@ -1380,6 +1679,10 @@ static Type *gen_expr(Node *n) {
         }
         if (!strcmp(n->name, "__builtin_va_end")) return ty_long();   // no-op
 
+        // Arguments 7 and beyond go on the stack in the SysV ABI, which this
+        // code generator does not implement — say so instead of walking off
+        // the end of ARGREG.
+        if (n->nargs > 6) die("more than 6 call arguments is not supported yet");
         for (int i = 0; i < n->nargs; i++) { gen_expr(n->args[i]); e_push("rax"); }
         for (int i = n->nargs - 1; i >= 0; i--) e_pop(ARGREG[i]);
         // eax is a 32-bit register, which the minimal target has no encoding for
@@ -1509,6 +1812,84 @@ static void emit_case_jumps(Node *n) {
     }
 }
 
+// ---- local brace initialisers ----------------------------------------------
+// The object is zeroed first and the supplied elements written over the top.
+// That is what C requires for a partial initialiser ({0} on a 256-byte array
+// must zero all 256), and it means the element walk never has to work out
+// which holes it left behind.
+//
+// `off` is a distance BELOW rbp, so byte k of an object at `off` lives at
+// rbp - (off - k). Sub-objects subtract their own offset the same way.
+
+static void gen_zero_local(int off, int size) {
+    if (size <= 0) return;
+    int slot = (size + 7) & ~7;                 // add_local rounds the slot up
+    if (slot > 128) {                           // big object: loop instead of unrolling
+        int top = label_id++;
+        e_lea_local(off);                       // rax = &obj[0]
+        emit("    mov rcx, rax");
+        emit("    mov rax, 0");
+        emit("    mov rdx, %d", slot / 8);
+        emit(".L%d:", top);
+        emit("    mov [rcx], rax");
+        emit("    add rcx, 8");
+        emit("    sub rdx, 1");
+        emit("    cmp rdx, 0");
+        emit("    jne .L%d", top);
+        return;
+    }
+    emit("    mov rax, 0");
+    for (int i = 0; i < slot; i += 8) emit("    mov [rbp - %d], rax", off - i);
+}
+
+static void gen_init_at(Node *init, Type *t, int off) {
+    if (!init) return;
+
+    // char buf[N] = "text"
+    if (init->kind == N_STR && t->is_array && t->ptr->kind == TY_CHAR) {
+        int room = t->arr_len, n = init->slen < room ? init->slen : room;
+        for (int i = 0; i < n; i++) {
+            if (!init->str[i]) continue;        // already zeroed
+            e_lea_local(off - i);
+            emit("    mov rcx, rax");
+            emit("    mov rax, %d", (unsigned char)init->str[i]);
+            emit("    mov [rcx], al");
+        }
+        return;
+    }
+    if (init->kind == N_INIT) {
+        if (t->is_array) {
+            int esz = ty_size(t->ptr);
+            if (init->nbody > t->arr_len) die("too many initialisers for this array");
+            for (int i = 0; i < init->nbody; i++)
+                gen_init_at(init->body[i], t->ptr, off - i * esz);
+            return;
+        }
+        if (t->kind == TY_STRUCT) {
+            Member *m = t->members;
+            for (int i = 0; i < init->nbody; i++) {
+                if (!m) die("too many initialisers for this struct");
+                gen_init_at(init->body[i], m->type, off - m->offset);
+                m = m->next;
+            }
+            return;
+        }
+        if (init->nbody == 0) return;           // {} / {0} on a scalar
+        gen_init_at(init->body[0], t, off);
+        return;
+    }
+    e_lea_local(off);
+    e_push("rax");
+    gen_expr(init);
+    e_pop("rcx");
+    store_rcx_rax(ty_size(t));
+}
+
+static void gen_local_init(Sym *s, Node *init) {
+    gen_zero_local(s->offset, ty_size(s->type));
+    gen_init_at(init, s->type, s->offset);
+}
+
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (int i = 0; i < n->nbody; i++) gen_stmt(n->body[i]); break;
@@ -1516,6 +1897,11 @@ static void gen_stmt(Node *n) {
     case N_DECL:
         if (n->init) {
             Sym *s = lookup(n->name);
+            if (n->init->kind == N_INIT ||
+                (n->init->kind == N_STR && s->type->is_array)) {
+                gen_local_init(s, n->init);
+                break;
+            }
             e_lea_local(s->offset);
             e_push("rax");
             gen_expr(n->init);
@@ -1623,8 +2009,18 @@ static void gen_func(Func *fn) {
     for (int i = 0; i < fn->nparams && i < 6; i++) {
         Sym *s = sym_find(locals, fn->params[i]->name);
         int sz = ty_size(s->type);
-        if (sz == 1) emit("    mov [rbp - %d], %s", s->offset,
-                          i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
+        if (sz == 1) {
+            // dil, sil and r8b..r15b all need a REX prefix to name at all. The
+            // minimal target only has the four REX-free byte registers, so the
+            // argument goes through rax first.
+            if (g_minimal) {
+                emit("    mov rax, %s", ARGREG[i]);
+                emit("    mov [rbp - %d], al", s->offset);
+            } else {
+                emit("    mov [rbp - %d], %s", s->offset,
+                     i==0?"dil":i==1?"sil":i==2?"dl":i==3?"cl":i==4?"r8b":"r9b");
+            }
+        }
         else emit("    mov [rbp - %d], %s", s->offset, ARGREG[i]);
     }
     if (fn->is_variadic) {
@@ -1648,11 +2044,12 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
         else if (!strcmp(argv[i], "--minimal")) g_minimal = 1;
+        else if (!strcmp(argv[i], "--nasm")) g_nasm = 1;
         else if (!inpath)  inpath  = argv[i];
         else if (!outpath) outpath = argv[i];
     }
     if (!inpath || !outpath) {
-        fprintf(stderr, "Usage: %s [--kernel] [--minimal] <input.c> <output.s>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--kernel] [--minimal] [--nasm] <input.c> <output.s>\n", argv[0]);
         return 1;
     }
 
@@ -1665,13 +2062,18 @@ int main(int argc, char **argv) {
     fout = fopen(outpath, "w");
     if (!fout) { perror("fopen"); return 1; }
 
-    emit(".intel_syntax noprefix");
-    emit("    .section .text");
-    emit("    .globl main");
+    if (g_nasm) {
+        emit("section .text");
+        emit("global main");
+    } else {
+        emit(".intel_syntax noprefix");
+        emit("    .section .text");
+        emit("    .globl main");
+    }
 
     if (!kernel_mode) {
         // hosted freestanding entry point: run main, then exit(rax)
-        emit("    .globl _start");
+        emit(g_nasm ? "global _start" : "    .globl _start");
         emit("_start:");
         emit("    call main");
         emit("    mov rdi, rax");
@@ -1686,11 +2088,55 @@ int main(int argc, char **argv) {
     // mode uses .data so the zero bytes are emitted into the object and survive
     // an objcopy to a flat binary — the bare-metal image needs no separate
     // .bss zero-fill step.
-    emit(kernel_mode ? "    .section .data" : "    .section .bss");
-    emit("    .align 8");
-    for (Sym *g = globals; g; g = g->next) {
-        int sz = ty_size(g->type); if (sz < 1) sz = 8;
-        emit("%s: .zero %d", g->name, sz);
+    if (g_nasm) {
+        // One flat image: the pooled string literals and the globals both go
+        // here, after the last function, where nothing can execute into them.
+        for (StrLit *sl = strlits; sl; sl = sl->next) {
+            char lbl[64]; snprintf(lbl, sizeof lbl, ".LC%d", sl->id);
+            emit_db_bytes(lbl, (const unsigned char *)sl->bytes, sl->len, 1);
+        }
+        for (DataStr *d = datastrs; d; d = d->next) {
+            char lbl[64]; snprintf(lbl, sizeof lbl, ".LD%d", d->id);
+            emit_db_bytes(lbl, (const unsigned char *)d->bytes, d->len, 1);
+        }
+        for (Sym *g = globals; g; g = g->next) emit_global(g, 1);
+    } else {
+        emit(kernel_mode ? "    .section .data" : "    .section .bss");
+        emit("    .align 8");
+        for (Sym *g = globals; g; g = g->next) {
+            // An initialised global cannot live in .bss — .bss has no contents.
+            if (g->initdata && !kernel_mode) continue;
+            emit_global(g, 0);
+        }
+    }
+    if (!g_nasm) {
+        // Initialised globals and the strings they point at need a section
+        // that actually holds bytes.
+        // In kernel mode the globals were already emitted into .data above, so
+        // only the string pool is left; without this the section header came
+        // out a second time with nothing under it.
+        int any = datastrs != NULL;
+        if (!kernel_mode)
+            for (Sym *g = globals; g && !any; g = g->next) if (g->initdata) any = 1;
+        if (any) {
+            emit("    .section .data");
+            emit("    .align 8");
+            for (DataStr *d = datastrs; d; d = d->next) {
+                fprintf(fout, ".LD%d: .string \"", d->id);
+                for (int i = 0; i < d->len; i++) {
+                    unsigned char ch = (unsigned char)d->bytes[i];
+                    switch (ch) {
+                        case '\n': fputs("\\n", fout); break;  case '\t': fputs("\\t", fout); break;
+                        case '\r': fputs("\\r", fout); break;  case '"':  fputs("\\\"", fout); break;
+                        case '\\': fputs("\\\\", fout); break;
+                        default: if (ch < 32 || ch > 126) fprintf(fout, "\\%03o", ch); else fputc(ch, fout);
+                    }
+                }
+                fputs("\"\n", fout);
+            }
+            for (Sym *g = globals; g; g = g->next)
+                if (g->initdata && !kernel_mode) emit_global(g, 0);
+        }
     }
 
     fclose(fout);
