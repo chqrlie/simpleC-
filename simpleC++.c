@@ -1888,7 +1888,10 @@ static Type *static_typeof(Node *n) {
         case N_STR:    return ptr_to(ty_char());
         case N_CAST:   return n->type;
         case N_VAR:  { Sym *s = lookup(n->name);
-                       if (!s) die_node(n, "sizeof an undeclared identifier");
+                       if (!s) {
+                           if (fnsig_find(n->name)) return ptr_to(ty_void());
+                           die_node(n, "sizeof an undeclared identifier");
+                       }
                        return s->type; }
         case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
                          // Returning `long` here when the member is unknown is
@@ -1947,7 +1950,16 @@ static Type *gen_expr(Node *n) {
     case N_STR:  gen_string(n); return n->type;
     case N_VAR: {
         Sym *s = lookup(n->name);
-        if (!s) die_node(n, "undeclared identifier");
+        if (!s) {
+            // Not a variable -- but a bare function name used as a value is
+            // its ADDRESS, which is how a kernel hands an entry point to a
+            // thread creator. Calling through the result still needs function
+            // pointers, which this compiler does not have; producing the
+            // address does not.
+            Type *ft = fnsig_find(n->name);
+            if (ft) { e_lea_rip(asm_sym(n->name)); return ptr_to(ty_void()); }
+            die_node(n, "undeclared identifier");
+        }
         // arrays and structs are used by-address (decay); scalars are loaded
         if (s->type->is_array || s->type->kind == TY_STRUCT) { gen_addr(n); return s->type; }
         gen_addr(n); load_rax(ty_size(s->type));
