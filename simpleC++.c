@@ -211,14 +211,15 @@ static atom_t atom_hash[ATOM_HASH_LEN];
 static const char *atom_str(atom_t i) { return atoms[i]->str; }
 static size_t atom_len(atom_t i) { return atoms[i]->len; }
 #define atom_flags(i)  atoms[i]->flags
-static atom_t new_atom_len(const char *str, size_t len) {
+static atom_t new_atom_len(const char *p, size_t len) {
     if (!atoms) {
         atoms = alloc(atoms_cap = 1024, sizeof(Atom*));
         atoms[0] = allocz(1, sizeof(Atom)); natoms = 1;
     }
     if (!len) { return 0; } // special case the empty string
+    const unsigned char *str = (const unsigned char *)p;
     unsigned long hash = 0;
-    for (size_t i = 0; i < len; i++) hash = hash * 37 + (str[i] & 255);
+    for (size_t i = 0; i < len; i++) hash = hash * 37 + str[i];
     // Achtung Minen! we do not support unsigned arithmetics yet
     hash = hash % ATOM_HASH_LEN;
     atom_t a = atom_hash[hash];
@@ -936,7 +937,7 @@ typedef struct Type {
     union {
         struct {            // TY_INT ... TY_ULONG
             int size__;
-            long min; unsigned long max;
+            unsigned long max;
         };
         struct {            // TY_ENUM
             int enum_size;
@@ -963,16 +964,16 @@ typedef struct Member {
     Type *type; struct Node *init; struct Member *next;
 } Member;
 
-static Type ty_char_s   = { TY_CHAR,   1, false, 0, {{ 1, -128, 127 }}}; // should be unsigned
-static Type ty_schar_s  = { TY_SCHAR,  1, false, 0, {{ 1, -128, 127 }}};
-static Type ty_short_s  = { TY_SHORT,  2, false, 0, {{ 2, -32768, 32768 }}};
-static Type ty_int_s    = { TY_INT,    4, false, 0, {{ 4, INT_MIN, INT_MAX }}};
-static Type ty_long_s   = { TY_LONG,   8, false, 0, {{ 8, LONG_MIN, LONG_MAX }}};
-static Type ty_uchar_s  = { TY_UCHAR,  1, true,  0, {{ 1, 0, 255 }}};
-static Type ty_ushort_s = { TY_USHORT, 2, true,  0, {{ 2, 0, 65535 }}};
-static Type ty_uint_s   = { TY_UINT,   4, true,  0, {{ 4, 0, UINT_MAX }}};
-static Type ty_ulong_s  = { TY_ULONG,  8, true,  0, {{ 8, 0, ULONG_MAX }}};
-static Type ty_void_s   = { TY_VOID,   1, false, 0, {{ 0, 0, 0 }}};
+static Type ty_char_s   = { TY_CHAR,   1, false, 0, {{ 1, 127 }}}; // should be unsigned
+static Type ty_schar_s  = { TY_SCHAR,  1, false, 0, {{ 1, 127 }}};
+static Type ty_short_s  = { TY_SHORT,  2, false, 0, {{ 2, 32768 }}};
+static Type ty_int_s    = { TY_INT,    4, false, 0, {{ 4, INT_MAX }}};
+static Type ty_long_s   = { TY_LONG,   8, false, 0, {{ 8, LONG_MAX }}};
+static Type ty_uchar_s  = { TY_UCHAR,  1, true,  0, {{ 1, 255 }}};
+static Type ty_ushort_s = { TY_USHORT, 2, true,  0, {{ 2, 65535 }}};
+static Type ty_uint_s   = { TY_UINT,   4, true,  0, {{ 4, UINT_MAX }}};
+static Type ty_ulong_s  = { TY_ULONG,  8, true,  0, {{ 8, ULONG_MAX }}};
+static Type ty_void_s   = { TY_VOID,   1, false, 0, {{ 0, 0 }}};
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -984,6 +985,7 @@ static Type ty_void_s   = { TY_VOID,   1, false, 0, {{ 0, 0, 0 }}};
 #define ty_long()    &ty_long_s
 #define ty_ulong()   &ty_ulong_s
 #define ty_void()    &ty_void_s
+#define ty_size_t()  &ty_ulong_s
 
 static const char *type_str(const Type *t) {
     if (!t) return "<null>";
@@ -1063,7 +1065,7 @@ enum {
 // 4. AST
 // =====================================================================
 enum {
-    N_NUM, N_STR, N_VAR, N_CALL, N_ASSIGN, N_BIN, N_UNARY,
+    N_NUM, N_STR, N_VAR, N_CALL, N_ASSIGN, N_BIN, N_COMMA, N_UNARY,
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECLIST, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
@@ -1080,6 +1082,7 @@ struct Node {
 #define HAS_BREAK     4     // N_SWITCH, N_FOR, N_DO, N_WHILE
 #define HAS_CONTINUE  8     // N_FOR, N_DO, N_WHILE
 #define HAS_DEFAULT   16    // N_SWITCH
+#define HAS_PAREN     32    // all expression nodes
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
@@ -1095,7 +1098,12 @@ struct Node {
         atom_t name;        // N_VAR / N_CALL / N_DECL
     };
     Type *type;             // result / declared type
-    Node *lhs, *rhs, *cond, *init, *next;
+    Node *lhs, *rhs, *cond;
+    union {
+        Node *init;
+        Type *type_arg;     // N_SIZEOF
+    };
+    Node *next;
 };
 
 static Token *cur(void);
@@ -1176,12 +1184,14 @@ static char *value_str(Value *vp, char *buf, size_t size) {
 static bool value_check_range(Value *vp, Type *t) {
     while (t) {
         switch (t->kind) {
-        case TY_ENUM: t = t->enum_type; break;
+        case TY_ENUM: t = t->enum_type; continue;
         case TY_CHAR:
         case TY_INT: case TY_SCHAR: case TY_SHORT: case TY_LONG:
-            return vp->ival >= t->min && vp->ival <= (long)t->max;
-        case TY_UINT: case TY_UCHAR: case TY_USHORT: case TY_ULONG:
+            return vp->ival >= (long)~t->max && vp->ival <= (long)t->max;
+        case TY_UINT: case TY_UCHAR: case TY_USHORT:
             return vp->uval <= t->max;
+        case TY_ULONG: case TY_VOID: return true;
+        case TY_PTR:  return !vp->uval;  // detect invalid casts
         default:      return false;
         }
     }
@@ -1192,7 +1202,7 @@ static bool value_cast(Value *vp, Type *t) {
         switch (t->kind) {
         case TY_CHAR:
         case TY_SCHAR: case TY_SHORT:  case TY_INT:  case TY_LONG:
-            if (vp->ival & t->min) vp->ival |= ~t->max; vp->type = t; return true;
+            vp->uval |= ~((vp->uval & (t->max + 1)) - 1); vp->type = t; return true;
         case TY_UCHAR: case TY_USHORT: case TY_UINT: case TY_ULONG:
             vp->uval &= t->max; vp->type = t; return true;
         case TY_VOID:  case TY_PTR:
@@ -1258,6 +1268,7 @@ static struct Label *add_label(Node *n);
 static struct Label *find_label(atom_t name);
 static Node *parse_const_expr(void);
 static Node *parse_init(void);
+static bool eval_expr(Node *n, Value *vp);
 static bool eval_const_expr(Node *n, Value *vp, const char *context);
 
 static Type *parse_ptr_to(Type *base) {
@@ -1443,32 +1454,42 @@ static Node *parse_string(void) {
     return n;
 }
 
+static Node *check_const_unary(Node *n) {
+    if (n->lhs->flags & CONST_VAL) { Value v; eval_expr(n, &v); }
+    return n;
+}
+static Node *check_const_binary(Node *n) {
+    if (n->lhs->flags & n->rhs->flags & CONST_VAL) { Value v; eval_expr(n, &v); }
+    return n;
+}
+static Node *check_const_ternary(Node *n) {
+    if (n->cond->flags & n->lhs->flags & n->rhs->flags & CONST_VAL) { Value v; eval_expr(n, &v); }
+    return n;
+}
+
+//static Node *parse_generic(void) {
+//    // static Node *parse_primary(void) {
+//}
+
 static Node *parse_primary(void) {
-    if (eat(T_LP)) {
-        // cast?  ( type ) unary
-        if (is_type_start(cur())) {
-            int flags;
-            Type *t = parse_type(&flags);
-            expect(T_RP);
-            Node *n = new_node(N_CAST); n->type = t; n->lhs = parse_assign();
-            return n;
-        }
-        Node *n = parse_expr(); expect(T_RP); return n;
-    }
-    if (at(T_NUM))  {
+    switch (toks[P].kind) {
+    case T_NUM: {
         Token *tp = cur();
         Type *t = ty_int();
-        unsigned long mask = tp->uval;
-        if (tp->is_long) mask |= LONG_MAX;
-        if (mask > LONG_MAX) t = ty_ulong();
-        else if (mask > UINT_MAX) t = tp->is_unsigned ? ty_ulong() : ty_long();
-        else if (mask > INT_MAX) t = (tp->is_unsigned || tp->base != 10) ? ty_uint() : ty_long();
+        unsigned long max_val = tp->uval;
+        if (tp->is_long) max_val |= LONG_MAX;
+        if (max_val > LONG_MAX) t = ty_ulong();
+        else if (max_val > UINT_MAX) t = tp->is_unsigned ? ty_ulong() : ty_long();
+        else if (max_val > INT_MAX) t = (tp->is_unsigned || tp->base != 10) ? ty_uint() : ty_long();
         Node *n = new_num_node(t, tp->ival); P++; return n;
     }
-    if (at(T_CHAR)) { Node *n = new_num_node(ty_int(), cur()->ival);  P++; return n; }
-    if (at(T_STR))  { return parse_string(); }
-    if (at(T_ID)) {
+    case T_CHAR: {
+        Node *n = new_num_node(ty_int(), cur()->ival); P++; return n;
+    }
+    case T_STR: return parse_string();
+    case T_ID: {
         atom_t nm = getid();
+        // XXX: this is actually a postfix expression
         if (at(T_LP)) {                       // function call
             Node *n = new_node(N_CALL); P++; n->name = nm;
             Node **ap = &n->rhs;
@@ -1480,7 +1501,13 @@ static Node *parse_primary(void) {
             }
             expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
         }
-        P--; Node *n = new_node(N_VAR); P++; n->name = nm; return n;
+        P--; Node *n = new_node(N_VAR); P++; n->name = nm; return n; // XXX: check for constant (need proper scoping)
+    }
+    case T_LP: {
+        P++; Node *n = parse_expr(); expect(T_RP);
+        n->flags |= HAS_PAREN; return n;
+    }
+    //case K_GENERIC: error(NULL, "_Generic selection not supported");
     }
     error(NULL, "expected expression, got '%s'", token_str(cur())); return 0;
 }
@@ -1496,6 +1523,9 @@ static Node *parse_postfix(void) {
             n->lhs->rhs = parse_expr();
             expect(T_RBRK);
             break;
+        //case T_LP: call expression
+            // mutate n into a N_CALL or
+            // wrap it if n is not a global reference
         case T_DOT:               // a.field
             n = new_node1(N_MEMBER, n); P++;
             n->name = getid();
@@ -1508,59 +1538,76 @@ static Node *parse_postfix(void) {
         case T_INC: case T_DEC:
             n = new_node1(N_POST, n); P++;
             break;
+        // case T_LP: check for compound literal
         default:
             return n;
         }
     }
 }
 
-static Node *parse_unary(void) {
+#define parse_cast_expression() parse_unary(true)
+static Node *parse_unary(bool accept_cast) {
+    Node *n;
     switch (toks[P].kind) {
-    case K_SIZEOF: {
-        Node *n = new_node(N_SIZEOF); P++;
-        if (at(T_LP) && is_type_start(&toks[P+1])) {
-            P++; n->type = parse_type(NULL); expect(T_RP);
-        } else {
-            n->lhs = parse_unary();
+    case T_LP:
+        if (accept_cast && is_type_start(&toks[P+1])) {
+            n = new_node(N_CAST); P++;
+            int flags;
+            n->type = parse_type(&flags);
+            expect(T_RP);
+            n->lhs = parse_cast_expression();
+            return check_const_unary(n);
         }
-        return n;
-    }
-    case T_PLUS:
-    case T_MINUS:
-    case T_NOT:
-    case T_BITNOT: { Node *n = new_node(N_UNARY); P++; n->lhs = parse_unary(); return n; }
-    case T_STAR:   { Node *n = new_node(N_DEREF); P++; n->lhs = parse_unary(); return n; }
-    case T_AMP:    { Node *n = new_node(N_ADDR);  P++; n->lhs = parse_unary(); return n; }
+        break;
+    //case K_ALIGNOF:  // alignof(type)
+    //case K_COUNTOF:
+    case K_SIZEOF:
+        n = new_node(N_SIZEOF); P++;
+        if (at(T_LP) && is_type_start(&toks[P+1])) {
+            P++; n->type_arg = parse_type(NULL); expect(T_RP);
+            // Should support delayed type resolution and
+            // dynamic type expressions: sizeof(char[expr])
+            n->uval = ty_size(n->type_arg);
+            n->type = ty_size_t();
+            n->flags |= CONST_VAL;
+            return n;
+        }
+        n->lhs = parse_unary(false); return check_const_unary(n);
+    case T_PLUS: case T_MINUS: case T_NOT:
+    case T_BITNOT: n = new_node(N_UNARY); P++; n->lhs = parse_cast_expression(); return check_const_unary(n);
+    case T_STAR:   n = new_node(N_DEREF); P++; n->lhs = parse_cast_expression(); return n;
+    case T_AMP:    n = new_node(N_ADDR);  P++; n->lhs = parse_cast_expression(); return n;
     case T_INC:
-    case T_DEC:    { Node *n = new_node(N_PRE); P++; n->lhs = parse_unary(); return n; }
+    case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
+    //case K_STATIC_ASSERT:
     }
     return parse_postfix();
 }
 
 static Node *parse_mul(void) {
-    Node *n = parse_unary();
-    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { n = new_bin_node(n); P++; n->rhs = parse_unary(); }
+    Node *n = parse_cast_expression();
+    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { n = new_bin_node(n); P++; n->rhs = parse_cast_expression(); check_const_binary(n); }
     return n;
 }
 static Node *parse_add(void) {
     Node *n = parse_mul();
-    while (at(T_PLUS) || at(T_MINUS)) { n = new_bin_node(n); P++; n->rhs = parse_mul(); }
+    while (at(T_PLUS) || at(T_MINUS)) { n = new_bin_node(n); P++; n->rhs = parse_mul(); check_const_binary(n); }
     return n;
 }
 // C precedence:  <<  >>  bind tighter than the relational operators.
 static Node *parse_shift(void) {
     Node *n = parse_add();
-    while (at(T_SHL) || at(T_SHR)) { n = new_bin_node(n); P++; n->rhs = parse_add(); }
+    while (at(T_SHL) || at(T_SHR)) { n = new_bin_node(n); P++; n->rhs = parse_add(); check_const_binary(n); }
     return n;
 }
 static Node *parse_rel(void) {
     Node *n = parse_shift();
-    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_bin_node(n); P++; n->rhs = parse_shift(); }
+    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_bin_node(n); P++; n->rhs = parse_shift(); check_const_binary(n); }
     return n;
 }
 static Node *parse_eq(void) {
     Node *n = parse_rel();
-    while (at(T_EQ) || at(T_NE)) { n = new_bin_node(n); P++; n->rhs = parse_rel(); }
+    while (at(T_EQ) || at(T_NE)) { n = new_bin_node(n); P++; n->rhs = parse_rel(); check_const_binary(n); }
     return n;
 }
 // Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
@@ -1571,22 +1618,22 @@ static Node *parse_band(void) {
 }
 static Node *parse_bxor(void) {
     Node *n = parse_band();
-    while (at(T_BITXOR)) { n = new_bin_node(n); P++; n->rhs = parse_band(); }
+    while (at(T_BITXOR)) { n = new_bin_node(n); P++; n->rhs = parse_band(); check_const_binary(n); }
     return n;
 }
 static Node *parse_bor(void) {
     Node *n = parse_bxor();
-    while (at(T_BITOR)) { n = new_bin_node(n); P++; n->rhs = parse_bxor(); }
+    while (at(T_BITOR)) { n = new_bin_node(n); P++; n->rhs = parse_bxor(); check_const_binary(n); }
     return n;
 }
 static Node *parse_land(void) {
     Node *n = parse_bor();
-    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); }
+    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); check_const_binary(n); }
     return n;
 }
 static Node *parse_lor(void) {
     Node *n = parse_land();
-    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); }
+    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); check_const_binary(n); }
     return n;
 }
 static Node *parse_ternary(void) {
@@ -1594,7 +1641,7 @@ static Node *parse_ternary(void) {
     if (at(T_QUESTION)) {
         Node *t = new_node(N_TERNARY); P++;
         t->cond = n; t->lhs = parse_expr(); expect(T_COLON); t->rhs = parse_ternary();
-        return t;
+        return check_const_ternary(t);
     }
     return n;
 }
@@ -1612,7 +1659,7 @@ static Node *parse_assign(void) {
 }
 static Node *parse_expr(void) {
     Node *n = parse_assign();
-    while (at(T_COMMA)) { n = new_bin_node(n); P++; n->rhs = parse_assign(); }
+    while (at(T_COMMA)) { n = new_node1(N_COMMA, n); P++; n->rhs = parse_assign(); }
     return n;
 }
 
@@ -1824,7 +1871,6 @@ static Node *parse_stmt(void) {
         }
         if (!at(T_SEMI)) n->cond = parse_expr();
         expect(T_SEMI);
-        // XXX should accept comma expression
         if (!at(T_RP)) n->rhs = parse_expr(); // step
         expect(T_RP);
         n->lhs = parse_loop_body(n);
@@ -1904,7 +1950,7 @@ static bool eval_expr(Node *n, Value *vp) {
         break;
     }
     case N_SIZEOF: {
-        Type *t = n->type ? n->type : static_typeof(n->lhs);
+        Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs);
         value_init(&v1, t, ty_size(t)); break;
     }
     case N_CAST:
@@ -1933,11 +1979,15 @@ static bool eval_expr(Node *n, Value *vp) {
         if (!eval_expr(n->lhs, &v1)) return false;
         if (!v1.uval && !eval_expr(n->rhs, &v1)) return false;
         v1.uval = (v1.uval != 0); break;
+    case N_COMMA:
+        if (!eval_expr(n->lhs, &v1)) return false;
+        if (!eval_expr(n->rhs, &v1)) return false;
+        break;
     case N_BIN:
         if (!eval_expr(n->lhs, &v1)) return false;
         Value v2; v2.type = NULL; v2.uval = 0;
         if (!eval_expr(n->rhs, &v2)) return false;
-        // XXX: should find common type except for T_COMMA. T_COMMA should be a different node kind
+        // XXX: should find common type
         // XXX: signed/unsigned arithmetics still not correct in case of different sizes
         bool is_unsigned = v1.type->is_unsigned | v2.type->is_unsigned;
         switch (n->op) {
@@ -1962,7 +2012,6 @@ static bool eval_expr(Node *n, Value *vp) {
         case T_GE:      if (is_unsigned) v1.uval = v1.uval >= v2.uval; else v1.uval = v1.ival >= v2.ival; break;
         case T_EQ:      v1.uval = v1.uval == v2.uval; break;
         case T_NE:      v1.uval = v1.uval != v2.uval; break;
-        case T_COMMA:   v1.uval = v2.uval; break;
         default:
             error(n, "bad binary operator '%s'", token_name[n->op]); return false;
         overflow:
@@ -1974,13 +2023,16 @@ static bool eval_expr(Node *n, Value *vp) {
     }
     if (!n->type) n->type = v1.type;
     if (!value_check_range(&v1, n->type)) {
-        char buf[32];
-        warning(n->pos, "%s is too large for type %s",
-                value_str(&v1, buf, sizeof(buf)), type_str(n->type));
+        char buf[32]; value_str(&v1, buf, sizeof(buf));
+        if (n->type->kind == TY_PTR) {
+            warning(n->pos, "implicit conversion of non zero value %s as a pointer", buf);
+        } else {
+            warning(n->pos, "%s is too large for type %s", buf, type_str(n->type));
+        }
     }
     value_cast(&v1, n->type);
     vp->type = v1.type;
-    vp->uval = v1.uval;
+    n->uval = vp->uval = v1.uval;
     n->flags |= CONST_VAL;
     return true;
 }
@@ -2145,7 +2197,7 @@ static void collect_locals(Node *n) {
       case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
       case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
         collect_locals(n->lhs); break;
-      case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
+      case N_ASSIGN: case N_BIN: case N_COMMA: case N_LOGAND: case N_LOGOR:
         collect_locals(n->lhs); collect_locals(n->rhs); break;
       case N_CALL: for (Node *e = n->rhs; e; e = e->next) collect_locals(e); break;
       case N_SWITCH: collect_locals(n->cond); collect_locals(n->rhs); break;
@@ -2172,7 +2224,7 @@ static bool check_rewrite(Node *n) {
         Node *arg = n->rhs; if (arg->kind != N_STR) break;
         const char *s = atom_str(arg->str);
         // do not use atom len to allow embedded nuls
-        set_num_node(n, ty_ulong(), strlen(s));
+        set_num_node(n, ty_size_t(), strlen(s));
         return true;
     }
     case ID_STRCPY: {   // optimize strcpy(dest, "str");
@@ -2181,7 +2233,7 @@ static bool check_rewrite(Node *n) {
         const char *s = atom_str(arg2->str);
         long len = (long)strlen(s); // do not use atom len to allow embedded nuls
         n->name = ID_MEMCPY;
-        arg2->next = new_num_node(ty_ulong(), len + 1);
+        arg2->next = new_num_node(ty_size_t(), len + 1);
         arg2->next->pos = arg2->pos;
         n->nargs = 3;
         return true;
@@ -2217,7 +2269,7 @@ static void check_used(Node *n) {
         case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
         case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
             check_used(n->lhs); break;
-        case N_ASSIGN: case N_BIN: case N_LOGAND: case N_LOGOR:
+        case N_ASSIGN: case N_BIN: case N_COMMA: case N_LOGAND: case N_LOGOR:
             check_used(n->lhs); check_used(n->rhs); break;
         case N_CALL:
             if (check_rewrite(n)) { check_used(n); break; }
@@ -2595,7 +2647,8 @@ static bool is_simple_load(Node *n) {
     case N_BIN:
         // would qualify if one of the operands is a N_NUM and the other is simple
         // and the op is not a shift or rotate operation
-        // or if both are simple for a comma op
+    case N_COMMA:
+        // would qualify if both are simple
     case N_PRE / N_POST: // would qualify if lhs is simple
     case N_ASSIGN: // would qualify if lhs is simple and op is neither generic mul, div or rem
         break;
@@ -2622,9 +2675,9 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         return load_ind(mt, r, r);
     }
     case N_SIZEOF: {
-        Type *t = n->type ? n->type : static_typeof(n->lhs);
+        Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs);
         emit("mov %s, %d", reg, ty_size(t));
-        return ty_ulong();
+        return ty_size_t();
     }
     case N_CAST:
         gen_expr(n->lhs, r, save_rax);
@@ -2830,11 +2883,11 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         warning(n->pos, "function not found '%s'", atom_str(n->name));
         return ty_long();
     }
-    case N_BIN: {
-        if (n->op == T_COMMA) {
-            n->lhs->flags |= DISCARD; gen_expr(n->lhs, r, save_rax);
-            n->rhs->flags |= n->flags & DISCARD; return gen_expr(n->rhs, r, save_rax);
-        }
+    case N_COMMA:
+        n->lhs->flags |= DISCARD; gen_expr(n->lhs, r, save_rax);
+        n->rhs->flags |= n->flags & DISCARD;
+        return gen_expr(n->rhs, r, save_rax);
+    case N_BIN:
         if (save_rax) emit("push rax");
         Type *lt = gen_expr(n->lhs, RAX, false);
         Type *rt = gen_expr(n->rhs, RCX, true);
@@ -2842,7 +2895,6 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         if (r != RAX) emit("mov %s, rax", reg);
         if (save_rax) emit("pop rax");
         return rt;
-    }
     default: error(n, "cannot generate expression"); return 0;
     }
 }
