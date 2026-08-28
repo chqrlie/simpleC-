@@ -933,7 +933,7 @@ const char *type_name[] = {
 };
 
 typedef struct Type {
-    unsigned char kind, align; bool is_unsigned; int pos;
+    unsigned char kind, align; bool is_unsigned, is_ptrish; int pos;
     union {
         struct {            // TY_INT ... TY_ULONG
             int size__;
@@ -964,16 +964,16 @@ typedef struct Member {
     Type *type; struct Node *init; struct Member *next;
 } Member;
 
-static Type ty_char_s   = { TY_CHAR,   1, false, 0, {{ 1, 127 }}}; // should be unsigned
-static Type ty_schar_s  = { TY_SCHAR,  1, false, 0, {{ 1, 127 }}};
-static Type ty_short_s  = { TY_SHORT,  2, false, 0, {{ 2, 32768 }}};
-static Type ty_int_s    = { TY_INT,    4, false, 0, {{ 4, INT_MAX }}};
-static Type ty_long_s   = { TY_LONG,   8, false, 0, {{ 8, LONG_MAX }}};
-static Type ty_uchar_s  = { TY_UCHAR,  1, true,  0, {{ 1, 255 }}};
-static Type ty_ushort_s = { TY_USHORT, 2, true,  0, {{ 2, 65535 }}};
-static Type ty_uint_s   = { TY_UINT,   4, true,  0, {{ 4, UINT_MAX }}};
-static Type ty_ulong_s  = { TY_ULONG,  8, true,  0, {{ 8, ULONG_MAX }}};
-static Type ty_void_s   = { TY_VOID,   1, false, 0, {{ 0, 0 }}};
+static Type ty_char_s   = { TY_CHAR,   1, false, false, 0, {{ 1, 127 }}}; // should be unsigned
+static Type ty_schar_s  = { TY_SCHAR,  1, false, false, 0, {{ 1, 127 }}};
+static Type ty_short_s  = { TY_SHORT,  2, false, false, 0, {{ 2, 32768 }}};
+static Type ty_int_s    = { TY_INT,    4, false, false, 0, {{ 4, INT_MAX }}};
+static Type ty_long_s   = { TY_LONG,   8, false, false, 0, {{ 8, LONG_MAX }}};
+static Type ty_uchar_s  = { TY_UCHAR,  1, true,  false, 0, {{ 1, 255 }}};
+static Type ty_ushort_s = { TY_USHORT, 2, true,  false, 0, {{ 2, 65535 }}};
+static Type ty_uint_s   = { TY_UINT,   4, true,  false, 0, {{ 4, UINT_MAX }}};
+static Type ty_ulong_s  = { TY_ULONG,  8, true,  false, 0, {{ 8, ULONG_MAX }}};
+static Type ty_void_s   = { TY_VOID,   1, false, false, 0, {{ 0, 0 }}};
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -994,14 +994,16 @@ static const char *type_str(const Type *t) {
 }
 
 static Type *ptr_to(Type *base) {
-    Type *t = allocz(1, sizeof(Type)); t->align = 8; t->kind = TY_PTR; t->ptr = base; return t;
+    Type *t = allocz(1, sizeof(Type));
+    t->kind = TY_PTR; t->align = 8; t->is_ptrish = true;
+    t->ptr = base; return t;
 }
 static int ty_size(Type *t) {
     switch (t->kind) {
-        case TY_ARRAY:  return t->arr_len * ty_size(t->ptr);
-        case TY_STRUCT: case TY_UNION: return t->struct_size;
-        case TY_VOID:   return 0;
-        default:        return t->align;
+    case TY_ARRAY:  return ty_size(t->ptr) * t->arr_len;
+    case TY_VOID:   return 0;
+    case TY_STRUCT: case TY_UNION: return t->struct_size;
+    default:        return t->align;
     }
 }
 #define ty_align(t) ((t)->align)
@@ -1025,7 +1027,8 @@ static int elem_size(Type *t) {
     if (t->kind == TY_PTR) { int s = ty_size(t->ptr); return s ? s : 1; }
     return 0;
 }
-static int is_ptrish(Type *t) { return t->kind == TY_ARRAY || t->kind == TY_PTR; }
+#define is_ptrish(t)  ((t)->is_ptrish)
+//static int is_ptrish(Type *t) { return t->kind == TY_ARRAY || t->kind == TY_PTR; }
 static bool same_type(Type *t1, Type *t2) {
     if (t1 && t2) {
         if (t1->kind != t2->kind) return false;
@@ -1036,6 +1039,34 @@ static bool same_type(Type *t1, Type *t2) {
         }
     }
     return t1 == t2;
+}
+static Type *promoted_type(Type *t) {
+    while (t) {
+        switch (t->kind) {
+        case TY_INT: case TY_SCHAR: case TY_SHORT:
+        case TY_UCHAR: case TY_USHORT: case TY_CHAR:
+            return ty_int();
+        case TY_ENUM: t = t->enum_type; continue;
+        default:
+            return t;
+        }
+    }
+    return ty_long();  // default type
+}
+static Type *common_type(Type *t1, Type *t2) {
+    if (is_ptrish(t1)) {
+        if (is_ptrish(t2)) return ty_long(); // ptrdiff_t
+        return t1;
+    }
+    if (is_ptrish(t2))    return t2;
+    if (t1 == ty_ulong()) return t1;
+    if (t2 == ty_ulong()) return t2;
+    if (t1 == ty_long())  return t1;
+    if (t2 == ty_long())  return t2;
+    if (t1 == ty_uint())  return t1;
+    if (t2 == ty_uint())  return t2;
+    // XXX: should check for integer type
+    return ty_int();
 }
 
 enum {
@@ -1125,10 +1156,10 @@ static void error(Node *n, const char *fmt, ...) {
     exit(1);
 }
 static Type *array_of(Type *base, Node *len_expr) {
-    Type *arr = allocz(1, sizeof(Type)); arr->align = base->align; arr->kind = TY_ARRAY; arr->ptr = base;
-    arr->arr_len = -1;
-    arr->arr_len_expr = len_expr;
-    if (len_expr && len_expr->kind == N_NUM) arr->arr_len = (int)len_expr->ival;
+    Type *arr = allocz(1, sizeof(Type));
+    arr->kind = TY_ARRAY; arr->align = base->align; arr->is_ptrish = true;
+    arr->ptr = base; arr->arr_len = -1; arr->arr_len_expr = len_expr;
+    if (len_expr && (len_expr->flags & CONST_VAL)) arr->arr_len = (int)len_expr->ival;
     return arr;
 }
 
@@ -1176,10 +1207,11 @@ static bool value_init(Value *vp, Type *t, long ival) {
     vp->ival = ival;
     return true;
 }
-static char *value_str(Value *vp, char *buf, size_t size) {
-    if (vp->type->is_unsigned) snprintf(buf, size, "%lu", vp->uval);
-    else snprintf(buf, size, "%ld", vp->ival);
-    return buf;
+static size_t value_str(Value *vp, char *buf, size_t size) {
+    size_t len = (size_t)((vp->type->is_unsigned) ?
+                          snprintf(buf, size, "%lu", vp->uval) :
+                          snprintf(buf, size, "%ld", vp->ival));
+    return len > size ? size : len;
 }
 static bool value_check_range(Value *vp, Type *t) {
     while (t) {
@@ -1466,6 +1498,14 @@ static Node *check_const_ternary(Node *n) {
     if (n->cond->flags & n->lhs->flags & n->rhs->flags & CONST_VAL) { Value v; eval_expr(n, &v); }
     return n;
 }
+static Node *check_const_logical(Node *n) {
+    if (n->lhs->flags & CONST_VAL) {
+        bool final = (n->kind == N_LOGOR);
+        if ((n->lhs->uval != 0) == final)   { n->flags |= CONST_VAL; n->uval = final; }
+        else if (n->rhs->flags & CONST_VAL) { n->flags |= CONST_VAL; n->uval = (n->rhs->uval != 0); }
+    }
+    return n;
+}
 
 //static Node *parse_generic(void) {
 //    // static Node *parse_primary(void) {
@@ -1628,12 +1668,12 @@ static Node *parse_bor(void) {
 }
 static Node *parse_land(void) {
     Node *n = parse_bor();
-    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); check_const_binary(n); }
+    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); check_const_logical(n); }
     return n;
 }
 static Node *parse_lor(void) {
     Node *n = parse_land();
-    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); check_const_binary(n); }
+    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); check_const_logical(n); }
     return n;
 }
 static Node *parse_ternary(void) {
@@ -1833,7 +1873,7 @@ static Node *parse_stmt(void) {
     if (at(K_CASE)) {
         if (!this_switch) error(NULL, "'case' outside a 'switch' statement");
         n = new_node(N_CASE); P++; n->cond = parse_const_expr();
-        //if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
+        if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
         goto link_case;
     }
     if (at(K_DEFAULT))  {
@@ -1849,8 +1889,10 @@ static Node *parse_stmt(void) {
     link_case:
         if (this_switch) {
             // append node to case list (quadratic but small n)
-            Node **np = &this_switch->lhs;
-            while (*np) { np = &(*np)->lhs; } *np = n;
+            // keep default node at the end of list
+            Node **np = &this_switch->lhs, *e;
+            while ((e = *np) && e->kind != N_DEFAULT) np = &e->lhs;
+            n->lhs = e; *np = n;
         }
         expect(T_COLON);
         return n;
@@ -2308,7 +2350,10 @@ static void emit_indent(int indent) { while (indent > 0) { putc('\t', fout); ind
 static void emit(const char *fmt, ...) attr_printf(1,2);
 static void emit(const char *fmt, ...) {
     int indent = 28;
-    if (next_label > 0) indent -= fprintf(fout, ".L%d:", next_label);
+    if (next_label) {
+        if (next_label >= 10) { fputc('.', fout); fputc('L', fout); indent -= 2; }
+        indent -= fprintf(fout, "%d:", next_label);
+    }
     next_label = 0;
     if (*fmt != ' ') {  // no empty format strings to avoid gcc warning
         emit_indent(indent - 20);
@@ -2320,7 +2365,7 @@ static void emit(const char *fmt, ...) {
     }
     putc('\n', fout);
 }
-static void emit_label(int lab) { if (!lab) return; if (next_label) emit(" "); next_label = lab; }
+static void emit_label(int lab) { if (lab > 0) { if (next_label) emit(" "); next_label = lab; }}
 static void emit_comment(const char *comment) {
     if (out_comments) {
         if (*next_comment) emit(" ");
@@ -2339,7 +2384,7 @@ static void emit_section(const char *name, int align) {
 }
 static void emit_entry(atom_t name, bool globl, bool skip) {
     if (!name) return;
-    emit_label(-1); // flush label and comments
+    if (*next_comment | next_label) emit(" "); // flush label and comments
     if (skip) putc('\n', fout);
     if (globl) emit(".globl %s", atom_str(name));
     fprintf(fout, "%s:\n", atom_str(name));
@@ -2347,7 +2392,9 @@ static void emit_entry(atom_t name, bool globl, bool skip) {
 
 static void emit_jmp(Node *n, const char *jmp, int lab) {
     if (!lab) error(n, "invalid jump");
-    emit("%s .L%d", jmp, lab);
+    if (lab >= 10) emit("%s .L%d", jmp, lab);
+    else if (lab < 0) emit("%s %d%c", jmp, -lab, 'b');
+    else emit("%s %d%c", jmp, lab, 'f');
 }
 
 // =====================================================================
@@ -2359,7 +2406,7 @@ const char *reg32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", 
 const char *reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
 const char *reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
 
-static int label_id = 1;
+static int label_id = 10;
 static int ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 // current function's varargs state (set in gen_func, read by __builtin_va_* codegen)
@@ -2405,6 +2452,18 @@ static void store_ind(Type *t, int r1, int r2) {    // [r1] = r2 (size and type 
     default: emit("mov [%s], %s", dest, reg64[r2]); return;
     }
 }
+static void emit_reg_imm(const char *instr, int r, unsigned long val) {
+    if ((int)val == (long)val) {
+        emit("%s %s, %d", instr, reg64[r], (int)val);
+    } else {
+        emit("mov rdx, %ld", (long)val);
+        emit("%s %s, rdx", instr, reg64[r]);
+    }
+}
+static void emit_cmp_imm(int r, unsigned long val) {
+    if (val) emit_reg_imm("cmp", r, val);
+    else emit("test %s, %s", reg64[r], reg64[r]);
+}
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
 static Type *gen_addr(Node *n, int r, bool save_rax) {
@@ -2434,19 +2493,19 @@ static Type *gen_addr(Node *n, int r, bool save_rax) {
 // best-effort static type inference (used only by sizeof(expr))
 static Type *static_typeof(Node *n) {
     switch (n->kind) {
-        case N_NUM:    return n->type ? n->type : ty_long();
-        case N_STR:    return ptr_to(ty_char());
-        case N_CAST:   return n->type;
-        case N_VAR:  { Sym *s = lookup(n->name, NULL); return s ? s->type : ty_long(); }
-        case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
-                         return m ? m->type : ty_long(); }
-        case N_DEREF: { Type *t = static_typeof(n->lhs); return is_ptrish(t) ? t->ptr : ty_long(); } // should report error
-        case N_ADDR:   return ptr_to(static_typeof(n->lhs));
-        default:       return ty_long();
+    case N_NUM:    return n->type ? n->type : ty_long();
+    case N_STR:    return ptr_to(ty_char());
+    case N_CAST:   return n->type;
+    case N_VAR:  { Sym *s = lookup(n->name, NULL); return s ? s->type : ty_long(); }
+    case N_MEMBER: { Type *st = static_typeof(n->lhs); Member *m = find_member(st, n->name);
+        return m ? m->type : ty_long(); }
+    case N_DEREF: { Type *t = static_typeof(n->lhs); return is_ptrish(t) ? t->ptr : ty_long(); } // should report error
+    case N_ADDR:   return ptr_to(static_typeof(n->lhs));
+    default:       return ty_long();
     }
 }
 
-static size_t gen_quoted_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
+static size_t encode_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
     size_t j = 0;
     if (sep && size > 1) buf[j++] = sep;
     for (size_t i = 0; i < slen; i++) {
@@ -2485,7 +2544,7 @@ static size_t gen_quoted_string(char *buf, size_t size, const char *str, size_t 
 
 static void gen_string_def(atom_t id) {
     char buf[8192];
-    gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+    encode_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
     fprintf(fout, ".LC%d:\t.string %s\n", id, buf);
 }
 
@@ -2493,7 +2552,7 @@ static Type *load_string(Node *n, int r) {
     atom_t id = n->str;
     if (out_comments) {
         char buf[37];
-        size_t len = gen_quoted_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+        size_t len = encode_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
         if (len > 32) pstrcpy(buf + 32, sizeof(buf) - 32, "...\"");
         emit_comment(buf);
     }
@@ -2502,28 +2561,191 @@ static Type *load_string(Node *n, int r) {
     return n->type;
 }
 
-static void gen_mul_size(int r, int size) {
-    if (size > 1) {
-        if ((size & (size - 1)) == 0) { // power of 2
-            emit("shl %s, %d", reg64[r], __builtin_ctz(size));
+static void emit_imul_imm(int r, unsigned long val) {
+    const char *reg = reg64[r];
+    if (!val) {
+        emit("sub %s, %s", reg, reg);
+    } else
+    if (val == 1) {
+        // nothing
+    } else
+    if ((val & (val - 1)) == 0) { // power of 2
+        emit("shl %s, %d", reg, __builtin_ctz(val));
+    } else
+    if (val <= INT_MAX) {
+        emit("imul %s, %lu", reg, val);
+    } else {
+        emit("mov rdx, %lu", val);
+        emit("imul %s, rdx", reg);
+    }
+}
+
+static void emit_idiv_imm(int r, unsigned long val, bool save_rax) {
+    const char *reg = reg64[r];
+    if (!val) return; // undefined behavior, no code
+    if (0 && val == 10) {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, 7378697629483820647");
+        emit("imul rcx");
+        emit("mov %s, rdx", reg);
+        emit("shr %s, 63", reg);
+        emit("sar rdx, 2");
+        emit("add %s, rdx", reg);
+        if (save_rax) emit("pop rax");
+    } else
+    if (val == 1) {
+        // no code
+    } else
+    if ((val & (val - 1)) == 0) { // power of 2
+        unsigned long adj = val - 1;
+        if (adj <= INT_MAX) {
+            emit("lea edx, [%s + %lu]", reg, adj);
         } else {
-            emit("imul %s, %d", reg64[r], size);
+            emit("mov edx, %lu", adj);
+            emit("add edx, %s", reg);
         }
+        emit("test %s, %s", reg, reg);
+        emit("cmovs %s, edx", reg);
+        emit("sar %s, %d", reg, __builtin_ctz(val));
+    } else {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, %ld", (long)val);
+        emit("cqo"); emit("idiv rcx");
+        if (r != RAX) emit("mov %s, rax", reg);
+        if (save_rax) emit("pop rax");
+    }
+}
+
+static void emit_div_imm(int r, unsigned long val, bool save_rax) {
+    const char *reg = reg64[r];
+    if (!val) return; // undefined behavior, no code
+    if (0 && val == 10) {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, -3689348814741910323");
+        emit("mul rcx");
+        emit("mov %s, rdx", reg);
+        emit("shr %s, 3", reg);
+        if (save_rax) emit("pop rax");
+    } else
+    if (val == 1) {
+        // nothing
+    } else
+    if ((val & (val - 1)) == 0) { // power of 2
+        emit("shr %s, %d", reg, __builtin_ctz(val));
+    } else {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        // could optimize furter using 32-bit division
+        emit("mov rcx, %ld", (long)val);
+        emit("sub rdx, rdx"); emit("div rcx");
+        if (r != RAX) emit("mov %s, rax", reg);
+        if (save_rax) emit("pop rax");
+    }
+}
+
+static void emit_imod_imm(int r, unsigned long val, bool save_rax) {
+    const char *reg = reg64[r];
+    if (!val) return; // undefined behavior, no code
+    if (0 && val == 10) {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("movabs rdx, 7378697629483820647");
+        emit("mov rcx, rax");
+        emit("imul rdx");
+        emit("mov rax, rdx");
+        emit("shr rax, 63");
+        emit("sar rdx, 2");
+        emit("add rdx, rax");
+        emit("add rdx, rdx");
+        emit("lea rax, [rdx + 4*rdx]");
+        emit("sub rcx, rax");
+        emit("mov %s, rcx", reg);
+        if (save_rax) emit("pop rax");
+    } else
+    if (val == 1) {
+        emit("sub %s, %s", reg, reg);
+    } else
+    if ((val & (val - 1)) == 0) { // power of 2
+        unsigned long adj = val - 1;
+        if (adj <= INT_MAX) {
+            emit("lea ecx, [%s + %lu]", reg, adj);
+        } else {
+            emit("mov ecx, %lu", adj);
+            emit("add ecx, %s", reg);
+        }
+        emit("test %s, %s", reg, reg);
+        emit("cmovns rcx, %s", reg);
+        emit_reg_imm("and", RCX, -val);
+        emit("sub %s, rcx", reg);
+    } else {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, %ld", (long)val);
+        emit("cqo"); emit("idiv rcx");
+        emit("mov %s, rdx", reg);
+        if (save_rax) emit("pop rax");
+    }
+}
+
+static void emit_mod_imm(int r, unsigned long val, bool save_rax) {
+    const char *reg = reg64[r];
+    if (!val) return; // undefined behavior, no code
+    if (0 && val == 10) {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, rax");
+        emit("movabs rdx, -3689348814741910323");
+        emit("mul rdx");
+        emit("shr rdx, 2");
+        emit("and rdx, -2");
+        emit("lea rax, [rdx + 4*rdx]");
+        emit("sub rcx, rax");
+        emit("mov %s, rcx", reg);
+        if (save_rax) emit("pop rax");
+    } else
+    if (val == 1) {
+        emit("sub %s, %s", reg, reg);
+    } else
+    if ((val & (val - 1)) == 0) { // power of 2
+        emit_reg_imm("and", r, val - 1);
+    } else {
+        if (save_rax) emit("push rax");
+        if (r != RAX) emit("mov rax, %s", reg);
+        emit("mov rcx, %ld", (long)val);
+        emit("sub rdx, rdx"); emit("div rcx");
+        emit("mov %s, rdx", reg);
+        if (save_rax) emit("pop rax");
+    }
+}
+
+static const char *get_cc(int op, bool is_unsigned) {
+    switch (op) {
+    case T_EQ: return "e";
+    case T_NE: return "ne";
+    case T_LT: return is_unsigned ? "b" : "l";
+    case T_GT: return is_unsigned ? "a" : "g";
+    case T_LE: return is_unsigned ? "be" : "le";
+    case T_GE: return is_unsigned ? "ae" : "ge";
+    default: return "";
     }
 }
 
 static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     // rax = left, rcx = right
+    Type *ct = common_type(lt = promoted_type(lt), rt);
     switch (op) {
     case T_PLUS:
         if (is_ptrish(lt)) {
             if (is_ptrish(rt)) error(n, "cannot add pointers");
-            gen_mul_size(RCX, elem_size(lt));
+            emit_imul_imm(RCX, elem_size(lt));
             emit("add rax, rcx");
             return lt;
         }
         if (is_ptrish(rt)) {
-            gen_mul_size(RAX, elem_size(rt));
+            emit_imul_imm(RAX, elem_size(rt));
             emit("add rax, rcx");
             return rt;
         }
@@ -2534,17 +2756,10 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
             int s = elem_size(lt);
             if (is_ptrish(rt)) {
                 emit("sub rax, rcx");
-                if (s > 1) {
-                    if ((s & (s - 1)) == 0) { // power of 2
-                        emit("sar rax, %d", __builtin_ctz(s));
-                    } else {
-                        emit("mov rcx, %d", s);
-                        emit("cqo"); emit("idiv rcx");
-                    }
-                }
+                emit_idiv_imm(RAX, s, false);
                 break;
             }
-            gen_mul_size(RCX, s);
+            emit_imul_imm(RCX, s);
             emit("sub rax, rcx");
             return lt;
         }
@@ -2552,13 +2767,13 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
         break;
     case T_STAR:    emit("imul rax, rcx"); break;
     case T_SLASH:
-        if (lt->is_unsigned | rt->is_unsigned) {
+        if (ct->is_unsigned) {
             emit("xor rdx,rdx"); emit("div rcx"); break;
         } else {
             emit("cqo"); emit("idiv rcx"); break;
         }
     case T_PERCENT:
-        if (lt->is_unsigned | rt->is_unsigned) {
+        if (ct->is_unsigned) {
             emit("xor rdx,rdx"); emit("div rcx");
         } else {
             emit("cqo"); emit("idiv rcx");
@@ -2567,34 +2782,64 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     case T_AMP:     emit("and rax, rcx"); break;
     case T_BITOR:   emit("or rax, rcx");  break;
     case T_BITXOR:  emit("xor rax, rcx"); break;
-    case T_SHL:     emit("shl rax, cl");  break;   // count in cl (low byte of rcx)
-    case T_SHR:     if (lt->is_unsigned) emit("shr rax, cl"); else emit("sar rax, cl"); break;
+    case T_SHL:     emit("shl rax, cl");  return lt;   // count in cl (low byte of rcx)
+    case T_SHR:     if (lt->is_unsigned) emit("shr rax, cl"); else emit("sar rax, cl"); return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
         emit("cmp rax, rcx");
-        const char *cc = op == T_LT ? "setl" : op == T_GT ? "setg" : op == T_LE ? "setle" :
-            op == T_GE ? "setge" : op == T_EQ ? "sete" : "setne";
-        if (lt->is_unsigned | rt->is_unsigned) {
-            cc = op == T_LT ? "setb" : op == T_GT ? "seta" : op == T_LE ? "setbe" :
-                op == T_GE ? "setae" : op == T_EQ ? "sete" : "setne";
-        }
-        emit("%s al", cc); emit("movzx rax, al");
+        emit("set%s al", get_cc(n->op, ct->is_unsigned));
+        emit("movzx rax, al");
         break;
     }
     default: error(n, "bad binary operator '%s'", token_name[op]);
     }
-    return ty_long();
+    return ct;
+}
+
+static Type *gen_bin_imm(Node *n, int op, Type *lt, int r, bool save_rax) {
+    // rax = left, val = right
+    Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
+    unsigned long val = n->rhs->uval;
+    switch (op) {
+    case T_PLUS:
+        if (is_ptrish(lt)) val *= elem_size(lt);
+        if (val) emit_reg_imm("add", r, val); break;
+    case T_MINUS:
+        if (is_ptrish(lt)) val *= elem_size(lt);
+        if (val) emit_reg_imm("sub", r, val); break;
+    case T_STAR:    emit_imul_imm(RAX, val); break;
+    case T_SLASH:
+        if (ct->is_unsigned) emit_div_imm(r, val, save_rax);
+        else emit_idiv_imm(r, val, save_rax);
+        break;
+    case T_PERCENT:
+        if (ct->is_unsigned) emit_mod_imm(r, val, save_rax);
+        else emit_imod_imm(r, val, save_rax);
+        break;
+    case T_AMP:     if (val + 1) emit_reg_imm("and", RAX, val);   break;
+    case T_BITOR:   if (val) emit_reg_imm("or", RAX, val);    break;
+    case T_BITXOR:  if (val) emit_reg_imm("xor", RAX, val);   break;
+    case T_SHL:     if (val &= 63) emit("shl rax, %ld", val);  return lt;
+    case T_SHR:     if (val &= 63) { if (lt->is_unsigned) emit("shr rax, %ld", val); else emit("sar rax, %ld", val); } return lt;
+    case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE:
+        emit_cmp_imm(RAX, val);
+        emit("set%s al", get_cc(n->op, ct->is_unsigned));
+        emit("movzx rax, al");
+        break;
+    default: error(n, "bad binary operator '%s'", token_name[op]);
+    }
+    return ct;
 }
 
 static Type *load_var(Node *n, int r) {
     const char *reg = reg64[r];
     Sym *s = lookup(n->name, n);
-    if (s->is_constant) { emit_comment(atom_str(n->name)); emit("mov %s, %ld", reg, s->ival); return ty_long(); }
     Type *t = s->type;
+    if (s->is_constant) { emit_comment(atom_str(n->name)); emit("mov %s, %ld", reg, s->ival); return t; }
     switch (t->kind) {
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
         if (s->is_global) emit("lea %s, [rip + %s]", reg, atom_str(n->name));
         else            { emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %d]", reg, s->offset); }
-        break;
+        break; // type is incorrect
     default: {
         const char *mov = t->is_unsigned ? "movzx" : "movsx";
         if (s->is_global) {
@@ -2660,6 +2905,14 @@ static bool all_simple_load(Node *n) {
     for (Node *arg = n->rhs; arg; arg = arg->next) if (!is_simple_load(arg)) return false;
     return true;
 }
+static bool check_num_args(Node *n, int nargs) {
+    if (n->nargs < abs(nargs)) { error(n, "missing argument for %s", atom_str(n->name)); return false; }
+    if (nargs > 0 && n->nargs > nargs) warning(n->pos, "too many arguments for %s", atom_str(n->name));
+    return true;
+}
+static void gen_arg(Node *n, int r, bool save_rax) {
+    if (check_num_args(n, 1)) gen_expr(n->rhs, r, save_rax);
+}
 
 static Type *gen_expr(Node *n, int r, bool save_rax) {
     const char *reg = reg64[r];
@@ -2701,8 +2954,13 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         } else {
             lt = gen_addr(n->lhs, RAX, save_rax); emit("push rax");
             load_ind(lt, RAX, RAX);
-            Type *rt = gen_expr(n->rhs, RCX, true);
-            gen_bin(n, n->op - T_PLUSEQ + T_PLUS, lt, rt);
+            int op = n->op - T_PLUSEQ + T_PLUS;
+            if (n->rhs->flags & CONST_VAL) {
+                gen_bin_imm(n, op, lt, RAX, false);
+            } else {
+                Type *rt = gen_expr(n->rhs, RCX, true);
+                gen_bin(n, op, lt, rt);
+            }
             emit("pop rcx");
             store_ind(lt, RCX, RAX);
         }
@@ -2755,34 +3013,39 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
     }
     case N_UNARY:
         gen_expr(n->lhs, r, save_rax);
-        if      (n->op == T_MINUS)  emit("neg %s", reg);
-        else if (n->op == T_BITNOT) emit("not %s", reg);
-        else { emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); }
-        return ty_long();
+        switch (n->op) {
+        case T_PLUS:    break; // promoted type
+        case T_MINUS:   emit("neg %s", reg); break; // type?
+        case T_BITNOT:  emit("not %s", reg); break; // type?
+        case T_NOT:     emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); break; // int?
+        }
+        return ty_long(); // should be int
     case N_LOGAND: {
-        int f = label_id++;
-        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", f);
+        int lab = label_id++;
+        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", lab);
         gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
-        emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(f);
-        return ty_long();
+        emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
+        return ty_long(); // should be int
     }
     case N_LOGOR: {
-        int tl = label_id++;
-        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jnz", tl);
+        int lab = label_id++;
+        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jnz", lab);
         gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
-        emit_label(tl); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
-        return ty_long();
+        emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
+        return ty_long(); // should be int
     }
     case N_CALL: {
         // ---- variadic built-ins (handled inline, not real calls) ----
         switch (n->name) {
         case ID__BUILTIN_VA_START:
+            if (!check_num_args(n, -1)) return ty_long();
             if (save_rax) emit("push rax");
             emit("lea rax, [rbp - %d]", cur_va_off - cur_named * 8);  // &save[named]
             gen_addr(n->rhs, RCX, true);      // rcx = &ap
             emit("mov [rcx], rax");            // ap = first vararg slot
             goto done_pop_rax;
         case ID__BUILTIN_VA_ARG: {
+            if (!check_num_args(n, -1)) return ty_long();
             if (save_rax) emit("push rax");
             gen_addr(n->rhs, RCX, false);     // rcx = &ap
             emit("mov rax, [rcx]");            // rax = ap
@@ -2792,33 +3055,31 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         }
         case ID__BUILTIN_VA_END: return ty_void();   // no-op
         case ID__BUILTIN_ROTATE_LEFT:
-            if (save_rax) emit("push rax");
-            gen_expr(n->rhs, RAX, false);
-            gen_expr(n->rhs->next, RCX, true); emit("rol rax, cl");
-            goto done_pop_rax;
         case ID__BUILTIN_ROTATE_RIGHT:
+            if (!check_num_args(n, 2)) return ty_long();
             if (save_rax) emit("push rax");
             gen_expr(n->rhs, RAX, false);
-            gen_expr(n->rhs->next, RCX, true); emit("ror rax, cl");
+            gen_expr(n->rhs->next, RCX, true);
+            if (n->kind == ID__BUILTIN_ROTATE_LEFT) emit("rol rax, cl"); else emit("ror rax, cl");
             goto done_pop_rax;
         case ID__BUILTIN_BSWAP16:
-            gen_expr(n->rhs, r, save_rax); emit("rol %s, 16", reg16[r]);
+            gen_arg(n, r, save_rax); emit("rol %s, 16", reg16[r]);
             goto done_long;
         case ID__BUILTIN_BSWAP32:
-            gen_expr(n->rhs, r, save_rax); emit("bswap %s", reg32[r]);
+            gen_arg(n, r, save_rax); emit("bswap %s", reg32[r]);
             goto done_long;
         case ID__BUILTIN_BSWAP64:
-            gen_expr(n->rhs, r, save_rax); emit("bswap %s", reg);
+            gen_arg(n, r, save_rax); emit("bswap %s", reg);
             goto done_long;
         case ID__BUILTIN_CLZ:
-            gen_expr(n->rhs, r, save_rax); emit("bsr %s, %s", reg, reg); emit("xor %s, 63", reg);
+            gen_arg(n, r, save_rax); emit("bsr %s, %s", reg, reg); emit("xor %s, 63", reg);
             goto done_long;
         case ID__BUILTIN_CTZ:
-            gen_expr(n->rhs, r, save_rax); emit("rep bsf %s, %s", reg, reg);
+            gen_arg(n, r, save_rax); emit("rep bsf %s, %s", reg, reg);
             goto done_long;
         case ID__SYSCALL:
+            if (!check_num_args(n, -1)) return ty_long();
             if (save_rax) emit("push rax");
-            if (!n->nargs) error(n, "missing syscall number argument");
             if (all_simple_load(n)) {
                 int i = 0;
                 for (Node *arg = n->rhs->next; arg; arg = arg->next) gen_expr(arg, ARGREG[i++], false);
@@ -2829,27 +3090,27 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
                 for (int i = n->nargs - 1; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
             }
             emit("syscall");
-            int end1 = label_id++;
             emit("test rax, rax");
-            emit_jmp(n, "jge", end1);
+            emit_jmp(n, "jge", 1);
             emit("neg rax");
             emit("mov [rip + errno], rax");
             emit("mov rax, -1");
-            emit_label(end1);
+            emit_label(1);
             goto done_pop_rax;
         case ID_ABS:
         case ID_LABS:
-            if (n->nargs != 1) error(n, "missing syscall number argument");
-            gen_expr(n->rhs, r, save_rax);
+            gen_arg(n, r, save_rax);
             emit("mov rdx, %s", reg);
             emit("neg %s", reg);
             emit("cmovs %s, rdx", reg);
-            return n->rhs->type;
+            goto done_long; // type?
         case ID__RDTSC:
+            check_num_args(n, 0);
             if (save_rax) emit("push rax");
             emit("rdtsc"); emit("shl rdx,32"); emit("or rax, rdx");
             goto done_pop_rax;
         case ID__RDTSCP:
+            check_num_args(n, 0);
             if (save_rax) emit("push rax");
             emit("rdtscp"); emit("shl rdx,32"); emit("or rax, rdx");
             goto done_pop_rax;
@@ -2890,11 +3151,15 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
     case N_BIN:
         if (save_rax) emit("push rax");
         Type *lt = gen_expr(n->lhs, RAX, false);
-        Type *rt = gen_expr(n->rhs, RCX, true);
-        rt = gen_bin(n, n->op, lt, rt);
+        if (n->rhs->flags & CONST_VAL) {
+            lt = gen_bin_imm(n, n->op, lt, RAX, false);
+        } else {
+            Type *rt = gen_expr(n->rhs, RCX, true);
+            lt = gen_bin(n, n->op, lt, rt);
+        }
         if (r != RAX) emit("mov %s, rax", reg);
         if (save_rax) emit("pop rax");
-        return rt;
+        return lt;
     default: error(n, "cannot generate expression"); return 0;
     }
 }
@@ -2925,23 +3190,99 @@ static void loop_push(Node *n, int b, int c) {
 }
 static void loop_pop(void) { loop_sp--; }
 
+//#define OLD
+#ifndef OLD
+#define DEST_NONE    (-1)
+#define DEST_BREAK   (-2)
+static bool case_expr_less(Node *t1, Node *t2, bool is_unsigned) {
+    if (is_unsigned) return t1->uval < t2->uval;
+    return t1->ival < t2->ival;
+}
+// generate case labels, evaluate case expressions, return true if all sorted
+static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
+    // evaluate and check case expressions
+    bool is_unsigned = ct->is_unsigned;
+    Node *last_expr = NULL;
+    bool sorted = true;
+    for (Node *e = n; e; e = e->lhs) {
+        Node *en = e->next;  // next statement in switch block
+        if (e->kind == N_DEFAULT) {
+            for (;; en = en->next) {
+                if (!en || en->kind == N_BREAK) { e->lab = DEST_NONE; break; }  // redundant default
+                if (en->kind == N_CASE) { en->lab = DEST_NONE; } // redundant cases after default
+                else break;
+            }
+            break;
+        }
+        // optimize `case xxx: ... break;` (should optimize continue and goto as well)
+        for (;; en = en->next) {
+            if (!en || en->kind == N_BREAK) { e->lab = DEST_BREAK; break; }
+            if (en->kind == N_DEFAULT) { e->lab = DEST_NONE; break; }
+            if (en->kind != N_CASE) break;
+        }
+        Node *t1 = e->cond, *t2 = e->rhs;
+        Value v1, v2;
+        eval_const_expr(t1, &v1, "'case' expression");
+        if (t2) {
+            eval_const_expr(t2, &v2, "'case' range end expression");
+            if (!value_check_range(&v1, ct) || !value_check_range(&v2, ct)) {
+                warning(e->cond->pos, "'case' range expressions are inconsistent with condition type");
+                e->lab = DEST_NONE;
+            }
+            if (case_expr_less(t2, t1, is_unsigned)) {
+                warning(e->pos, "'case' range is empty");
+                e->lab = DEST_NONE;
+            }
+        } else {
+            if (!value_check_range(&v1, ct)) {
+                warning(e->cond->pos, "'case' expression is beyond the range of condition type");
+                e->lab = DEST_NONE;
+            }
+            value_cast(&v1, ct);
+        }
+        if (last_expr) sorted &= case_expr_less(last_expr, t1, is_unsigned);
+        last_expr = t2 ? t2 : t1;
+    }
+
+    // allocate labels
+    int end = 0, def = 0;
+    for (Node *e = n; e; e = e->lhs) {
+        if (e->lab < 0) continue;
+        e->lab = label_id++;
+        if (e->kind == N_DEFAULT) def = e->lab;
+    }
+    if (has_flow(n)) end = label_id++;
+    if (!def) def = end;
+    *defp = def; *endp = end;
+    // XXX: should sort case expressions and check for duplicates
+    return sorted;
+}
+#endif
+
+static size_t gen_case_value(char *cbuf, size_t size, const char *s, Node *e) {
+    size_t pos = pstrcpy(cbuf, size, s);
+    switch (e->kind) {
+    case N_VAR:  pos += pstrcpy(cbuf + pos, size - pos, atom_str(e->name)); return pos;
+    default:
+        if (e->op == T_CHAR) {
+            char c = (char)e->uval; pos += encode_string(cbuf + pos, size - pos, &c, 1, '\''); return pos;
+        } else {
+            Value v; v.uval = e->uval; v.type = e->type; pos += value_str(&v, cbuf + pos, size - pos); return pos;
+        }
+    }
+}
+
 static void gen_case_comment(Node *n) {
     if (!out_comments) return;
-    char buf[20];
-    size_t pos = pstrcpy(buf, sizeof(buf), "case ");
-    Node *e = n->cond; long val = e->ival;
-    switch (e->kind) {
-    case N_VAR: pstrcpy(buf + pos, sizeof(buf) - pos, atom_str(e->name)); break;
-    default:
-        if (val >= ' ' && val < 127) snprintf(buf + pos, sizeof(buf) - pos, "'%c'", (int)val);
-        else snprintf(buf + pos, sizeof(buf) - pos, "%ld", val);
-        break;
-    }
+    char buf[48];
+    size_t len = gen_case_value(buf, sizeof(buf), "case ", n->cond);
+    if (n->rhs) len += gen_case_value(buf + len, sizeof(buf) - len, " ... ", n->rhs);
     emit_comment(buf);
 }
 
 static void gen_switch(Node *n) {
-    gen_expr(n->cond, RAX, false);
+    Type *ct = promoted_type(gen_expr(n->cond, RAX, false));
+#ifdef OLD
     // Emit "if (switch_value == case_value) goto case_label" for every case.
     // XXX: should check for duplicates
     int def = 0, end = 0;
@@ -2951,12 +3292,7 @@ static void gen_switch(Node *n) {
             Value v;
             eval_const_expr(e->cond, &v, "'case' expression");
             gen_case_comment(e);
-            if (value_check_range(&v, ty_int())) {
-                emit("cmp rax, %ld", v.ival);
-            } else {
-                emit("mov rdx, %ld", v.ival);
-                emit("cmp rax, rdx");
-            }
+            emit_cmp_imm(RAX, v.uval);
             emit_jmp(n, "jz", e->lab);
         } else {
             def = e->lab;
@@ -2964,6 +3300,62 @@ static void gen_switch(Node *n) {
     }
     if ((n->flags & HAS_BREAK) || !def) end = label_id++;
     emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
+#else
+    if (!n->lhs) { warning(n->pos, "empty switch"); return; }
+    int def, end, dest;
+    bool sorted = check_cases(n->lhs, ct, &def, &end);
+    bool is_unsigned = ct->is_unsigned;
+    unsigned long min_val = is_unsigned ? 0 : LONG_MIN;
+    for (Node *e = n->lhs; e; e = e->lhs) {
+        if (e->kind == N_DEFAULT) continue;
+        switch (dest = e->lab) {
+        case DEST_NONE:    continue;  // dummy case, no code generated
+        case DEST_BREAK:   dest = end; break;
+        }
+        gen_case_comment(e);
+        unsigned long val, val2;
+        val2 = val = e->cond->uval;
+        if (e->rhs) val2 = e->rhs->uval;
+        Node *nc;
+        // coalesce ordered consecutive cases
+        while ((nc = e->lhs) && nc == e->next && nc->kind == N_CASE && val2 != ct->max && nc->cond->uval == val2 + 1) {
+            val2++;
+            e = nc;
+            e->lab = DEST_NONE;
+            if (e->rhs) val2 = e->rhs->uval;
+            gen_case_comment(e);
+        }
+        if (val == val2) {  // range of 2: use individual tests
+            emit_cmp_imm(RAX, val);
+            emit_jmp(e, "jz", dest);
+        } else {
+            int lab = 0, emit_lab = 0;
+            if (val != min_val) { // need to test lower bound
+                long adj = (long)-val;
+                if (adj == (int)adj) {  // branchless version
+                    if (adj) {
+                        emit("lea rcx, [rax %+ld]", adj);
+                        emit_cmp_imm(RCX, val2 - val);
+                    } else {
+                        emit_cmp_imm(RAX, val2);
+                    }
+                    emit_jmp(e, "jbe", dest);
+                    if (sorted) min_val = val2;
+                    continue;
+                }
+                lab = sorted ? def : (emit_lab = 1);
+                emit_cmp_imm(RAX, val);
+                emit_jmp(e, is_unsigned ? "jb" : "jl", lab);
+            }
+            emit_cmp_imm(RAX, val2);
+            emit_jmp(e, is_unsigned ? "jbe" : "jle", dest);
+            emit_label(emit_lab);
+        }
+        if (sorted) min_val = val2;
+    }
+    emit_comment(def != end ? "default" : "break");
+    emit_jmp(n, "jmp", def);
+#endif
 
     // break exits the switch; continue passes through to the enclosing loop
     loop_push(n, end, cont_lbl[loop_sp]);
@@ -2994,8 +3386,14 @@ static void gen_stmt(Node *n) {
         emit("leave"); emit("ret");
         break;
     case N_IF: {
+        Node *cond = n->cond;
+        if (cond->flags & CONST_VAL) {
+            n = cond->uval ? n->lhs : n->rhs;
+            if (n) gen_stmt(n);
+            break;
+        }
         int els = label_id++;
-        gen_expr(n->cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", els);
+        gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", els);
         gen_stmt(n->lhs);
         if (n->rhs) {
             int end = label_id++; emit_jmp(n, "jmp", end);
@@ -3007,7 +3405,12 @@ static void gen_stmt(Node *n) {
     case N_WHILE: {
         int top = label_id++, end = label_id++;
         emit_label(top);
-        gen_expr(n->cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end);
+        Node *cond = n->cond;
+        if (cond->flags & CONST_VAL) {
+            if (!cond->uval) break;
+        } else {
+            gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end);
+        }
         loop_push(n, end, top); gen_stmt(n->lhs); loop_pop();
         // XXX: should duplicate test
         emit_jmp(n, "jmp", top);
@@ -3021,7 +3424,12 @@ static void gen_stmt(Node *n) {
         emit_label(top);
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
         emit_label(cont);
-        gen_expr(n->cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jnz", top);
+        Node *cond = n->cond;
+        if (cond->flags & CONST_VAL) {
+            if (cond->uval) emit_jmp(n, "jmp", top);
+        } else {
+            gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jnz", top);
+        }
         emit_label(end);
         break;
     }
@@ -3031,7 +3439,14 @@ static void gen_stmt(Node *n) {
         if (n->cond || (n->flags & HAS_BREAK)) end = label_id++;
         if (n->init) gen_stmt(n->init);
         emit_label(top);
-        if (n->cond) { gen_expr(n->cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end); }
+        Node *cond = n->cond;
+        if (cond) {
+            if (cond->flags & CONST_VAL) {
+                if (!cond->uval) break; // no code to emit
+            } else {
+                gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end);
+            }
+        }
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
         if (n->rhs) {
             if (cont != top) emit_label(cont);
@@ -3228,8 +3643,8 @@ static int output_token(FILE *fp, Token *t) {
             s = p; break;
         }
     case T_ID:    s = atom_str(t->text); break;
-    case T_STR:   gen_quoted_string(buf, sizeof(buf), atom_str(t->text), atom_len(t->text), '"'); break;
-    case T_CHAR:  c = (char)t->ival; gen_quoted_string(buf, sizeof(buf), &c, 1, '\''); break;
+    case T_STR:   encode_string(buf, sizeof(buf), atom_str(t->text), atom_len(t->text), '"'); break;
+    case T_CHAR:  c = (char)t->ival; encode_string(buf, sizeof(buf), &c, 1, '\''); break;
     default:      s = atom_str((atom_t)t->kind); break;
     }
     fputs(s, fp); return (int)strlen(s);

@@ -16,7 +16,7 @@ ssize_t __fwrite(const void *p, size_t len, nano_FILE *fp) {
 #endif
 
 char *_cvulong(char *p, unsigned long n, int shft, char cc) {
-    if (!shft) while (n) { *--p = '0' + n % 10; n = n / 10; }
+    if (!shft) while (n) { *--p = n % 10 + '0'; n = n / 10; }
     else {
         const char *digits = "0123456789ABCDEF";
         unsigned long msk = (1 << shft) - 1;
@@ -42,7 +42,7 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
         case 'd':;
             int n1 = va_arg(ap, int); n = n1;  // force sign extension
             if (n1 < 0) { total++; put1('-', fp); n = -n; }
-            do { *--s = '0' + n % 10; } while (n /= 10);
+            do { *--s = n % 10 + '0'; } while (n /= 10);
             total += e - s;
             while (s < e) put1(*s++, fp);
             q = ++fmt; continue;
