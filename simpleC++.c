@@ -1531,6 +1531,25 @@ static int g_minimal = 0;
 // They are pooled here and written out after the last function instead.
 static int g_nasm = 0;
 
+// --bss puts uninitialised globals in .bss (GNU-as) / `resb` (NASM) even in
+// kernel mode, instead of writing their zero bytes out into the object.
+//
+// Kernel mode's default is the other way round for a reason: a bare-metal image
+// is flattened with `objcopy -O binary`, which DROPS .bss entirely, and the
+// boot stub zeroes nothing -- so a global left in .bss comes up holding
+// whatever was in memory. Emitting the zeros makes them part of the image.
+//
+// That reasoning stops applying the moment something else does the zeroing. A
+// program loaded by an ELF loader gets p_memsz - p_filesz bytes of zeroed
+// pages for free, and paying for them in the file instead is not a small
+// difference: this compiler has about 19 MB of uninitialised globals, so its
+// own binary comes out at 19.6 MB with the zeros in it and 112 KB without.
+// That is the difference between a file the OS can load and one it cannot.
+//
+// It is orthogonal to --kernel and off by default, so every existing target
+// keeps the output it had.
+static int g_bss = 0;
+
 typedef struct StrLit { int id; char *bytes; int len; struct StrLit *next; } StrLit;
 static StrLit *strlits = NULL, *strlit_tail = NULL;
 
@@ -1591,6 +1610,12 @@ static void emit_global(Sym *g, int nasm) {
     int sz = ty_size(g->type); if (sz < 1) sz = 8;
     if (!g->initdata) {
         if (!nasm) { emit("%s: .zero %d", asm_sym(g->name), sz); return; }
+        // `resb N` reserves N bytes without emitting them. It is the NASM
+        // spelling of the same thing .zero-in-.bss does, and the reason the
+        // --nasm output of this compiler was 61 MB without it: 19 MB of
+        // globals written out as `db 0, 0, 0, ...`, one decimal digit and a
+        // comma per byte.
+        if (g_bss) { fprintf(fout, "%s: resb %d\n", asm_sym(g->name), sz); return; }
         fprintf(fout, "%s:", asm_sym(g->name));
         for (int i = 0; i < sz; i++) {
             if (i % 32 == 0) fputs(i ? "\n db " : " db ", fout);
@@ -2494,11 +2519,12 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--kernel") || !strcmp(argv[i], "-k")) kernel_mode = 1;
         else if (!strcmp(argv[i], "--minimal")) g_minimal = 1;
         else if (!strcmp(argv[i], "--nasm")) g_nasm = 1;
+        else if (!strcmp(argv[i], "--bss")) g_bss = 1;
         else if (!inpath)  inpath  = argv[i];
         else if (!outpath) outpath = argv[i];
     }
     if (!inpath || !outpath) {
-        fprintf(stderr, "Usage: %s [--kernel] [--minimal] [--nasm] <input.c> <output.s>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--kernel] [--minimal] [--nasm] [--bss] <input.c> <output.s>\n", argv[0]);
         return 1;
     }
 
@@ -2542,10 +2568,13 @@ int main(int argc, char **argv) {
     for (Func *f = funcs; f; f = f->next) gen_func(f);
     if (g_need_divmod) gen_divmod_routine();
 
-    // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
-    // mode uses .data so the zero bytes are emitted into the object and survive
-    // an objcopy to a flat binary — the bare-metal image needs no separate
-    // .bss zero-fill step.
+    // Globals.  Hosted mode puts the uninitialised ones in .bss, where the
+    // loader zeroes them.  Kernel mode uses .data instead, so the zero bytes
+    // are emitted into the object and survive an objcopy to a flat binary —
+    // that image has no .bss zero-fill step, so a global in .bss would come up
+    // holding whatever was in memory.  --bss overrides that for kernel-mode
+    // output that will be loaded as an ELF rather than flattened.
+    int use_bss = !kernel_mode || g_bss;
     if (g_nasm) {
         // One flat image: the pooled string literals and the globals both go
         // here, after the last function, where nothing can execute into them.
@@ -2557,13 +2586,25 @@ int main(int argc, char **argv) {
             char lbl[64]; snprintf(lbl, sizeof lbl, ".LD%d", d->id);
             emit_db_bytes(lbl, (const unsigned char *)d->bytes, d->len, 1);
         }
-        for (Sym *g = globals; g; g = g->next) emit_global(g, 1);
+        // g_bss, not use_bss: --nasm output goes to the bootstrap assembler,
+        // which produces one flat image with no loader behind it, so .bss is
+        // only safe here when it has been asked for explicitly by someone who
+        // knows the assembler honours `resb`.
+        if (g_bss) {
+            // Initialised globals stay in the flat stream; the uninitialised
+            // ones move behind a `section .bss` header so they cost no bytes.
+            for (Sym *g = globals; g; g = g->next) if (g->initdata)  emit_global(g, 1);
+            emit("section .bss");
+            for (Sym *g = globals; g; g = g->next) if (!g->initdata) emit_global(g, 1);
+        } else {
+            for (Sym *g = globals; g; g = g->next) emit_global(g, 1);
+        }
     } else {
-        emit(kernel_mode ? "    .section .data" : "    .section .bss");
+        emit(use_bss ? "    .section .bss" : "    .section .data");
         emit("    .align 8");
         for (Sym *g = globals; g; g = g->next) {
             // An initialised global cannot live in .bss — .bss has no contents.
-            if (g->initdata && !kernel_mode) continue;
+            if (g->initdata && use_bss) continue;
             // Kernel mode exports its globals. A kernel is C plus hand-written
             // assembly, and the assembly regularly needs to read a variable the
             // C side owns -- isr_common reads g_switch_cr3 in the one window
@@ -2586,7 +2627,7 @@ int main(int argc, char **argv) {
         // only the string pool is left; without this the section header came
         // out a second time with nothing under it.
         int any = datastrs != NULL;
-        if (!kernel_mode)
+        if (use_bss)
             for (Sym *g = globals; g && !any; g = g->next) if (g->initdata) any = 1;
         if (any) {
             emit("    .section .data");
@@ -2605,7 +2646,13 @@ int main(int argc, char **argv) {
                 fputs("\"\n", fout);
             }
             for (Sym *g = globals; g; g = g->next)
-                if (g->initdata && !kernel_mode) emit_global(g, 0);
+                if (g->initdata && use_bss) {
+                    // Same export rule as the .bss pass above: in kernel mode
+                    // the assembly half of the image has to be able to see
+                    // these names.
+                    if (kernel_mode) emit("    .globl %s", asm_sym(g->name));
+                    emit_global(g, 0);
+                }
         }
     }
 
