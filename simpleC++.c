@@ -1615,7 +1615,13 @@ static void emit_global(Sym *g, int nasm) {
         // --nasm output of this compiler was 61 MB without it: 19 MB of
         // globals written out as `db 0, 0, 0, ...`, one decimal digit and a
         // comma per byte.
-        if (g_bss) { fprintf(fout, "%s: resb %d\n", asm_sym(g->name), sz); return; }
+        //
+        // "name resb N", with NO colon, which is NASM's form and is not
+        // cosmetic. With a colon the name is a LABEL AT THE CURRENT ADDRESS
+        // and `resb` is left behind as a bare directive on its own: the global
+        // would point into the middle of the code, nothing would be reserved,
+        // and every write through it would overwrite an instruction.
+        if (g_bss) { fprintf(fout, "%s resb %d\n", asm_sym(g->name), sz); return; }
         fprintf(fout, "%s:", asm_sym(g->name));
         for (int i = 0; i < sz; i++) {
             if (i % 32 == 0) fputs(i ? "\n db " : " db ", fout);
@@ -2576,8 +2582,19 @@ int main(int argc, char **argv) {
     // output that will be loaded as an ELF rather than flattened.
     int use_bss = !kernel_mode || g_bss;
     if (g_nasm) {
-        // One flat image: the pooled string literals and the globals both go
-        // here, after the last function, where nothing can execute into them.
+        // One image, but not one segment. Everything above this line is code
+        // and everything below it is data, so saying so lets the assembler emit
+        // a read+execute segment and a read+write one instead of a single
+        // read+write+execute segment -- which is the one property every
+        // "write some bytes and then jump to them" technique needs.
+        //
+        // The assembler pads to a page boundary here, because a loader maps a
+        // segment at p_vaddr from p_offset and the two have to be congruent
+        // modulo the page size.
+        emit("section .data");
+
+        // The pooled string literals and the globals both go here, after the
+        // last function, where nothing can execute into them.
         for (StrLit *sl = strlits; sl; sl = sl->next) {
             char lbl[64]; snprintf(lbl, sizeof lbl, ".LC%d", sl->id);
             emit_db_bytes(lbl, (const unsigned char *)sl->bytes, sl->len, 1);
