@@ -2564,6 +2564,18 @@ int main(int argc, char **argv) {
         for (Sym *g = globals; g; g = g->next) {
             // An initialised global cannot live in .bss — .bss has no contents.
             if (g->initdata && !kernel_mode) continue;
+            // Kernel mode exports its globals. A kernel is C plus hand-written
+            // assembly, and the assembly regularly needs to read a variable the
+            // C side owns -- isr_common reads g_switch_cr3 in the one window
+            // where it can change CR3 safely, and a call to fetch it would
+            // touch the stack it is in the middle of replacing. Without this
+            // the symbol is local to the object and the link fails with
+            // "undefined reference" to something the source plainly defines.
+            //
+            // Only in kernel mode: a kernel image links exactly one C object,
+            // so there is nothing for these names to collide with. Hosted
+            // output keeps its globals local.
+            if (kernel_mode) emit("    .globl %s", asm_sym(g->name));
             emit_global(g, 0);
         }
     }

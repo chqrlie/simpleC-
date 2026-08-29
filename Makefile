@@ -13,7 +13,9 @@ CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
 SRC       = simpleC++.c
 BIN       = nano_cc
 
-.PHONY: all run test demo structs bitwise printf switch clean
+.PHONY: all run test demo structs bitwise printf switch minimal \
+        initializers typedefs gotos functions reserved libcheck casts checkall \
+        selfhost clean
 
 all: $(BIN)
 
@@ -70,8 +72,63 @@ switch: $(BIN)
 	@echo "---- ./switch_prog output ----"
 	@./switch_prog
 
+# --minimal: emit only the instruction set the bootstrap assembler implements
+# (mov add or and sub xor cmp shl shr sar jcc call ret syscall, plus 8-bit mov).
+# Checks every demo still behaves identically and uses nothing outside that set.
+minimal: $(BIN)
+	@sh minimal-check.sh
+
+# Checked against gcc compiling the same source, in normal and --minimal mode.
+# Pass MINIASM=/path/to/mini-asm to include the no-binutils leg:
+#   make initializers MINIASM=../sha-audit/build/fixed
+MINIASM ?=
+
+# Brace initialisers, local and global.
+initializers: $(BIN)
+	@sh gcc-check.sh initializers.c $(MINIASM)
+
+# typedef and enum: typedef'd builtins, structs, pointers and arrays, the
+# self-referential idiom, enumerator auto-increment, enums as array sizes and
+# case labels, and block-scope typedefs.
+typedefs: $(BIN)
+	@sh gcc-check.sh typedefs.c $(MINIASM)
+
+# goto and labels: forward, backward, out of nested loops, inside a switch.
+gotos: $(BIN)
+	@sh gcc-check.sh gotos.c $(MINIASM)
+
+# array parameters (long m[4][3] is long (*m)[3]) and function return types.
+functions: $(BIN)
+	@sh gcc-check.sh functions.c $(MINIASM)
+
+# C names that are assembler keywords (sp, ax, ch, gs, flat, ptr, word).
+reserved: $(BIN)
+	@sh gcc-check.sh reserved.c $(MINIASM)
+
+# nano-libc.h: the freestanding C library, checked against glibc.
+libcheck: $(BIN)
+	@sh gcc-check.sh libcheck.c $(MINIASM)
+
+# Cast precedence: a cast binds to a unary-expression, not to what follows.
+casts: $(BIN)
+	@sh gcc-check.sh casts.c $(MINIASM)
+
+# Every gcc-checked suite in one go.
+checkall: $(BIN)
+	@for f in initializers typedefs gotos functions reserved libcheck casts; do \
+	    echo "== $$f.c"; sh gcc-check.sh $$f.c $(MINIASM) || exit 1; \
+	done
+
+# The three-stage bootstrap: nano_cc builds itself, then that builds itself,
+# and the two have to come out byte-identical. Uses nano-libc.h, not glibc.
+selfhost: $(BIN)
+	@sh selfhost.sh
+
 clean:
 	rm -f $(BIN) sample.s sample_prog test.s test_prog \
 	      features.s features_prog structs.s structs_prog \
 	      bitwise.s bitwise_prog printf.s printf_prog \
-	      switch.s switch_prog
+	      switch.s switch_prog initializers.s initializers_prog \
+	      typedefs.s typedefs_prog gotos.s gotos_prog \
+	      functions.s functions_prog reserved.s reserved_prog \
+	      libcheck.s libcheck_prog libcheck.tmp casts.s casts_prog
