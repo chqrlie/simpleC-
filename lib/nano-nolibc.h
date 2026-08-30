@@ -6,7 +6,7 @@ typedef unsigned char bool;
 #define true 1
 #define false 0
 
-typedef long va_list;
+#define va_list          __builtin_va_list
 #define va_start(ap, l)  __builtin_va_start(ap, l)
 #define va_arg(ap, t)    ((t)__builtin_va_arg(ap))
 #define va_copy(a1, a2)  ((a1) = (a2))

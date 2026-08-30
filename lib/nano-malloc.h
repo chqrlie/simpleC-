@@ -1,6 +1,6 @@
 #ifndef ARENA_LENGTH
 // stdlib.h
-#define ARENA_LENGTH 2400000 // 2MB should suffice for everyone
+#define ARENA_LENGTH 3200000 // 3MB should suffice for everyone
 //#define MALLOC_TRACE 1
 unsigned char arena[ARENA_LENGTH];
 size_t arena_top, arena_last;

@@ -9,6 +9,7 @@
 // =====================================================================
 
 //#define NO_REALLOC
+//#define ATOM_STATS
 #define SMALL
 
 #include <ctype.h>
@@ -31,7 +32,7 @@ static void malloc_stats(void) {
 #include <malloc.h>
 #endif
 
-#if (defined(__GNUC__) || defined(__TINYC__))
+#if defined(__GNUC__) || defined(__TINYC__)
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #else
 #define attr_printf(a, b)
@@ -98,6 +99,17 @@ static size_t skip_until(const char *s, char c) {
     size_t i = 0;
     while (s[i] && s[i] != '\n' && s[i] != c) i++;
     return i;
+}
+static size_t skip_pp_number(const char *p) {
+    const char *q = p;
+    for (unsigned char c, last = 0; (c = *p++); last = c) {
+        if (c == '.' && *p != '.') continue;
+        if ((c == '+' || c == '-') && ((last |= 0x20) == 'e' || last == 'p')) continue;
+        if (c == '\'' || c == '_') continue;
+        if (isalnum(c)) continue;
+        break;
+    }
+    return p - q - 1;
 }
 static size_t skip_string(const char *s, size_t *slen) {
     char sep = *s;
@@ -199,14 +211,54 @@ static void sbuf_trim(sbuf_t *sb) {
     if (p) { sb->buf = p; sb->cap = sb->len + 1; }
 }
 
+static size_t encode_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
+    if (!size) return 0;
+    size--;  // number of available bytes left in buf before the null terminator
+    size_t j = 0;
+#define PUT(c)  (void)(j < size && (buf[j++] = c))
+    if (sep) PUT(sep);
+    for (size_t i = 0; i < slen;) {
+        int ch = (unsigned char)str[i++];
+        switch (ch) {
+        case '\a': ch = 'a'; break;  case '\b': ch = 'b'; break;
+        case '\t': ch = 't'; break;  case '\n': ch = 'n'; break;
+        case '\v': ch = 'v'; break;  case '\f': ch = 'f'; break;
+        case '\r': ch = 'r'; break;
+        case '\\': break;
+        case '"': case '\'': if (ch == sep) break;
+        default:
+            if (ch < 32 || ch > 126) break;
+            PUT(ch); continue;
+        }
+        PUT('\\');  // encode as an escape sequence
+        if (ch >= 32 && ch <= 126) { PUT(ch); continue; }
+        if (i < slen && isdigit((unsigned char)str[i])) ch |= 01000;
+        if (ch & 01700) PUT(((ch >> 6) & 7) + '0');
+        if (ch & 01770) PUT(((ch >> 3) & 7) + '0');
+        PUT((ch & 7) + '0');
+    }
+    if (sep) PUT(sep);
+#undef PUT
+    buf[j] = '\0';
+    return j;
+}
+
 // =====================================================================
 // 0.1. ATOM TABLE -> convert names and strings to single atoms
 // =====================================================================
 
 typedef unsigned int atom_t;
-#define ATOM_MACRO 1
-#define ATOM_USED  2
-typedef struct Atom { atom_t next; unsigned int len; struct Sym *sym; unsigned char flags; char str[7]; } Atom;
+#define ATOM_MACRO  1
+#define ATOM_USED   2
+typedef struct Atom {
+    atom_t next; unsigned int len;
+    struct Sym *sym;
+#ifdef ATOM_STATS
+#define ATOM_STRING 4
+    unsigned refs;
+#endif
+    unsigned char flags; char str[15];  // this improves gdb output
+} Atom;
 static Atom **atoms;
 static size_t natoms, atoms_cap;
 #define ATOM_HASH_LEN  1023
@@ -216,28 +268,40 @@ static const char *atom_str(atom_t i) { return atoms[i]->str; }
 static size_t atom_len(atom_t i) { return atoms[i]->len; }
 #define atom_flags(i)  atoms[i]->flags
 #define atom_sym(i)    atoms[i]->sym
+static void stop() {}
 static atom_t new_atom_len(const char *p, size_t len) {
-    if (!atoms) {
-        atoms = alloc(atoms_cap = 1024, sizeof(Atom*));
-        atoms[0] = allocz(1, sizeof(Atom)); natoms = 1;
+    if (len == 7 && !memcmp(p, "xffffff", 7)) stop(); //@@@
+    if (!len) { // special case the empty string, which must be created first
+        if (atoms) {
+#ifdef ATOM_STATS
+            (*atoms)->refs++;
+#endif
+            return 0;
+        }
     }
-    if (!len) { return 0; } // special case the empty string
     const unsigned char *str = (const unsigned char *)p;
     unsigned long hash = 0;
     for (size_t i = 0; i < len; i++) hash = hash * 37 + str[i];
-    // Achtung Minen! we do not support unsigned arithmetics yet
     hash = hash % ATOM_HASH_LEN;
     atom_t a = atom_hash[hash];
     while (a) {
         Atom *ap = atoms[a];
-        if (ap->len == len && !memcmp(ap->str, str, len)) return a;
+        if (ap->len == len && !memcmp(ap->str, str, len)) {
+#ifdef ATOM_STATS
+            ap->refs++;
+#endif
+            return a;
+        }
         a = ap->next;
     }
     if (natoms >= atoms_cap) { atoms = reallocate(atoms, &atoms_cap, sizeof(Atom*), 2048); }
-    Atom *ap = alloc(1, sizeof(Atom) - 7 + len + 1);
+    Atom *ap = alloc(1, sizeof(Atom) - 15 + len + 1);
     ap->next = atom_hash[hash];
     ap->len = (unsigned int)len;
     ap->sym = NULL;
+#ifdef ATOM_STATS
+    ap->refs = 0;
+#endif
     ap->flags = 0;
     memcpy(ap->str, str, len);
     ap->str[len] = 0;
@@ -247,6 +311,23 @@ static atom_t new_atom_len(const char *p, size_t len) {
     return a;
 }
 static atom_t new_atom(const char *str) { return new_atom_len(str, strlen(str)); }
+
+#ifdef ATOM_STATS
+static void atom_stats(void) {
+    unsigned long total = 0;
+    for (atom_t a = 0; a < natoms; a++) {
+        char buf[8192];
+        Atom *ap = atoms[a];
+        total += ap->refs + 1;
+        const char *s = ap->str;
+        if (ap->flags & ATOM_STRING) {
+            encode_string(buf, sizeof(buf), ap->str, ap->len, '"'); s = buf;
+        }
+        printf("%5u %3d %2d  %s\n", ap->refs + 1, ap->len, ap->flags, s);
+    }
+    printf("%zu/%zu atoms, %lu calls\n", natoms, atoms_cap, total);
+}
+#endif
 
 // =====================================================================
 // 0.2. PREDEFINED ATOMS
@@ -279,14 +360,14 @@ enum {
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
     K_INCLUDE, K_LINE, ID__FILE__, ID__LINE__, ID__COUNTER__,
 
-#define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) < ID_START)
+#define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) < ID__START)
     ID__BUILTIN_VA_START, ID__BUILTIN_VA_ARG, ID__BUILTIN_VA_END,
     ID__BUILTIN_BSWAP16, ID__BUILTIN_BSWAP32, ID__BUILTIN_BSWAP64,
     ID__BUILTIN_CLZ, ID__BUILTIN_CTZ,
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
     ID__SYSCALL, ID__RDTSC, ID__RDTSCP, ID_ABS, ID_LABS,
 
-    ID_START, ID_EXIT, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
+    ID__START, ID_EXIT, ID_MAIN, ID_PRINTF, ID_PUTS, ID_STRLEN, ID_STRCPY, ID_MEMCPY,
     T_count
 };
 static const char *token_name[T_count] = {
@@ -367,6 +448,15 @@ static void macro_undef(atom_t name) {
     }
 }
 
+static void create_builtin_macros(void) {
+    macro_define(new_atom("__NANOCC__"), 0, -1, NULL, 1, "1");
+    macro_define(new_atom("__VERSION__"), 0, -1, NULL, 3, "0.1");
+    atom_t a = ID_MAIN;
+    macro_define(new_atom("__attribute__"), 0, 1, &a, 0, "");
+    macro_define(new_atom("__builtin_va_list"), 0, -1, NULL, 4, "long");
+    //macro_define(ID_VA_LIST, 0, -1, NULL, 17, "__builtin_va_list");
+}
+
 typedef struct MacroArguments {
     const char *argv[8];
     int len[8];
@@ -385,8 +475,9 @@ static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, ch
     const char *q = p;
     size_t j = 0, k = 0;
     int pi = -1;
-    for (char vc;;) {
+    for (unsigned char vc;;) {
         if      ((vc = *p) == '\0') k = 0;
+        else if (isdigit(vc)) { p += skip_pp_number(p); continue; }
         else if (isalpha((unsigned char)vc) || vc == '_') {
             k = skip_word(p);
             if (!m || m->nparams <= 0 || !find_macro_param(m, new_atom_len(p, k), &pi)) { p += k; continue; }
@@ -408,6 +499,7 @@ static void expand_line(const char *in, sbuf_t *sb) {
         char buf[256]; int len;
         char c;
         while ((c = *p) != '\0') {
+            if (isdigit((unsigned char)c)) { p += skip_pp_number(p); continue; }
             if (c == '"' || c == '\'') { p += skip_string(p, NULL); continue; }
             if (isalpha((unsigned char)c) || c == '_') {
                 size_t k = skip_word(p);
@@ -480,7 +572,7 @@ static size_t strip_comments(char *s) {
     }
     // strip comments, extra blanks, preserve line numbers and indentation
     p = q = s;
-    for (;;) {
+    for (size_t k;;) {
         switch (c = *q = *p++) {
         case '\0': return q - s;
         case '\n':
@@ -491,11 +583,12 @@ static size_t strip_comments(char *s) {
             if (bol) q++; // keep indentation
             else if (q[-1] != ' ') *q++ = ' '; // normalize spacing
             continue;
-        case '\'': // char constant or bogus digit separator
-            if (isdigit((unsigned char)q[-1])) break;
-        case '"':;
-            size_t k = skip_string(--p, NULL);
-            while (k--) *q++ = *p++;
+        case '0'...'9':
+            k = skip_pp_number(p); goto copy; // needed to recognise 1'000
+        case '\'': case '"':
+            k = skip_string(p - 1, NULL) - 1;
+        copy:
+            q++; while (k--) *q++ = *p++;
             bol = false; continue;
         case '/':
             if (*p == '/') {
@@ -682,7 +775,11 @@ static void process_text(const char *text, sbuf_t *sb) {
                 if (*p == '"' || (sep = '>', sys = true, *p == '<')) {
                     size_t k = skip_until(++p, sep);
                     if (p[k] != sep) die("invalid include file name");
-                    process_include(atom_str(new_atom_len(p, k)), sys, sb); p += k + 1;
+                    atom_t name = new_atom_len(p, k);
+#ifdef ATOM_STATS
+                    atom_flags(name) |= ATOM_STRING;
+#endif
+                    process_include(atom_str(name), sys, sb); p += k + 1;
                 } else { die("missing include file name"); }
                 break;
             }
@@ -761,11 +858,11 @@ typedef struct {
     };
 } Token;
 
-#define MAX_TOK 60000
-static Token toks[MAX_TOK];
+#define DEF_TOK_CAP 50000
+static Token *toks;
+static size_t toks_cap;
 static size_t ntok;
 
-static Token *add_tok(int kind) { Token *t = &toks[ntok++]; t->kind = kind; t->pos = src_pos; return t; }
 static const char *token_str(Token *t) {
     return atom_str(t->kind == T_ID ? t->text : (atom_t)t->kind);
 }
@@ -775,10 +872,11 @@ static int read_escape(const char *p, size_t *len) { // `p` points just past a b
     int c = *p++;
     switch (c) {
     case 0: *len = 0; return 0;
-    case 'n': return '\n';  case 't': return '\t';  case 'r': return '\r';
-    case 'b': return '\b';  case 'f': return '\f';  case 'v': return '\v';
+    case 'a': return '\a';  case 'b': return '\b';  case 'f': return '\f';
+    case 'n': return '\n';  case 'r': return '\r';  case 't': return '\t';
+    case 'v': return '\v';
     case '\\': case '\'': case '"': return c;
-    case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7':
+    case '0'...'7':
         c -= '0';
         if (*p >= '0' && *p <= '7') {
             c = c * 8 + (*p++ - '0'); *len = 2;
@@ -834,14 +932,26 @@ static size_t lex(const char *p) {
         unsigned char c = *p++;
         if (c == '\n') { src_pos++; continue; }
         if (isspace(c)) continue;
+        // should handle comments and preprocessing here too
+        // prepare token
+        if (ntok >= toks_cap) toks = reallocate(toks, &toks_cap, sizeof(Token), DEF_TOK_CAP);
+        Token *t = &toks[ntok++]; t->pos = src_pos;
 
-        if (c == 0) {
-            p--; add_tok(T_EOF);
-            if (verbose) printf("Tokenized: %zu tokens\n", ntok);
+#define set_tok(k)  t->kind = (k)
+        if (!c) {
+            p--; set_tok(T_EOF);
+            if (verbose) printf("Tokenized: %zu/%zu tokens\n", ntok, toks_cap);
             return p - start;
         }
+        if (c == '.') {
+            if (isdigit((unsigned char)*p)) goto has_float;
+            if (*p == '.' && p[1] == '.') {
+                p += 2; set_tok(T_ELLIPSIS); continue;
+            }
+            set_tok(T_DOT); continue;
+        }
         if (isdigit(c)) {
-            Token *t = add_tok(T_NUM);
+            set_tok(T_NUM);
             unsigned long v = c - '0';
             int base = 10, d;
             if (c == '0') {
@@ -852,11 +962,20 @@ static size_t lex(const char *p) {
                 default:  base = 8;        break;
                 }
             }
+            // should ignore '
             while ((d = xdigit(c = *p)) < base) { v = v * base + d; p++; }
             t->base = base;
             t->uval = v;
             if (isdigit(c)) die("invalid digit '%c' for base %d", c, base);
-            if (c == '.' || (c | 0x20) == 'e') die("floating point not supported");
+        has_float:;
+            char c1 = c | 0x20;
+            if (c == '.' || c1 == 'e' || c1 == 'p' || c1 == 'f') {
+                warning(t->pos, "floating point not supported");
+                // parse and ignore fractional part, exponent and suffix
+                p--;  // backtrack on the exponent part
+                p += skip_pp_number(p);
+                continue;
+            }
             for (;; c = *++p) {
                 switch (c | 0x20) {
                 case 'u': t->is_unsigned = true; continue;
@@ -870,8 +989,8 @@ static size_t lex(const char *p) {
         if (isalpha(c) || c == '_') {
             size_t k = skip_word(--p);
             atom_t name = new_atom_len(p, k); p += k;
-            if (IS_KEYWORD(name)) { add_tok((int)name); continue; }
-            Token *t = add_tok(T_ID); t->text = name; ; continue;
+            if (IS_KEYWORD(name)) { set_tok((int)name); continue; }
+            set_tok(T_ID); t->text = name; continue;
         }
         if (c == '"' || c == '\'') {  // string literal / character constant
             char buf[8192]; size_t len = 0;
@@ -883,17 +1002,15 @@ static size_t lex(const char *p) {
                 if (len >= sizeof(buf)) die("%s too long", thing);
                 buf[len++] = (char)ch;
             }
-            Token *t;
-            if (ch == '"') { t = add_tok(T_STR); t->text = new_atom_len(buf, len); continue; }
-            if (len != 1) die("malformed character constant");
-            t = add_tok(T_CHAR); t->ival = *buf; continue;
-        }
-        if (c == '.') {
-            if (isdigit((unsigned char)*p)) { die("floating point not supported"); }
-            if (*p == '.' && p[1] == '.') {
-                p += 2; add_tok(T_ELLIPSIS); continue;
+            if (ch == '"') {
+                set_tok(T_STR); t->text = new_atom_len(buf, len);
+#ifdef ATOM_STATS
+                atom_flags(t->text) |= ATOM_STRING;
+#endif
+                continue;
             }
-            add_tok(T_DOT); continue;
+            if (len != 1) die("malformed character constant");
+            set_tok(T_CHAR); t->ival = *buf; continue;
         }
         if (c == '#') { // parse # number [filename]
             p += skip_blanks(p);
@@ -908,20 +1025,23 @@ static size_t lex(const char *p) {
             src_pos = update_pos(src_pos, filename, lineno);
             p += skip_until(p, '\n');
             p += (*p == '\n');
+            ntok--;  // backtrack: no token yet
             continue;
         }
-        if (c == '-' && *p == '>') { p++; add_tok(T_ARROW); continue; }
+        if (c == '-' && *p == '>') { p++; set_tok(T_ARROW); continue; }
         const char *pp = ops;
         while (pp < ops + sizeof(ops) && *pp && *pp != c) pp += 5;
         if (*pp) {
             if (pp[2] && *p == c) {
-                if (pp[4] && p[1] == '=') { p += 2; add_tok(pp[4]); continue; }
-                else { p++; add_tok(pp[2]); continue; }
+                if (pp[4] && p[1] == '=') { p += 2; set_tok(pp[4]); continue; }
+                else { p++; set_tok(pp[2]); continue; }
             }
-            if (pp[3] && *p == '=') { p++; add_tok(pp[3]); continue; }
-            else { add_tok(pp[1]); continue; }
+            if (pp[3] && *p == '=') { p++; set_tok(pp[3]); continue; }
+            else { set_tok(pp[1]); continue; }
         }
-        warning(src_pos, "unknown character '%c' in source", c);
+        // should make this an unknown token?
+        warning(t->pos, "unknown character '%c' in source", c);
+#undef set_tok
     }
 }
 
@@ -943,7 +1063,7 @@ typedef struct Type {
     unsigned char kind, align; bool is_unsigned, is_ptrish; int pos;
     union {
         struct {            // TY_INT ... TY_ULONG
-            int size__;
+            int size_;
             unsigned long max;
         };
         struct {            // TY_ENUM
@@ -1005,7 +1125,6 @@ static Type *ptr_to(Type *base) {
     t->kind = TY_PTR; t->align = t->size = 8; t->is_ptrish = true;
     t->ptr = base; return t;
 }
-#define ty_align(t) ((t)->align)
 static int ty_size(Type *t) {
     switch (t->kind) {
     case TY_ARRAY:  return ty_size(t->ptr) * t->arr_len;
@@ -1088,13 +1207,13 @@ enum {  // tflags
     HAS_TYPE     = 1 << (K_ENUM     - K_INT),  // typename, enum, struct, union
 };
 enum {  // sflags
-    HAS_CONST    = 1 << (K_CONST    - K_CONST),
-    HAS_VOLATILE = 1 << (K_VOLATILE - K_CONST),
-    HAS_AUTO     = 1 << (K_AUTO     - K_CONST),
+    //HAS_CONST    = 1 << (K_CONST    - K_CONST),
+    //HAS_VOLATILE = 1 << (K_VOLATILE - K_CONST),
+    //HAS_AUTO     = 1 << (K_AUTO     - K_CONST),
     HAS_STATIC   = 1 << (K_STATIC   - K_CONST),
     HAS_REGISTER = 1 << (K_REGISTER - K_CONST),
     HAS_EXTERN   = 1 << (K_EXTERN   - K_CONST),
-    HAS_THREAD_LOCAL = 1 << (K_THREAD_LOCAL - K_CONST),
+    //HAS_THREAD_LOCAL = 1 << (K_THREAD_LOCAL - K_CONST),
     HAS_TYPEDEF  = 1 << (K_TYPEDEF  - K_CONST),
     HAS_INLINE   = 1 << (K_INLINE   - K_CONST),
     HAS_NORETURN = 1 << (K_NORETURN - K_CONST),
@@ -1402,12 +1521,12 @@ static Type *parse_struct(int kind) {
         st->align = 1;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             int flags;
-            Type *mbase = parse_type_base_only(&flags);
+            Type *base = parse_type_base_only(&flags);
             for (;;) {
-                Type *mt = parse_ptrs(mbase);
-                atom_t mnm = 0;
+                Type *mt = parse_ptrs(base);
+                atom_t name = 0;
                 if (at(T_ID)) {
-                    mnm = getid();
+                    name = getid();
                     if (eat(T_LBRK)) mt = parse_array(mt);
                 } else {
                     // accept unnamed members, must be untagged aggregate types (except bit-fields)
@@ -1415,10 +1534,10 @@ static Type *parse_struct(int kind) {
                         error(NULL, "anonymous members must be untagged struct or union definitions");
                 }
                 int msz = ty_size(mt);
-                int align = ty_align(mt);
+                int align = mt->align;
                 if (align > st->align) st->align = (unsigned char)align;
                 Member *m = allocz(1, sizeof(Member));
-                m->name = mnm; m->type = mt;
+                m->name = name; m->type = mt;
                 if (tail) { // set padding bytes in previous element
                     int off0 = off;
                     off = (off + align - 1) & ~(align - 1);
@@ -1433,7 +1552,7 @@ static Type *parse_struct(int kind) {
                 } else {
                     m->offset = off; off += msz;
                 }
-                if (!mnm) shift_members(m);
+                if (!name) shift_members(m);
                 if (!eat(T_COMMA)) break;
             }
             expect(T_SEMI);
@@ -1544,6 +1663,9 @@ static Node *parse_string(void) {
         }
         if (len == sizeof buf) error(n, "string too long");
         n->str = new_atom_len(buf, len);
+#ifdef ATOM_STATS
+        atom_flags(n->str) |= ATOM_STRING;
+#endif
     }
     return n;
 }
@@ -2278,7 +2400,6 @@ static void parse_toplevel(void) {
             fn->endpos = toks[P-1].pos;
         }
         scope_pop(&fun);
-        if (verbose) printf("-> %s\n", atom_str(name));
         return;
     }
     if (flags & (HAS_NORETURN | HAS_INLINE)) warning(pos, "inline or _Noreturn can only be applied to functions");
@@ -2296,7 +2417,6 @@ static void parse_toplevel(void) {
                 t->arr_size = ty_size(base) * t->arr_len;
             }
         }
-        if (verbose) printf("-> %s\n", atom_str(name));
         if (!eat(T_COMMA)) break;
         t = parse_ptrs(base);
         name = getid();
@@ -2566,37 +2686,6 @@ static Type *static_typeof(Node *n, Type *def) {
     case N_ADDR:   { Type *t = static_typeof(n->lhs, NULL); return t ? ptr_to(t) : def; }
     default:       return def;
     }
-}
-
-static size_t encode_string(char *buf, size_t size, const char *str, size_t slen, char sep) {
-    if (!size) return 0;
-    size--;  // number of available bytes left in buf before the null terminator
-    size_t j = 0;
-#define PUT(c)  (void)(j < size && (buf[j++] = c))
-    if (sep) PUT(sep);
-    for (size_t i = 0; i < slen; i++) {
-        int ch = (unsigned char)str[i];
-        switch (ch) {
-        case '\b': ch = 'b'; break;  case '\t': ch = 't'; break;
-        case '\n': ch = 'n'; break;  case '\v': ch = 'v'; break;
-        case '\f': ch = 'f'; break;  case '\r': ch = 'r'; break;
-        case '\\': break;
-        case '"': case '\'': if (ch == sep) break;
-        default:
-            if (ch < 32 || ch > 126) break;
-            PUT(ch); continue;
-        }
-        PUT('\\');  // encode as an escape sequence
-        if (ch >= 32 && ch <= 126) { PUT(ch); continue; }
-        if (i < slen && isdigit((unsigned char)str[i+1])) ch |= 01000;
-        if (ch & 01700) PUT(((ch >> 6) & 7) + '0');
-        if (ch & 01770) PUT(((ch >> 3) & 7) + '0');
-        PUT((ch & 7) + '0');
-    }
-    if (sep) PUT(sep);
-#undef PUT
-    buf[j] = '\0';
-    return j;
 }
 
 static void gen_string_def(atom_t id) {
@@ -3852,7 +3941,7 @@ static _Noreturn void arg_error(const char *msg, const char *arg) {
 }
 
 static FILE *open_output(const char *path, FILE *def) {
-    if (!path) return def;
+    if (!path) return fout = def;
     if (!strcmp(path, "-")) return fout = stdout;
     if ((fout = fopen(path, "w"))) return fout;
     die("cannot open output file '%s': %s", path, strerror(errno));
@@ -3865,7 +3954,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
 
     if (!kernel_mode && !libc_mode) {
         // hosted freestanding entry point: run main, then exit(rax)
-        emit_entry(ID_START, true, true);
+        emit_entry(ID__START, true, true);
         emit("cld");
         emit("xor rbp, rbp");
         emit_comment("argc"); emit("mov rdi, [rsp]");
@@ -3948,13 +4037,14 @@ int main(int argc, char **argv) {
     if (!inpath) arg_error("missing filename", "");
 
     lex_init();
+    create_builtin_macros();
+
     sbuf_t src[1]; sbuf_init(src, 128 * 1024);
     preprocess(inpath, false, src);
     if (preprocess_mode == 1) {
         open_output(outpath, stdout);
         fputs(sbuf_getptr(src), fout);
-        fclose(fout);
-        return rc;
+        goto done;
     }
     lex(sbuf_getptr(src));
     sbuf_deinit(src);
@@ -3962,8 +4052,7 @@ int main(int argc, char **argv) {
     if (preprocess_mode) {
         open_output(outpath, stdout);
         rc = output_tokens(fout, toks, ntok);
-        fclose(fout);
-        return rc;
+        goto done;
     }
 
     while (!at(T_EOF)) parse_toplevel();
@@ -3978,9 +4067,13 @@ int main(int argc, char **argv) {
     open_output(outpath, NULL);
     rc = emit_x86_intel(kernel_mode, libc_mode);
     if (fout != stdout) fclose(fout);
-
+    // should invoke assembler / linker
     if (!rc && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
+done:
     if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %lu.%03lu ms\n", t0 / 1000, t0 % 1000); }
     if (mem_stats) malloc_stats();
+#ifdef ATOM_STATS
+    if (verbose) atom_stats();
+#endif
     return rc;
 }

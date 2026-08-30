@@ -74,7 +74,7 @@ nano: $(BIN) build Makefile
 	$(AS) -nostdlib $(TMP)/nano.s   -o $(TMP)/nano_prog
 	$(AS) -nostdlib $(TMP)/nano_g.s -o $(TMP)/nano_prog_g -g
 	$(STRIP) $(BIN) $(TMP)/nano_prog
-	$(SIZE) $(BIN) $(TMP)/nano_prog
+	$(SIZE) $(BIN) $(wildcard $(TMP)/nano_prog)
 	$(RUN) $(TMP)/nano_prog $(FLAGS) $(SRC) -time -memory -o $(TMP)/nano2.s
 	$(RUN) $(TMP)/nano_prog $(FLAGS) $(SRC) -time -g -o $(TMP)/nano2_g.s
 	$(RUN) diff $(TMP)/nano.s $(TMP)/nano2.s | head -50
