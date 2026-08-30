@@ -1,0 +1,173 @@
+# Build products. The two screenshots are kept because the READMEs show them.
+*.o
+*.ppm
+*.log
+*.clean
+shell.s
+gfx.s
+gfxshell.s
+blob-gfx.s
+blob-gshell.s
+kernel64.elf
+kernel64.bin
+kernel.elf
+gfx64.elf
+gfx64.bin
+gfx.elf
+gshell64.elf
+gshell64.bin
+gshell.elf
+intr.s
+acpi.s
+blob-intr.s
+blob-acpi.s
+intr64.elf
+intr64.bin
+intr.elf
+acpi64.elf
+acpi64.bin
+acpi.elf
+mm.s
+blob-mm.s
+mm64.elf
+mm64.bin
+mm.elf
+threads.s
+blob-threads.s
+threads64.elf
+threads64.bin
+threads.elf
+srv.s
+blob-srv.s
+srv64.elf
+srv64.bin
+srv.elf
+fs.s
+blob-fs.s
+fs64.elf
+fs64.bin
+fs.elf
+elf.s
+blob-elf.s
+elf64.elf
+elf64.bin
+elfk.elf
+
+# User programs: the .c and nano-user.h, ustart.s and user.ld are sources; the
+# assembly nano_cc emits from them and the linked binaries are not.
+user/hello.s
+user/twin.s
+user/wild.s
+user/*.elf
+
+# The compiler as a user program, and its test image. cc.c and src/ are
+# sources; user/ccbuild is a staging directory the Makefile assembles.
+user/ccbuild/
+cc.s
+cck.o
+blob-cc.s
+cc64.elf
+cc64.bin
+cck.elf
+cc-host.s
+cc-os.s
+
+# The assembler as a user program, and the chain test image. miniasm.asm,
+# target-linux.inc and the tools are sources; everything built from them is not.
+user/as/miniasm.s
+user/as/miniasm.o
+user/as/hostas
+user/as/hostas.asm
+user/as/hostas.s
+user/as/hostas.o
+user/as/.regen.asm
+chain.s
+chaink.o
+blob-chain.s
+chain64.bin
+chain64.elf
+chaink.elf
+chain-host.asm
+chain-host.bin
+chain-host.hex
+chain-os.hex
+
+# The compositor image. nano-wm.h and wm.c are sources; wm.png is kept because
+# the README shows it.
+wm.s
+blob-wm.s
+wm64.elf
+wm64.bin
+wm.elf
+
+# The floating-point measurement image. sse.c is the source.
+sse.s
+blob-sse.s
+sse64.elf
+sse64.bin
+sse.elf
+sse-serial.log
+sse-serial.clean
+
+# The mouse / window-manager-input image. nano-mouse.h, nano-wmin.h,
+# nano-term.h and wmin.c are sources; wmin.png is kept because the README
+# shows it. sabotage.log* is written by tools/sabotage-wmin.sh.
+wmin.s
+blob-wmin.s
+wmin64.elf
+wmin64.bin
+wmin.elf
+sabotage.log
+sabotage.log.clean
+*.h.orig
+
+# The immediate-mode widget image. nano-ui.h and ui.c are sources; ui.png and
+# ui-live.png are kept because the README shows them.
+ui.s
+blob-ui.s
+ui64.elf
+ui64.bin
+ui.elf
+uik.o
+sabotage-ui.log
+sabotage-ui.log.clean
+
+# The 3D image. nano-gl.h and gl.c are sources; gl.png and gl-live.png are
+# kept because the README shows them.
+gl.s
+blob-gl.s
+gl64.elf
+gl64.bin
+gl.elf
+glk.o
+
+# The OpenGL-shaped API image. nano-glapi.h and glapi.c are sources; glapi.png
+# and glapi-live.png are kept because the README shows them.
+glapi.s
+blob-glapi.s
+glapi64.elf
+glapi64.bin
+glapi.elf
+glapik.o
+sabotage-glapi.log
+sabotage-glapi.log.clean
+
+# The texture image. nano-gl.h's texture code and gltex.c are sources; gltex.png
+# and gltex-live.png are kept because the README shows them.
+gltex.s
+blob-gltex.s
+gltex64.elf
+gltex64.bin
+gltex.elf
+gltexk.o
+sabotage-gltex.log
+sabotage-gltex.log.clean
+
+# The image where a compiled program gets a window. oswin.c, src/wingl.c and
+# src/winbad.c are sources; oswin.png is kept because the README shows it.
+oswin.s
+blob-oswin.s
+oswin64.elf
+oswin64.bin
+oswin.elf
+oswink.o
