@@ -2037,7 +2037,14 @@ static Type *gen_expr(Node *n) {
         // An array element that is itself an array does not get loaded: for
         // `long m[2][3]`, m[0] is the ADDRESS of row 0, which the next index
         // then walks. Loading here would treat m[0][0] as a pointer.
-        if (pt->is_array) return pt;
+        //
+        // A struct is the same: `*p` on a struct pointer is used BY ADDRESS,
+        // which is how N_VAR and N_MEMBER already treat one. Loading here
+        // fetched the first eight bytes and called that the struct, so
+        // `v = *p` copied one field and left the rest of the destination
+        // untouched -- with no diagnostic, because the single `mov` it emitted
+        // was perfectly valid code for the wrong amount of data.
+        if (pt->is_array || pt->kind == TY_STRUCT) return pt;
         load_rax(ty_size(pt));
         return pt;
     }
@@ -2048,8 +2055,30 @@ static Type *gen_expr(Node *n) {
     case N_ASSIGN: {
         Type *lt = gen_addr(n->lhs);
         e_push("rax");
-        gen_expr(n->rhs);
+        Type *rt = gen_expr(n->rhs);
         e_pop("rcx");
+        // Whole-struct assignment. rax holds the source address (structs decay
+        // to addresses) and rcx the destination, so this is a copy of
+        // ty_size(lt) bytes rather than a single move. It used to emit
+        // `mov [rcx], rax` regardless of size, which copied eight bytes of a
+        // twenty-four byte struct and said nothing about it.
+        if (lt->kind == TY_STRUCT && !lt->is_array) {
+            int size = ty_size(lt), off = 0;
+            if (rt && rt->kind == TY_STRUCT && !rt->is_array && ty_size(rt) != size)
+                die_node(n, "assigning structs of different sizes");
+            while (size - off >= 8) {
+                emit("    mov rdx, [rax + %d]", off);
+                emit("    mov [rcx + %d], rdx", off);
+                off += 8;
+            }
+            while (off < size) {
+                emit("    mov dl, [rax + %d]", off);
+                emit("    mov [rcx + %d], dl", off);
+                off += 1;
+            }
+            emit("    mov rax, rcx");              // the value is the destination
+            return lt;
+        }
         store_rcx_rax(ty_size(lt));
         return lt;
     }
