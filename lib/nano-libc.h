@@ -257,11 +257,11 @@ FILE _iob[NFILE] = {
 FILE *fopen(const char *filename, char *mode) {
     for (FILE *fp = _iob; fp < _iob + NFILE; fp++) {
         if (!fp->flags) {
-            int hd, mode; unsigned char flags;
-            if      (*mode == 'r') { flags = _IOREAD;  mode = O_RDONLY; }
-            else if (*mode == 'w') { flags = _IOWRITE; mode = O_WRONLY | O_CREAT | O_TRUNC; }
+            int hd, omode; unsigned char flags;
+            if      (*mode == 'r') { flags = _IOREAD;  omode = O_RDONLY; }
+            else if (*mode == 'w') { flags = _IOWRITE; omode = O_WRONLY | O_CREAT | O_TRUNC; }
             else                   { errno = EINVAL; return NULL; }
-            if ((hd = open(filename, mode, 0777)) < 0) return NULL;
+            if ((hd = open(filename, omode, 0777)) < 0) return NULL;
             fp->hd = hd; fp->flags = flags; fp->size = BUFSIZ;
             return fp;
         }
