@@ -1227,8 +1227,7 @@ enum {
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
-    N_MEMBER, N_SIZEOF,
-    N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
+    N_MEMBER, N_SIZEOF, N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
 };
 
 typedef struct Node Node;
@@ -1240,7 +1239,7 @@ struct Node {
 #define HAS_BREAK     4     // N_SWITCH, N_FOR, N_DO, N_WHILE
 #define HAS_CONTINUE  8     // N_FOR, N_DO, N_WHILE
 #define HAS_DEFAULT   16    // N_SWITCH
-#define HAS_PAREN     32    // all expression nodes
+#define HAS_PAREN     32    // all E-nodes
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
@@ -1259,10 +1258,14 @@ struct Node {
         int offset;         // N_VAR (stack pos)
         unsigned depth;     // N_BLOCK, N_FOR (scope depth)
     };
-    Type *type;             // result / declared type
-    Node *lhs, *rhs, *cond;
     union {
-        Node *init;
+        Type *type;         // E-nodes
+        Node *finit;        // N_FOR
+    };
+    Node *lhs;              // all nodes except N_NUM, N_STR, N_VAR, N_DEFAULT, N_GOTO, N_LABEL
+    Node *rhs;              // binary E-nodes, N_IF, N_WHILE, N_FOR, N_DOWHILE
+    union {
+        Node *cond;         // ternary E-nodes, N_IF, N_FOR, N_DOWHILE, N_SWITCH, N_CASE
         Type *type_arg;     // N_SIZEOF
         struct Sym *decl;   // N_DECL
     };
@@ -2107,9 +2110,9 @@ static Node *parse_stmt(void) {
     if (at(K_FOR)) {
         n = new_node(N_FOR); P++; scope_push(n);
         expect(T_LP);
-        if (is_type_start(cur())) n->init = parse_decl_stmt();      // consumes ';'
+        if (is_type_start(cur())) n->finit = parse_decl_stmt();      // consumes ';'
         else {
-            if (!at(T_SEMI)) { n->init = new_node(N_EXPR); n->init->lhs = parse_expr(); }
+            if (!at(T_SEMI)) { n->finit = new_node(N_EXPR); n->finit->lhs = parse_expr(); }
             expect(T_SEMI);
         }
         if (!at(T_SEMI)) n->cond = parse_expr();
@@ -2484,7 +2487,7 @@ static void check_used(Node *n) {
     case N_WHILE: case N_DOWHILE:
         check_used(n->cond); check_used(n->lhs); break;
     case N_FOR:
-        check_used(n->init); check_used(n->cond); check_used(n->rhs);
+        check_used(n->finit); check_used(n->cond); check_used(n->rhs);
         check_used(n->lhs); break;
     case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
     case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
@@ -3648,7 +3651,7 @@ static void gen_stmt(Node *n) {
         int top = label_id++, cont = top, end = 0;
         if (n->rhs && (n->flags & HAS_CONTINUE)) cont = label_id++;
         if (n->cond || (n->flags & HAS_BREAK)) end = label_id++;
-        if (n->init) gen_stmt(n->init);
+        if (n->finit) gen_stmt(n->finit);
         emit_label(top);
         Node *cond = n->cond;
         if (cond) {
