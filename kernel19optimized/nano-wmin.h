@@ -38,6 +38,10 @@ long g_prev_btn;        // button state at the previous event, for edges
 long g_wmin_clicks;     // presses acted on
 long g_wmin_drags;      // drags started
 long g_wmin_closes;     // windows closed by their button
+long g_wmin_closed;     // handle of the last one, or -1. A latch: the layer
+                        // above wants to know that the user closed something,
+                        // and this says which, without wmin knowing what a
+                        // process is.
 
 // ---------- hit testing ----------
 
@@ -124,6 +128,7 @@ void wm_input_mouse(long x, long y, long btn) {
 
         if (part == WM_PART_CLOSE) {
             g_wmin_closes = g_wmin_closes + 1;
+            g_wmin_closed = hnd;
             wm_destroy(hnd);
             return;
         }
@@ -165,6 +170,7 @@ void wmin_init() {
     g_wmin_clicks = 0;
     g_wmin_drags = 0;
     g_wmin_closes = 0;
+    g_wmin_closed = -1;
 }
 
 #endif

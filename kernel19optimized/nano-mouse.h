@@ -71,27 +71,47 @@ long g_mp1;
 // has the same button state as the one arriving, its coordinates are simply
 // overwritten. The ring therefore only ever grows on a button change, and a
 // user cannot generate 64 of those before the next poll.
+//
+// WITH ONE EXCEPTION, WHICH COST A WORKING CLOSE BUTTON. That rule keeps every
+// button transition, but it does not keep WHERE it happened. Press at (410,97)
+// and move three pixels before the next drain twenty milliseconds later, and
+// the two events coalesce -- same button mask -- so the press is delivered at
+// (413,97). Nobody holds a mouse still while clicking it, so a press on a
+// close box gets reported on the title bar next to it and starts a drag
+// instead of closing the window. The event that survived was the right event
+// at the wrong place, which is the harder kind of wrong: the counters all
+// agree, no packet was dropped, and the click just does not do what you asked.
+//
+// So an event that CHANGES the button state is an edge, and an edge is never
+// overwritten. Motion after it starts a new entry, which subsequent motion is
+// free to coalesce into. The ring now grows by at most two per button change
+// rather than one, which does not change the argument above.
 
 #define MOUSE_RING 64
 
-struct MEvent { long x; long y; long btn; };
+struct MEvent { long x; long y; long btn; long edge; };
 
 struct MEvent g_mev[MOUSE_RING];
 long g_mev_head;
 long g_mev_tail;
 long g_mev_dropped;
+long g_mev_lastbtn;     // button mask of the newest event pushed, edge or not
 
 long mouse_events_pending() { return g_mev_head != g_mev_tail; }
 
 void mouse_push(long x, long y, long btn) {
     long next;
     long last;
+    long edge;
 
-    // Coalesce with the newest queued event if the buttons have not changed.
-    if (g_mev_head != g_mev_tail) {
+    edge = (btn != g_mev_lastbtn);
+
+    // Coalesce with the newest queued event -- unless either it or this one is
+    // a button transition, whose position is the whole point of it.
+    if (!edge && g_mev_head != g_mev_tail) {
         last = g_mev_head - 1;
         if (last < 0) last = MOUSE_RING - 1;
-        if (g_mev[last].btn == btn) {
+        if (!g_mev[last].edge && g_mev[last].btn == btn) {
             g_mev[last].x = x;
             g_mev[last].y = y;
             return;
@@ -103,7 +123,9 @@ void mouse_push(long x, long y, long btn) {
     g_mev[g_mev_head].x = x;
     g_mev[g_mev_head].y = y;
     g_mev[g_mev_head].btn = btn;
+    g_mev[g_mev_head].edge = edge;
     g_mev_head = next;
+    g_mev_lastbtn = btn;
 }
 
 // Returns 1 and fills *out, or returns 0 if the queue is empty.
@@ -112,6 +134,7 @@ long mouse_pop(struct MEvent *out) {
     out->x = g_mev[g_mev_tail].x;
     out->y = g_mev[g_mev_tail].y;
     out->btn = g_mev[g_mev_tail].btn;
+    out->edge = g_mev[g_mev_tail].edge;
     g_mev_tail = (g_mev_tail + 1) % MOUSE_RING;
     return 1;
 }
@@ -266,6 +289,7 @@ void mouse_state_reset() {
     g_mev_head = 0;
     g_mev_tail = 0;
     g_mev_dropped = 0;
+    g_mev_lastbtn = 0;
     g_mouse_maxx = 1023;
     g_mouse_maxy = 767;
 }

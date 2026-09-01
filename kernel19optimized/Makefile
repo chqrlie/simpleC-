@@ -20,8 +20,20 @@ QEMU   := qemu-system-x86_64
 UPROGS := user/hello.elf user/twin.elf user/wild.elf user/cc.elf user/as.elf
 QFLAGS := -kernel kernel.elf -no-reboot
 
+# No built-in rules.
+#
+# `make gfxshell` used to invoke the HOST compiler on gfxshell.c, because make
+# has a built-in rule that turns any x.c into an executable x and gfxshell had
+# no rule of its own. The result was a page of gcc errors about headers that
+# were never meant for gcc, which reads like the project is broken when in fact
+# the target simply did not exist. With the built-in rules off, a name with no
+# rule says so in one line.
+MAKEFLAGS += --no-builtin-rules
+.SUFFIXES:
+
 .PHONY: all run test shot gfx gfxrun gfxtest gfxshot \
         gshell gshellrun gshelltest gshellshot \
+        gfxshell gfxshellrun gfxshelltest gfxshellshot \
         intr intrrun intrtest acpi acpirun acpitest \
         mm mmrun mmtest threads threadsrun threadstest \
         srv srvrun srvtest fs fsrun fstest \
@@ -367,6 +379,13 @@ gshell.elf: boot32.s blob-gshell.s gshell64.bin final.ld
 	ld -m elf_i386 -T final.ld -o gshell.elf boot32.o blob-gshell.o
 
 gshell: gshell.elf
+
+# The image is built from gfxshell.c, so `make gfxshell` is the name people
+# reach for first. Both spellings work.
+gfxshell:      gshell
+gfxshellrun:   gshellrun
+gfxshelltest:  gshelltest
+gfxshellshot:  gshellshot
 
 gshellrun: gshell.elf
 	$(QEMU) -kernel gshell.elf -no-reboot

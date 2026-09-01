@@ -386,6 +386,35 @@ void test_queue() {
     while (mouse_pop(&e)) { n = n + 1; }
     expect("40 button changes all survive", n, 40);
     expect("still nothing dropped", g_mev_dropped, 0);
+
+    // A CLICK WITH A HAND ON THE END OF IT.
+    //
+    // The press and the movement just after it carry the same button mask, so
+    // the coalescing rule above was entitled to merge them -- and merging them
+    // delivers the press at the position the mouse ENDED UP. The event was
+    // never lost; it was moved. Nobody holds a mouse still while clicking it,
+    // so this is not an edge case, it is every click.
+    mouse_state_reset();
+    mouse_bounds(1024, 768);
+    mouse_warp(400, 300);
+    while (mouse_pop(&e)) { }
+    inject(0, 0, 1);                                    // press at (400, 300)
+    i = 0;
+    while (i < 6) { inject(5, 0, 1); i = i + 1; }       // and drift 30 right
+    {
+        long px;
+        long py;
+        long seen;
+        px = 0 - 1; py = 0 - 1; seen = 0;
+        n = 0;
+        while (mouse_pop(&e)) {
+            n = n + 1;
+            if (e.btn == 1 && !seen) { px = e.x; py = e.y; seen = 1; }
+        }
+        expect("the press is delivered where the button went down", px, 400);
+        expect("...and at the y it went down at", py, 300);
+        expect("...with the drift after it as a second event", n, 2);
+    }
 }
 
 // ============================================================
@@ -469,11 +498,56 @@ void test_cursor() {
     wm_present();
     check_matches_full("window dragged out from under the pointer");
 
+    // A POINTER THAT HAS NOT MOVED MUST NOT BE REDRAWN.
+    //
+    // wm_present used to lift the pointer and put it back on every single
+    // call, whether or not anything had changed. That is invisible in a test
+    // and extremely visible on a monitor: the desktop loop at the end of
+    // oswin.c presents as fast as the CPU will go, so the pointer was being
+    // taken off the screen and put back thousands of times a second, and a
+    // 60Hz display caught it absent about as often as it caught it there.
+    // Reported as "the mouse was flickering bad", and it was.
+    puts("\n  presenting with a still pointer:\n");
+    wm_cursor_move(600, 400);
+    wm_present();
+    wm_reset_counters();
+    {
+        long i;
+        i = 0;
+        while (i < 50) { wm_present(); i = i + 1; }
+    }
+    printf("  50 idle presents cost %d pixels, %d of them the pointer\n",
+           wm_pixels, g_cur_pixels);
+    // One redraw of the glyph is about 110 pixels, so the old version scored
+    // 5,500 here. Anything above zero is the flicker.
+    if (g_cur_pixels != 0)
+        fail("an idle present repainted a pointer that had not moved");
+
+    // And the control, which is the half that matters: the saving must not be
+    // a pointer that has quietly stopped being drawn at all. Repaint the
+    // ground underneath it and it MUST come back on top.
+    wm_reset_counters();
+    wm_damage(600 - 4, 400 - 4, CUR_W + 8, CUR_H + 8);
+    wm_present();
+    printf("  repainting the ground under it redrew %d pointer pixels\n",
+           g_cur_pixels);
+    if (g_cur_pixels == 0)
+        fail("the pointer was painted over and never put back");
+    check_matches_full("pointer back on top after the ground was repainted");
+
     wm_cursor_show(0);
     wm_present();
     check_matches_full("pointer hidden");
     wm_cursor_show(1);
     wm_present();
+    // Named, rather than left for a later section to trip over. Hiding the
+    // pointer damages the rectangle it was in, so it is no longer on screen --
+    // and the first version of the "do not redraw a pointer that has not
+    // moved" rule read the stale "it is already painted" flag, decided there
+    // was nothing to do, and left the desktop with no pointer at all. The only
+    // thing that caught it was a checksum mismatch sixty lines later, in the
+    // console test, which is not where anybody would look.
+    check_matches_full("pointer shown again");
 }
 
 // ============================================================
@@ -631,6 +705,45 @@ void test_interaction() {
     // keystroke would be delivered into a freed slot.
     if (g_focus == b) fail("focus stayed on the closed window");
     else printf("  ok  focus moved off the closed window (now %d)\n", g_focus);
+
+    // THE SAME CLICK, DONE THE WAY A PERSON DOES IT.
+    //
+    // click_at pumps the queue between the press and the release. A hand does
+    // not: the press, the drift and the release all arrive between two of the
+    // compositor's twenty-millisecond drains. Every close test above was
+    // written the convenient way, which is exactly why they were all green
+    // while the close button did not work on the desktop -- the harness was
+    // draining the queue at a moment no real click ever offers.
+    //
+    // Twelve pixels of drift is a hand, not a drag. Before the queue kept the
+    // position a button went down at, this reported the press on the title bar
+    // beside the close box: the window was raised and started dragging instead
+    // of closing, which is the reported symptom exactly.
+    puts("\n  the close button, clicked by a hand that is not perfectly still:\n");
+    {
+        long c;
+        long drags;
+        long cx;
+        long cy;
+        release();
+        c = wm_create(300, 400, 200, 120, "shaky");
+        wm_decorate(c);
+        drags = g_wmin_drags;
+        cx = g_win[c].x + wm_close_x(c) + 3;
+        cy = g_win[c].y + wm_close_y() + 3;
+        mouse_warp(cx, cy);
+        wm_pump_mouse();
+        inject(0, 0, 1);            // press, on the close box
+        inject(0 - 12, 0, 1);       // the hand moves while the button is down
+        inject(0, 0, 0);            // release
+        wm_pump_mouse();            // ONE drain, which is all the desktop does
+        expect("the window closed anyway", g_win[c].used, 0);
+        expect("...and nothing was dragged instead", g_wmin_drags, drags);
+        if (g_win[c].used) wm_destroy(c);
+        release();
+    }
+    wm_present();
+    check_matches_full("after a shaky close");
 }
 
 // ============================================================
@@ -856,6 +969,116 @@ void test_console() {
 }
 
 // ============================================================
+// 7. what a drag costs
+// ============================================================
+//
+// "dragging a window uses all the CPU" is a rate, not something you can see in
+// a frame. The mouse reports about a hundred times a second, the event loop
+// presents one frame per report, and if a frame costs a whole tick then a drag
+// is the entire machine with nothing left over.
+//
+// Two numbers, because they have two different causes and two different fixes:
+//
+//   PIXELS PER FRAME is the damage tracker's answer to "how much work does
+//   moving a window ask for". Moving a window by one pixel dirties the union
+//   of where it was and where it is, so the floor is one window's area and
+//   there is not much to win here.
+//
+//   TICKS PER FRAME is the blitter's answer to "how long does that work take".
+//   This is the one that decides whether a drag is free or fatal, and it is
+//   measured, not reasoned about, because the pixel count says nothing about
+//   the cost of a pixel.
+void test_drag_cost() {
+    long a;
+    long b;
+    long i;
+    long t0;
+    long t1;
+    long px;
+    long frames;
+    long load;
+    long full0;
+    long full1;
+
+    puts("\n-- 7. what a drag costs --\n");
+
+    wm_init(rgb(24, 28, 38));
+    wmin_init();
+    mouse_state_reset();
+    mouse_bounds(fb_width, fb_height);
+    a = wm_create(60, 70, 340, 230, "picture viewer");
+    b = wm_create(330, 190, 300, 180, "files");
+    paint_content(a, 3);
+    paint_content(b, 6);
+    wm_cursor_show(1);
+    wm_present();
+
+    frames = 400;
+
+    // Grab the title bar and then move one pixel at a time, doing exactly what
+    // the event loop does per mouse report: pump the queue, present once.
+    // Alternating direction keeps the window in the same place over 400 frames,
+    // so this measures a drag and not a journey off the edge of the screen.
+    press_at(g_win[a].x + 120, g_win[a].y + WM_TITLE_H / 2);
+    expect("the drag started", g_drag_win, a);
+
+    wm_reset_counters();
+    t0 = g_ticks;
+    i = 0;
+    while (i < frames) {
+        inject(((i & 1) ? -1 : 1), 0, 1);
+        wm_pump_mouse();
+        wm_present();
+        i = i + 1;
+    }
+    t1 = g_ticks;
+    px = wm_pixels;
+    release();
+    expect("releasing ended the drag", g_drag_win, -1);
+
+    printf("  %d drag frames: %d pixels, %d per frame, %d blits\n",
+           frames, px, px / frames, wm_blits);
+    printf("  the window itself is %d pixels, a full screen is %d\n",
+           g_win[a].w * g_win[a].h, wm_screen_pixels());
+    printf("  %d drag frames took %d ticks at %d Hz\n", frames, t1 - t0, g_hz);
+
+    // A PS/2 mouse reports at 100 samples a second, so a drag that costs
+    // (t1-t0) ticks for `frames` frames occupies this share of the machine.
+    load = (100 * (t1 - t0) * 100) / (frames * g_hz);
+    printf("  => a real drag would use %d%% of the CPU\n", load);
+    // Ten per cent, and the bound is chosen so that the version of this that
+    // wrote a pixel at a time -- measured at 30% here, and at "all of it" on
+    // the client's machine -- fails it.
+    if (load > 10) fail("dragging a window costs more than 10% of the CPU");
+    else printf("  ok  a drag leaves the machine usable\n");
+
+    check_matches_full("after 400 drag frames");
+
+    // And the blitter on its own, with the damage tracker taken out of the
+    // picture entirely: how long does it take to write the whole screen? The
+    // drag number above is a consequence of this one, and separating them is
+    // what says whether to fix the damage tracker or the pixel loop.
+    wm_no_damage = 1;
+    wm_reset_counters();
+    full0 = g_ticks;
+    i = 0;
+    while (i < 10) { wm_present(); i = i + 1; }
+    full1 = g_ticks;
+    wm_no_damage = 0;
+    {
+        long ticks;
+        long perscreen;
+        ticks = full1 - full0;
+        printf("  10 full repaints (%d pixels) took %d ticks\n", wm_pixels, ticks);
+        perscreen = (ticks * 1000) / 10;
+        printf("  = %d.%d ticks, or %d ms, per full screen\n",
+               perscreen / 1000, (perscreen % 1000) / 100,
+               (perscreen * 1000) / (g_hz * 1000));
+    }
+    wm_present();
+}
+
+// ============================================================
 // the desktop that is left on screen
 // ============================================================
 long g_shell_term;
@@ -929,6 +1152,7 @@ void run_tests() {
     test_hit();
     test_interaction();
     test_console();
+    test_drag_cost();
 
     printf("\nheap: %d pages mapped, %d bytes free\n", heap_pages, heap_bytes_free());
     printf("mouse: %d packets, %d resyncs, %d dropped events, %d spurious IRQs\n",

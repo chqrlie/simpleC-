@@ -164,21 +164,19 @@ void wm_damage(long x, long y, long w, long h) {
 // counter cannot drift away from the truth.
 
 void wm_row_fill(long fx, long fy, long n, long colour) {
-    long addr; long i;
+    long addr;
     if (n <= 0) return;
     addr = fb_base + fy * fb_pitch + fx * 4;
-    i = 0;
-    while (i < n) { mmio_write32(addr + i * 4, colour); i = i + 1; }
+    fb_fill32(addr, colour, n);
     wm_pixels = wm_pixels + n;
     wm_blits = wm_blits + 1;
 }
 
 void wm_row_copy(long fx, long fy, long *src, long n) {
-    long addr; long i;
+    long addr;
     if (n <= 0) return;
     addr = fb_base + fy * fb_pitch + fx * 4;
-    i = 0;
-    while (i < n) { mmio_write32(addr + i * 4, src[i]); i = i + 1; }
+    fb_blit32(addr, src, n);
     wm_pixels = wm_pixels + n;
     wm_blits = wm_blits + 1;
 }
@@ -483,7 +481,14 @@ long g_cur_pixels;      // pixels the pointer itself has cost since a reset
 void wm_cursor_show(long on) {
     if (g_cur_on == on) return;
     g_cur_on = on;
-    if (!on && g_cur_painted) wm_damage(g_cur_px, g_cur_py, CUR_W, CUR_H);
+    // Hiding damages the rectangle it was in, and it is NOT on screen any more
+    // once that damage has been painted. Leaving g_cur_painted set would tell
+    // the next present that a pointer it can no longer see is already correct,
+    // and showing it again would draw nothing.
+    if (!on && g_cur_painted) {
+        wm_damage(g_cur_px, g_cur_py, CUR_W, CUR_H);
+        g_cur_painted = 0;
+    }
 }
 
 // Ask for the pointer to be somewhere. Nothing reaches the screen until the
@@ -587,18 +592,54 @@ void wm_paint_rect(struct Rect *r) {
     while (i < g_nreg) { wm_fill_rect(&g_reg[i], wm_bg); i = i + 1; }
 }
 
+// Is anything about to be repainted under the pointer? Called before the
+// damage list is consumed, and the answer decides whether the pointer has to
+// be put back on top afterwards.
+long wm_cursor_in_damage() {
+    long i;
+    if (!g_cur_on) return 0;
+    if (wm_no_damage || g_dmg_overflow) return 1;      // the whole screen is
+    i = 0;
+    while (i < g_ndmg) {
+        if (g_dmg[i].x         < g_cur_x + CUR_W &&
+            g_cur_x            < g_dmg[i].x + g_dmg[i].w &&
+            g_dmg[i].y         < g_cur_y + CUR_H &&
+            g_cur_y            < g_dmg[i].y + g_dmg[i].h) return 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
 void wm_present() {
     long i;
+    long redraw;
 
-    // Erase the pointer by damaging where it is. The compositor has no idea a
-    // pointer exists; it just repaints that rectangle from the windows and the
-    // desktop, which is exactly what "erase" means. Doing it this way rather
-    // than saving and restoring the pixels underneath also means the pointer
-    // cannot resurrect a stale copy of a window that has since moved.
-    if (g_cur_painted) {
+    // THE POINTER IS ONLY LIFTED WHEN IT IS ABOUT TO MOVE.
+    //
+    // This used to erase and redraw the pointer on every single present,
+    // unconditionally, and that is what made it flicker. A present is not a
+    // frame: nothing here is synchronised to the display, so a loop calling
+    // present a few thousand times a second was taking the pointer off the
+    // screen and putting it back a few thousand times a second, and the
+    // monitor sampled that at 60Hz and caught it absent about as often as
+    // present.
+    //
+    // Erasing means damaging the rectangle it occupies -- the compositor has
+    // no idea a pointer exists, it just repaints that rectangle from the
+    // windows and the desktop, which is exactly what "erase" means, and it
+    // cannot resurrect a stale copy of a window that has since moved. But
+    // that is only worth doing if the pointer is going to appear somewhere
+    // else. A pointer that has not moved is already correct on screen.
+    redraw = 0;
+    if (g_cur_painted && (g_cur_px != g_cur_x || g_cur_py != g_cur_y)) {
         wm_damage(g_cur_px, g_cur_py, CUR_W, CUR_H);
         g_cur_painted = 0;
     }
+
+    // ...and if it has NOT moved but something else is repainting the ground
+    // it is standing on, it is about to be painted over and has to go back on
+    // top. Asked before the list is consumed, because that is when it exists.
+    if (!g_cur_painted || wm_cursor_in_damage()) redraw = 1;
 
     if (wm_no_damage || g_dmg_overflow) wm_damage_all();
     i = 0;
@@ -607,7 +648,7 @@ void wm_present() {
     g_dmg_overflow = 0;
 
     // Last, on top of everything, and outside the damage system entirely.
-    wm_cursor_draw();
+    if (redraw) wm_cursor_draw();
 }
 
 // ---------- window operations that generate damage ----------

@@ -33,6 +33,15 @@ extern void outl(int port, long val);
 extern void mmio_write32(long addr, long val);
 extern long mmio_read32(long addr);
 
+// A row at a time, in boot64.s. One pixel per call is about fifty-seven
+// instructions once nano_cc has recomputed the address and made the call; one
+// ROW per call is five per pixel, or a rep-string. See boot64.s for the
+// measurement that motivated them.
+extern void fb_blit32(long dst, long *src, long n);   // long[] -> 32-bit words
+extern void fb_fill32(long dst, long val, long n);    // n copies of val
+extern void fb_move32(long dst, long src, long n);    // word copy, no overlap
+extern void fb_copy64(long *dst, long *src, long n);  // long[] -> long[]
+
 // ---------- Bochs VBE (the "BGA") ----------
 #define VBE_INDEX   0x01CE
 #define VBE_DATA    0x01CF
@@ -197,13 +206,8 @@ void fb_fill(long x, long y, long w, long h, long colour) {
     yy = 0;
     while (yy < h) {
         long row;
-        long xx;
         row = fb_base + (y + yy) * fb_pitch + x * 4;
-        xx = 0;
-        while (xx < w) {
-            mmio_write32(row + xx * 4, colour);
-            xx = xx + 1;
-        }
+        fb_fill32(row, colour, w);
         yy = yy + 1;
     }
 }
@@ -319,14 +323,10 @@ void fb_scroll() {
     while (y < limit - cell) {
         long src;
         long dst;
-        long x;
         dst = fb_base + (fb_win_y + y) * fb_pitch + fb_win_x * 4;
         src = fb_base + (fb_win_y + y + cell) * fb_pitch + fb_win_x * 4;
-        x = 0;
-        while (x < fb_win_w) {
-            mmio_write32(dst + x * 4, mmio_read32(src + x * 4));
-            x = x + 1;
-        }
+        // Rows never overlap: src is a whole cell height below dst.
+        fb_move32(dst, src, fb_win_w);
         y = y + 1;
     }
     fb_fill(fb_win_x, fb_win_y + limit - cell, fb_win_w, cell, fb_bg);

@@ -1215,25 +1215,35 @@ long syscall_dispatch(long nr, long a, long b, long c, long d, long e) {
         oy = e / cw;
         src = (long *)b;
         copied = 0;
-        j = 0;
-        while (j < d) {
-            long dy;
-            dy = oy + j;
-            if (dy >= 0 && dy < ch) {
-                long i;
-                i = 0;
-                while (i < c) {
-                    long dx;
-                    dx = ox + i;
-                    if (dx >= 0 && dx < cw) {
-                        wm_win_pixel(a, wm_client_x() + dx, wm_client_y() + dy,
-                                     src[j * c + i]);
-                        copied = copied + 1;
-                    }
-                    i = i + 1;
-                }
+        // A row at a time, not a pixel at a time.
+        //
+        // This used to call wm_win_pixel per pixel, which re-clips against the
+        // window and recomputes y*w+x every time -- roughly forty instructions
+        // to move one long. A process presenting a 300x200 frame paid that
+        // sixty thousand times per frame, inside a syscall, with interrupts
+        // where they were. Clipping is a property of the RECTANGLE, so it is
+        // done once here and the run in between is a rep movsq.
+        {
+            long x0;
+            long x1;
+            long y0;
+            long y1;
+            long n;
+            x0 = 0; x1 = c;
+            if (ox + x1 > cw) x1 = cw - ox;
+            y0 = 0; y1 = d;
+            if (oy + y1 > ch) y1 = ch - oy;
+            n = x1 - x0;
+            j = y0;
+            while (j < y1 && n > 0) {
+                long *dst;
+                dst = g_win[a].pix
+                    + (wm_client_y() + oy + j) * g_win[a].w
+                    + wm_client_x() + ox + x0;
+                fb_copy64(dst, src + j * c + x0, n);
+                copied = copied + n;
+                j = j + 1;
             }
-            j = j + 1;
         }
         // Damage only the rectangle that was actually written, clipped the
         // same way. Invalidating the whole client area would work and would

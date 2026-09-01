@@ -100,6 +100,78 @@ mmio_read32:
     mov (%rdi), %eax
     ret
 
+/* ---- row primitives ------------------------------------------------------
+ *
+ * mmio_write32 above is correct and it is what the compositor used for every
+ * pixel it ever wrote.  Measured, that came to about fifty-seven instructions
+ * per pixel: nano_cc recomputes `fb_base + fy*fb_pitch + fx*4` and `src[i]`
+ * from scratch on every iteration, two imuls and a dozen stack moves each, and
+ * then makes a call for the store itself.  A window drag dirties one window's
+ * area per mouse report, a hundred reports a second, and under an emulator
+ * that is the whole machine.
+ *
+ * These three do a ROW at a time.  The address arithmetic happens once, in the
+ * caller, and the inner loop is five instructions or a rep-string.  Nothing
+ * about the pixel format changes, so every existing checksum still matches.
+ *
+ * void fb_blit32(long dst, long *src, long n)
+ *   n pixels from a long[] (one pixel per long, low 32 bits used) to n
+ *   consecutive 32-bit slots at dst.  The stride mismatch — 8 in, 4 out — is
+ *   why this cannot be a rep movsd. */
+.globl fb_blit32
+fb_blit32:
+    test %rdx, %rdx
+    jle .Lblit32_out
+.Lblit32_loop:
+    mov (%rsi), %eax
+    mov %eax, (%rdi)
+    add $8, %rsi
+    add $4, %rdi
+    dec %rdx
+    jnz .Lblit32_loop
+.Lblit32_out:
+    ret
+
+/* void fb_fill32(long dst, long val, long n) — n copies of the low 32 bits of
+ * val, written consecutively at dst. */
+.globl fb_fill32
+fb_fill32:
+    test %rdx, %rdx
+    jle .Lfill32_out
+    mov %rdx, %rcx
+    mov %esi, %eax
+    cld
+    rep stosl
+.Lfill32_out:
+    ret
+
+/* void fb_move32(long dst, long src, long n) — n 32-bit words from one
+ * framebuffer address to another.  Used by the console scroll, where source
+ * and destination are both video memory and never overlap within a row. */
+.globl fb_move32
+fb_move32:
+    test %rdx, %rdx
+    jle .Lmove32_out
+    mov %rdx, %rcx
+    cld
+    rep movsl
+.Lmove32_out:
+    ret
+
+/* void fb_copy64(long *dst, long *src, long n) — n longs, one pixel each, from
+ * one backing buffer to another. This is the blit a process asks for with
+ * SYS_WINBLIT: its own pixels into its window. Both sides are ordinary memory,
+ * both are long[], so a whole row is one rep movsq. */
+.globl fb_copy64
+fb_copy64:
+    test %rdx, %rdx
+    jle .Lcopy64_out
+    mov %rdx, %rcx
+    cld
+    rep movsq
+.Lcopy64_out:
+    ret
+
 /* long kernel_end_addr(void) — the end of the loaded image, from the linker
  * script. Physical memory below this is the kernel itself and must never be
  * handed out as a free frame. */

@@ -133,7 +133,41 @@ long build(char *src, char *asmout, char *binout) {
     printf("\n-- cc %s -> %s --\n", src, asmout);
     code = run_cc("/src", src, asmout);
     printf("cc exited with %d\n", code);
-    if (code != 0) { fail("the compile"); return 0; }
+    if (code != 0) {
+        // A failed compile here has, about one run in six, printed NOTHING at
+        // all before exiting 1 -- and that happens on builds from well before
+        // any of the compositor work, so it is the in-OS cc, not this image.
+        // Every documented exit(1) inside nano_cc prints to fd 2 first, and fd
+        // 2 goes to the serial port, so a silent one means it died somewhere
+        // that has no diagnostic.
+        //
+        // These three lines say WHERE. If the output file does not exist, it
+        // died before fopen(outpath) -- preprocess, lex or parse. If it exists
+        // and is short, it died mid-codegen, and the free-block count says
+        // whether the disk ran out underneath it.
+        long o;
+        char full[64];
+        long k;
+        // cc ran with cwd /src and asmout is relative to it.
+        k = 0;
+        if (asmout[0] != '/') {
+            full[0] = '/'; full[1] = 's'; full[2] = 'r'; full[3] = 'c'; full[4] = '/';
+            k = 5;
+        }
+        {
+            long j;
+            j = 0;
+            while (asmout[j] && k < 63) { full[k] = asmout[j]; k = k + 1; j = j + 1; }
+        }
+        full[k] = 0;
+        o = fs_lookup(full);
+        if (o) printf("  DIAGNOSTIC: %s exists, %d bytes written\n", full, fs_size(o));
+        else   printf("  DIAGNOSTIC: %s was never created\n", full);
+        printf("  DIAGNOSTIC: %d of %d data blocks free, heap %d bytes\n",
+               blocks_free(), sb_nblocks - sb_data_start, heap_bytes_free());
+        fail("the compile");
+        return 0;
+    }
     ino = fs_lookup(asmout[0] == '/' ? asmout : "/src/x");
     printf("\n-- as %s -> %s --\n", asmout, binout);
     code = run_as("/src", asmout, binout);
@@ -306,6 +340,22 @@ long windows_owned_by(long pid) {
 //   there are several distinct colours     -> it drew structure, not a fill
 //
 // A solid-colour blit would satisfy "every pixel changed" and fails both.
+//
+// Both read every FOURTH pixel in each direction rather than all of them, and
+// that is not a corner cut, it is a bug fix. These two ran on every pass of the
+// watch loop, and the same loop samples the pointer's position exactly once per
+// pass. Instrumented, they were 181 ticks of a 204-tick run -- eighty-nine per
+// cent of the machine spent watching, at eight and a half ticks per pass. The
+// pointer-latency figure could therefore never be better than eight ticks no
+// matter how good the compositor was, and the test was reporting the cost of
+// its own instrument.
+//
+// A sixteenth of 52,000 pixels is 3,250, which is thousands of samples spread
+// over the whole client area. Neither question being asked here -- did the
+// picture change, does it have structure -- can survive that sample and still
+// be wrong about the frame.
+#define CLIENT_STEP 4
+
 long client_hash(long hnd) {
     long h;
     long j;
@@ -318,13 +368,14 @@ long client_hash(long hnd) {
     j = 0;
     while (j < ch) {
         long i;
+        long row;
+        row = (wm_client_y() + j) * g_win[hnd].w + wm_client_x();
         i = 0;
         while (i < cw) {
-            h = ((h * 33) + g_win[hnd].pix[(wm_client_y() + j) * g_win[hnd].w
-                                           + wm_client_x() + i]) & 0xFFFFFFFF;
-            i = i + 1;
+            h = ((h * 33) + g_win[hnd].pix[row + i]) & 0xFFFFFFFF;
+            i = i + CLIENT_STEP;
         }
-        j = j + 1;
+        j = j + CLIENT_STEP;
     }
     return h;
 }
@@ -349,13 +400,14 @@ long client_colours(long hnd) {
     j = 0;
     while (j < ch) {
         long i;
+        long row;
+        row = (wm_client_y() + j) * g_win[hnd].w + wm_client_x();
         i = 0;
         while (i < cw) {
             long c;
             long k;
             long found;
-            c = g_win[hnd].pix[(wm_client_y() + j) * g_win[hnd].w
-                               + wm_client_x() + i];
+            c = g_win[hnd].pix[row + i];
             found = 0;
             k = 0;
             while (k < n) { if (g_seen[k] == c) found = 1; k = k + 1; }
@@ -364,9 +416,9 @@ long client_colours(long hnd) {
                 g_seen[n] = c;
                 n = n + 1;
             }
-            i = i + 1;
+            i = i + CLIENT_STEP;
         }
-        j = j + 1;
+        j = j + CLIENT_STEP;
     }
     return n;
 }
@@ -421,6 +473,13 @@ long g_probe_misses;
 long g_probe_worst;
 long g_probe_total;
 long g_probe_bad_spot;
+
+// The harness watching itself. A test rig that eats the machine changes the
+// thing it is measuring, and the pointer latency below is sampled exactly once
+// per pass through the watch loop.
+long g_watch_passes;
+long g_watch_look;      // ticks spent hashing and counting colours
+long g_watch_t0;
 
 // How long to wait for the pointer before calling it a miss. It has to be
 // SHORTER than the run that contains it, or the control can never register a
@@ -499,6 +558,9 @@ long run_and_watch(char *path, char *arg) {
     g_max_colours = 0;
     g_frames_seen = 0;
     last_ink = 0;
+    g_watch_passes = 0;
+    g_watch_look = 0;
+    g_watch_t0 = g_ticks;
 
     for (;;) {
         long i;
@@ -515,18 +577,30 @@ long run_and_watch(char *path, char *arg) {
         }
 
         // Look for a window this pid owns, and see what is in it.
-        i = 0;
-        while (i < WM_MAXWIN) {
-            if (g_win[i].used && g_win_owner[i] == pid) {
-                long h;
-                long cols;
-                g_saw_window = i;
-                h = client_hash(i);
-                if (h != last_ink) { g_frames_seen = g_frames_seen + 1; last_ink = h; }
-                cols = client_colours(i);
-                if (cols > g_max_colours) g_max_colours = cols;
+        //
+        // This is the expensive half of the harness: client_hash reads all
+        // 52,000 pixels of the client area and client_colours reads them again.
+        // It is timed, because the pointer latency below is sampled once per
+        // pass through this loop, so whatever this costs is added to every
+        // latency this test reports.
+        g_watch_passes = g_watch_passes + 1;
+        {
+            long look_t0;
+            look_t0 = g_ticks;
+            i = 0;
+            while (i < WM_MAXWIN) {
+                if (g_win[i].used && g_win_owner[i] == pid) {
+                    long h;
+                    long cols;
+                    g_saw_window = i;
+                    h = client_hash(i);
+                    if (h != last_ink) { g_frames_seen = g_frames_seen + 1; last_ink = h; }
+                    cols = client_colours(i);
+                    if (cols > g_max_colours) g_max_colours = cols;
+                }
+                i = i + 1;
             }
-            i = i + 1;
+            g_watch_look = g_watch_look + (g_ticks - look_t0);
         }
 
         // Move the pointer, then watch the screen for it.
@@ -809,15 +883,34 @@ void main_thread(long unused) {
                 printf("the compositor presented %d times in %d ticks of its "
                        "own; gears presented %d\n",
                        g_comp_frames, g_comp_ticks, g_frames_seen);
+                // What the measurement itself cost. The pointer is sampled once
+                // per watch pass, so a pass that takes N ticks puts a floor of
+                // N on the worst latency this test can ever report, whatever the
+                // compositor does.
+                printf("the watcher: %d passes over %d ticks, %d of them spent "
+                       "hashing the window\n",
+                       g_watch_passes, g_ticks - g_watch_t0, g_watch_look);
                 expect_true("the pointer moved while the renderer was running",
                             g_probe_hits > 8);
                 expect("...and never failed to arrive", g_probe_misses, 0);
-                // A gears frame is tens of ticks. Ten is comfortably inside
-                // that and comfortably above the compositor's own 2-tick
-                // period, so this fails if the pointer is riding on the
-                // application's frames again.
-                expect_true("...within ten ticks, not one gears frame",
-                            g_probe_worst <= 10);
+                // The bound is now the compositor's own period, not a gears
+                // frame.
+                //
+                // It used to be ten ticks, justified as "a gears frame is tens
+                // of ticks". That justification expired: gears is five ticks a
+                // frame now, so ten ticks had quietly become TWO frames and
+                // would have passed a pointer riding on the application again,
+                // which is the exact failure it was written to catch. And with
+                // the watch loop costing eight ticks a pass, ten was also below
+                // anything this test could measure.
+                //
+                // The compositor naps 20ms, so it wakes every 2 ticks and the
+                // floor here is 2. Six is three of its periods: tight enough
+                // that a pointer moving at the application's rate fails it, and
+                // loose enough to survive a slow host. The control run below,
+                // with the compositor stopped, fails it outright.
+                expect_true("...within three compositor periods",
+                            g_probe_worst <= 6);
 
                 printf("a click on the kernel window's title bar was acted on "
                        "after %d ticks\n", g_click_lat);
@@ -953,17 +1046,46 @@ void main_thread(long unused) {
     // Which is also the first thing on this machine that behaves like a
     // desktop rather than a test: a process ends, its window goes with it, and
     // something starts another one.
+    //
+    // THREE THINGS WERE WRONG WITH THE LOOP THAT DID THAT, and all three were
+    // visible from the other side of the screen:
+    //
+    //   It called wm_present() with nothing but a thread_yield() between one
+    //   call and the next, which is not a frame rate, it is a spin. Every
+    //   present lifted the pointer and put it back, so the pointer was
+    //   flickering at whatever rate this loop happened to achieve.
+    //
+    //   It had no business presenting at all. The compositor thread owns the
+    //   screen and does its work with interrupts masked; this loop was
+    //   painting the same framebuffer from a second thread that did not, so a
+    //   tick landing inside wm_present let the two of them interleave.
+    //
+    //   It restarted wingl unconditionally -- including when the user had just
+    //   closed its window. The close worked perfectly: the window was
+    //   destroyed, wingl noticed through SYS_WINPOLL and exited, and then this
+    //   put it straight back. Reported, reasonably, as a close button that
+    //   does nothing.
+    //
+    // So: sleep instead of spinning, leave the screen to the thread that owns
+    // it, and restart wingl only when it finished by itself.
     puts("\nrunning wingl on a loop, for the screenshot\n");
     {
         char *av[2];
         long pid;
+        long closed_by_hand;
         av[0] = "/bin/wingl";
         pid = 0;
+        closed_by_hand = 0;
         for (;;) {
             proc_poll();
-            if (!proc_alive()) pid = proc_spawn("/bin/wingl", 1, av, "/bin/wingl", "/");
-            wm_present();
-            thread_yield();
+            // A window closed by its button, that a process owned, is the user
+            // saying they are done with it. g_win_owner survives the destroy,
+            // so it still says whose it was.
+            if (g_wmin_closed >= 0 && g_win_owner[g_wmin_closed] != 0)
+                closed_by_hand = 1;
+            if (!proc_alive() && !closed_by_hand)
+                pid = proc_spawn("/bin/wingl", 1, av, "/bin/wingl", "/");
+            thread_sleep_ms(50);
         }
     }
     cpu_halt_forever();
