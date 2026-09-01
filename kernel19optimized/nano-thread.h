@@ -1,0 +1,635 @@
+// nano-thread.h — threads, a preemptive scheduler, and locking.
+//
+// Compiled by nano_cc with --kernel. Include AFTER nano-kernel.h and
+// nano-mm.h, and BEFORE nano-int.h -- the interrupt dispatcher switches on this
+// file's include guard to decide whether the timer schedules or just counts.
+//
+// The whole context switch is one instruction. isr_common has already pushed
+// every register onto the current thread's stack before the dispatcher runs,
+// so the entire machine state IS that stack -- and moving the stack pointer
+// moves all of it. The scheduler's only job is to decide which stack to
+// return, and `mov %rax, %rsp` in isr.s does the rest.
+//
+// That is also why a brand-new thread is indistinguishable from a preempted
+// one: thread_create builds a stack that looks exactly like a thread caught
+// mid-interrupt, so it resumes through the same path as everything else.
+//
+// SCOPE. One CPU. The MADT reports one processor and there is no local APIC
+// bring-up here, so this is concurrency, not parallelism. The consequence is
+// stated at every lock: with preemption arriving only from the timer, masking
+// interrupts IS mutual exclusion, and a spin loop would be strictly worse.
+// On more than one core that stops being true and each lock needs a real
+// atomic test-and-set -- the places are marked.
+
+#ifndef NANO_THREAD_H
+#define NANO_THREAD_H
+
+extern long irq_save();
+extern void irq_restore(long were_enabled);
+extern void switch_to_first(long rsp);
+// sti+hlt, from isr.s. Declared again here rather than taken from nano-int.h,
+// because that file is included after this one -- it has to be, so that its
+// interrupt dispatcher can see the scheduler.
+extern void cpu_idle();
+
+#define MAX_THREADS   32
+#define THREAD_STACK  32768        // 8 pages each
+
+#define STACK_CANARY 0x5441434B47554152   // "TACKGUAR"
+
+#define T_UNUSED   0
+#define T_READY    1
+#define T_RUNNING  2
+#define T_BLOCKED  3
+#define T_DONE     4
+// Blocked on the clock rather than on another thread. Separate from T_BLOCKED
+// because the timer wakes these and nothing else does, so the wake scan only
+// has to look at this state.
+#define T_SLEEPING 5
+
+struct Thread {
+    long rsp;                  // saved stack pointer while not running
+    long state;
+    long id;
+    long stack_base;           // for freeing, and for a stack-overflow check
+    long entry;
+    long arg;
+    long retval;
+    long joiner;               // id of a thread waiting on this one, or -1
+    long slices;               // how many times it has been scheduled
+    long faulted;              // 1 if it died from a CPU exception
+    long root;                 // page-table root this thread runs in
+    long proc;                 // owning process id, or -1 for a kernel thread
+    long wake_at;              // tick to wake on, while T_SLEEPING
+    char name[32];
+};
+
+struct Thread g_threads[MAX_THREADS];
+long g_current;                // index of the running thread
+long g_nthreads;
+long g_switches;
+long g_sched_on;               // 0 until the scheduler is allowed to preempt
+
+// The address space every kernel thread runs in: whatever boot32.s built.
+long g_kernel_root;
+
+// Set by sched_switch, read by isr_common in the one instruction window where
+// changing CR3 is safe -- see the comment there. Zero means "no change".
+//
+// It is a global rather than a second return value because the switch happens
+// in assembly, and because there is exactly one CPU: nothing else can be
+// between setting it and consuming it.
+long g_switch_cr3;
+long g_space_switches;
+
+// The stack a new thread starts on has to look exactly like one that was
+// interrupted, because that is the only way back into a thread. From low to
+// high: the fifteen registers isr_common pushes, then the vector and error
+// code it adds, then the five words the CPU itself pushes for iretq.
+//
+// Getting the order wrong here produces a thread that starts with garbage in
+// its registers and jumps somewhere arbitrary -- which, before the exception
+// reporter existed, would have been a silent reboot.
+long thread_build_stack(long stack_top, long entry, long arg) {
+    long *s;
+    long i;
+
+    s = (long *)stack_top;
+
+    // the CPU's own iretq frame, highest first
+    s = s - 1; s[0] = 0x10;                  // ss
+    s = s - 1; s[0] = stack_top;             // rsp after iretq
+    s = s - 1; s[0] = 0x202;                 // rflags, with IF set so the
+                                             // thread runs interruptible
+    s = s - 1; s[0] = 0x08;                  // cs
+    s = s - 1; s[0] = entry;                 // rip
+
+    s = s - 1; s[0] = 0;                     // error code
+    s = s - 1; s[0] = 32;                    // vector (looks like a timer IRQ)
+
+    // the fifteen general registers, in the order isr_common pushes them:
+    // rax first (highest address), r15 last (lowest)
+    s = s - 1; s[0] = 0;                     // rax
+    s = s - 1; s[0] = 0;                     // rbx
+    s = s - 1; s[0] = 0;                     // rcx
+    s = s - 1; s[0] = 0;                     // rdx
+    s = s - 1; s[0] = 0;                     // rsi
+    s = s - 1; s[0] = arg;                   // rdi = the thread's argument
+    s = s - 1; s[0] = 0;                     // rbp
+    i = 0;
+    while (i < 8) { s = s - 1; s[0] = 0; i = i + 1; }   // r8..r15
+
+    return (long)s;
+}
+
+long thread_find_slot() {
+    long i;
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (g_threads[i].state == T_UNUSED || g_threads[i].state == T_DONE) return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+void thread_name(long id, char *nm) {
+    long i;
+    i = 0;
+    while (i < 31 && nm[i]) { g_threads[id].name[i] = nm[i]; i = i + 1; }
+    g_threads[id].name[i] = 0;
+}
+
+// Returns a thread id, or -1. The entry point is passed as an address rather
+// than a function pointer, because nano_cc has none -- callers write
+// (long)&func... which it also has no syntax for, so entry points are exported
+// from the caller with a small accessor. See threads.c.
+long thread_create(long entry, long arg, char *nm) {
+    long slot;
+    long stack;
+    long flags;
+
+    flags = irq_save();
+    slot = thread_find_slot();
+    if (slot < 0) { irq_restore(flags); return -1; }
+
+    stack = (long)kmalloc(THREAD_STACK);
+    if (!stack) { irq_restore(flags); return -1; }
+
+    g_threads[slot].stack_base = stack;
+    // A canary at the low end of the stack. A thread that runs off the bottom
+    // corrupts whatever kmalloc put there, and the symptom appears somewhere
+    // else entirely; this turns it into a message naming the thread.
+    {
+        long *canary;
+        canary = (long *)stack;
+        canary[0] = STACK_CANARY;
+    }
+    g_threads[slot].entry = entry;
+    g_threads[slot].arg = arg;
+    g_threads[slot].retval = 0;
+    g_threads[slot].joiner = -1;
+    g_threads[slot].slices = 0;
+    g_threads[slot].faulted = 0;
+    g_threads[slot].root = g_kernel_root;
+    g_threads[slot].proc = -1;
+    g_threads[slot].wake_at = 0;
+    g_threads[slot].id = slot;
+    thread_name(slot, nm);
+    // 16-byte align the top, and leave a word spare: the ABI wants rsp+8
+    // aligned to 16 at a function's first instruction.
+    g_threads[slot].rsp = thread_build_stack((stack + THREAD_STACK) & ~15, entry, arg);
+    g_threads[slot].state = T_READY;
+    if (slot >= g_nthreads) g_nthreads = slot + 1;
+
+    irq_restore(flags);
+    return slot;
+}
+
+// The idle thread's slot, or -1 before there is one. It is always runnable, so
+// without excluding it here round-robin would hand it a full slice every
+// rotation -- which on two threads is half the machine spent in hlt.
+long g_idle_thread;
+
+// Pick the next runnable thread, round-robin from the one after the current.
+// The idle thread is skipped unless nothing else can run at all.
+//
+// Returns -1 only when there is no idle thread either, which on this kernel
+// means everything is blocked and only an interrupt can change that.
+long sched_pick() {
+    long i;
+    long n;
+    n = 0;
+    i = g_current;
+    while (n < MAX_THREADS) {
+        i = i + 1;
+        if (i >= MAX_THREADS) i = 0;
+        if (i == g_idle_thread) { n = n + 1; continue; }
+        if (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING) return i;
+        n = n + 1;
+    }
+    if (g_idle_thread >= 0 &&
+        (g_threads[g_idle_thread].state == T_READY ||
+         g_threads[g_idle_thread].state == T_RUNNING)) return g_idle_thread;
+    return -1;
+}
+
+// Wake every sleeper whose deadline has passed. Called from the timer, which is
+// the only thing that can move the clock, and which is also the only context
+// where nothing else can be part-way through touching the table.
+//
+// `now` is passed in rather than read, because g_ticks lives in nano-int.h and
+// that file is included after this one.
+long g_sleep_wakes;
+
+void thread_wake_due(long now) {
+    long i;
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (g_threads[i].state == T_SLEEPING && now >= g_threads[i].wake_at) {
+            g_threads[i].state = T_READY;
+            g_sleep_wakes = g_sleep_wakes + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// Called from the timer interrupt with the current thread's saved stack.
+// Returns the stack to resume on -- the same one if no switch is wanted.
+long g_stack_smashed;
+
+long sched_switch(long cur_rsp) {
+    long next;
+
+    // Every path out of here must leave this defined, including the ones that
+    // decide not to switch. A stale value would install the previous switch's
+    // page tables under a thread that never asked to move.
+    g_switch_cr3 = 0;
+
+    if (!g_sched_on) return cur_rsp;
+
+    // Check the outgoing thread's canary while we are already touching it.
+    {
+        long *canary;
+        canary = (long *)g_threads[g_current].stack_base;
+        if (g_threads[g_current].stack_base && canary[0] != STACK_CANARY) {
+            g_stack_smashed = g_stack_smashed + 1;
+            printf("\n*** thread %d (%s) overflowed its stack\n",
+                   g_current, g_threads[g_current].name);
+            g_threads[g_current].state = T_DONE;
+        }
+    }
+
+    g_threads[g_current].rsp = cur_rsp;
+    if (g_threads[g_current].state == T_RUNNING) g_threads[g_current].state = T_READY;
+
+    next = sched_pick();
+    if (next < 0) return cur_rsp;             // nothing runnable; carry on
+    if (next == g_current) {
+        g_threads[g_current].state = T_RUNNING;
+        return cur_rsp;
+    }
+
+    // If the incoming thread lives in a different address space, hand the root
+    // to isr_common rather than installing it here: this function is running on
+    // the OUTGOING thread's stack, and that stack is only mapped in the address
+    // space we are about to leave.
+    if (g_threads[next].root != g_threads[g_current].root) {
+        g_switch_cr3 = g_threads[next].root;
+        g_space_switches = g_space_switches + 1;
+    }
+
+    g_current = next;
+    g_threads[next].state = T_RUNNING;
+    g_threads[next].slices = g_threads[next].slices + 1;
+    g_switches = g_switches + 1;
+    return g_threads[next].rsp;
+}
+
+// Give up the rest of this time slice. Implemented as a software interrupt on
+// the timer's own vector, so it goes through exactly the same path a real
+// preemption does -- one code path to be right rather than two.
+extern void yield_now();
+
+void thread_yield() {
+    if (!g_sched_on) return;
+    yield_now();
+}
+
+// Block until the clock reaches `deadline`. The difference from a yield loop is
+// the whole point: a sleeping thread is not in the ready set at all, so it is
+// never handed a slice it has nothing to do with. The old thread_sleep_ms spun
+// on thread_yield, which on two threads gave a sleeper half the machine.
+//
+// The deadline is absolute so that the caller, which is the only place that can
+// see the clock, computes it once. Sleeping while the scheduler is off would
+// block forever with nothing able to wake it, so that degrades to a no-op and
+// the caller's own spin -- see thread_sleep_ms.
+long thread_sleep_until(long deadline) {
+    if (!g_sched_on) return 0;
+    g_threads[g_current].wake_at = deadline;
+    g_threads[g_current].state = T_SLEEPING;
+    yield_now();
+    return 1;
+}
+
+void thread_exit(long value) {
+    long flags;
+    flags = irq_save();
+    g_threads[g_current].retval = value;
+    g_threads[g_current].state = T_DONE;
+    if (g_threads[g_current].joiner >= 0) {
+        long j;
+        j = g_threads[g_current].joiner;
+        if (g_threads[j].state == T_BLOCKED) g_threads[j].state = T_READY;
+    }
+    irq_restore(flags);
+    // Nothing more to do on this stack; the next tick will schedule elsewhere
+    // and never come back here.
+    for (;;) thread_yield();
+}
+
+long thread_join(long id) {
+    long r;
+    long f;
+    if (id < 0 || id >= MAX_THREADS) return 0;
+    while (g_threads[id].state != T_DONE && g_threads[id].state != T_UNUSED) {
+        g_threads[id].joiner = g_current;
+        thread_yield();
+    }
+    r = g_threads[id].retval;
+
+    // Reclaim the stack here rather than in thread_exit. A thread cannot free
+    // the stack it is standing on -- the very next call would write into
+    // memory the heap has already handed to somebody else. The joiner is the
+    // first point at which the stack is provably idle.
+    //
+    // A consequence worth knowing: a thread that is never joined leaks its
+    // stack. That is the same bargain pthreads makes, and the reason detach
+    // exists.
+    f = irq_save();
+    if (g_threads[id].stack_base) {
+        kfree((void *)g_threads[id].stack_base);
+        g_threads[id].stack_base = 0;
+    }
+    irq_restore(f);
+    return r;
+}
+
+// The idle thread. It exists so that "everything is asleep" has an answer other
+// than "resume a sleeping thread anyway", which is what sched_switch had to do
+// before, and which made a real sleep impossible: with only one thread on the
+// machine there was nowhere else to go.
+//
+// hlt stops the core until the next interrupt, so an idle machine costs nothing
+// -- which is visible from outside as the emulator no longer pinning a host CPU
+// while the desktop sits there.
+long g_idle_slices;
+
+void idle_body(long arg) {
+    for (;;) {
+        g_idle_slices = g_idle_slices + 1;
+        cpu_idle();
+    }
+}
+
+// Create it. Called from sched_start, so no caller has to remember to.
+void idle_start() {
+    if (g_idle_thread >= 0) return;
+    // -1 while it is being built: thread_create runs sched_pick's exclusion
+    // rule against g_idle_thread, and pointing that at a half-built slot would
+    // hide the new thread from the scheduler.
+    g_idle_thread = thread_create((long)idle_body, 0, "idle");
+}
+
+// Turn the scheduler on and jump into the first thread. Does not return.
+void sched_start() {
+    long first;
+    cli_();
+    idle_start();
+    first = sched_pick();
+    if (first < 0) return;
+    g_current = first;
+    g_threads[first].state = T_RUNNING;
+    g_threads[first].slices = 1;
+    g_sched_on = 1;
+    switch_to_first(g_threads[first].rsp);
+}
+
+void thread_init() {
+    long i;
+    i = 0;
+    while (i < MAX_THREADS) { g_threads[i].state = T_UNUSED; i = i + 1; }
+    g_current = 0;
+    g_nthreads = 0;
+    g_switches = 0;
+    g_sched_on = 0;
+    g_stack_smashed = 0;
+    g_thread_faults = 0;
+    g_switch_cr3 = 0;
+    g_space_switches = 0;
+    g_idle_thread = -1;
+    g_idle_slices = 0;
+    g_sleep_wakes = 0;
+    // Whatever boot32.s built is the kernel's address space, and every thread
+    // starts in it. Reading it rather than naming a constant means this stays
+    // right if the boot path ever moves the tables.
+    g_kernel_root = read_cr3_();
+}
+
+// A thread that runs in a page-table root of its own. The stack is supplied by
+// the caller because it lives in that other address space, and this side of the
+// kernel cannot allocate there.
+//
+// The stack frame the thread starts on must already have been built in the
+// target space -- see proc_build_stack in nano-proc.h, which pokes it in
+// through the identity map.
+long thread_adopt(long rsp, long root, long proc, char *nm) {
+    long slot;
+    long flags;
+
+    flags = irq_save();
+    slot = thread_find_slot();
+    if (slot < 0) { irq_restore(flags); return -1; }
+
+    g_threads[slot].stack_base = 0;      // not ours to free, and not on the heap
+    g_threads[slot].entry = 0;
+    g_threads[slot].arg = 0;
+    g_threads[slot].retval = 0;
+    g_threads[slot].joiner = -1;
+    g_threads[slot].slices = 0;
+    g_threads[slot].faulted = 0;
+    g_threads[slot].root = root;
+    g_threads[slot].proc = proc;
+    g_threads[slot].wake_at = 0;
+    g_threads[slot].id = slot;
+    thread_name(slot, nm);
+    g_threads[slot].rsp = rsp;
+    g_threads[slot].state = T_READY;
+    if (slot >= g_nthreads) g_nthreads = slot + 1;
+
+    irq_restore(flags);
+    return slot;
+}
+
+// Called from the exception handler when the running thread has faulted.
+// Returns 1 if it was safe to kill just this thread, 0 if the fault has to be
+// fatal to the whole machine.
+//
+// It is NOT safe when the faulting thread is the only one that can run: with
+// nothing left to schedule, returning would resume the dead thread and fault
+// again immediately. Better to say so and stop than to loop.
+long g_thread_faults;
+
+long thread_fault_kill() {
+    long other;
+    long i;
+    long n;
+
+    if (!g_sched_on) return 0;
+
+    // Is there anything else to run? The idle thread does not count: killing
+    // the faulting thread and then idling forever is not "the rest of the
+    // system continues", it is a hang with a cheerful message. Before the idle
+    // thread existed this loop was right without having to say so.
+    //
+    // A SLEEPER DOES count. It is not runnable this instant, but the timer will
+    // make it runnable, and a compositor that naps 20ms between frames is
+    // exactly the shape of thread that would otherwise be missed here.
+    other = 0;
+    n = 0;
+    i = 0;
+    while (i < MAX_THREADS) {
+        if (i != g_current && i != g_idle_thread &&
+            (g_threads[i].state == T_READY || g_threads[i].state == T_RUNNING ||
+             g_threads[i].state == T_SLEEPING))
+            other = 1;
+        i = i + 1;
+    }
+    if (!other) return 0;
+
+    printf("thread %d (%s) faulted\n", g_current, g_threads[g_current].name);
+    g_thread_faults = g_thread_faults + 1;
+    g_threads[g_current].state = T_DONE;
+    g_threads[g_current].retval = -1;
+    g_threads[g_current].faulted = 1;
+    if (g_threads[g_current].joiner >= 0) {
+        long j;
+        j = g_threads[g_current].joiner;
+        if (g_threads[j].state == T_BLOCKED) g_threads[j].state = T_READY;
+    }
+    return 1;
+}
+
+// ---------- locks ----------
+//
+// On one core with preemption only from the timer, masking interrupts IS
+// mutual exclusion: nothing else can be running to contend for the lock. That
+// makes this both correct and cheaper than any spin loop.
+//
+// >>> On more than one core this is NOT enough. The other cores keep running
+// >>> with interrupts of their own, and each of these needs a real atomic
+// >>> test-and-set on `held`. The field is already here for that.
+struct Spinlock {
+    long held;
+    long flags;
+    long owner;
+};
+
+void spin_init(struct Spinlock *l) { l->held = 0; l->flags = 0; l->owner = -1; }
+
+void spin_lock(struct Spinlock *l) {
+    long f;
+    f = irq_save();
+    // <<< SMP: an atomic exchange on l->held goes here, spinning until it wins
+    l->held = 1;
+    l->flags = f;
+    l->owner = g_current;
+}
+
+void spin_unlock(struct Spinlock *l) {
+    long f;
+    f = l->flags;
+    l->held = 0;
+    l->owner = -1;
+    irq_restore(f);
+}
+
+// A mutex a thread can hold across a yield. Interrupts stay ON while it is
+// held, so the holder can be preempted -- which is the whole point, and also
+// why it cannot simply be a spinlock.
+struct Mutex {
+    long locked;
+    long owner;
+    long waiters;
+};
+
+void mutex_init(struct Mutex *m) { m->locked = 0; m->owner = -1; m->waiters = 0; }
+
+void mutex_lock(struct Mutex *m) {
+    for (;;) {
+        long f;
+        f = irq_save();
+        if (!m->locked) {
+            m->locked = 1;
+            m->owner = g_current;
+            irq_restore(f);
+            return;
+        }
+        m->waiters = m->waiters + 1;
+        irq_restore(f);
+        // Yield rather than spin: on one core, spinning here burns the rest of
+        // a slice that the holder needs in order to release it.
+        thread_yield();
+    }
+}
+
+// A thread that dies holding a mutex leaves it locked forever, and everyone
+// waiting on it blocks for good. Real isolation solves this by giving each
+// server its own address space and its own locks; here, the supervisor calls
+// this for the locks it knows about when it reaps a dead server. Anything it
+// does not know about stays stuck -- which is precisely the limitation that
+// address-space separation exists to remove.
+long mutex_release_if_owner(struct Mutex *m, long owner) {
+    long f;
+    long freed;
+    f = irq_save();
+    freed = 0;
+    if (m->locked && m->owner == owner) {
+        m->locked = 0;
+        m->owner = -1;
+        freed = 1;
+    }
+    irq_restore(f);
+    return freed;
+}
+
+long mutex_trylock(struct Mutex *m) {
+    long f;
+    long got;
+    f = irq_save();
+    got = 0;
+    if (!m->locked) { m->locked = 1; m->owner = g_current; got = 1; }
+    irq_restore(f);
+    return got;
+}
+
+void mutex_unlock(struct Mutex *m) {
+    long f;
+    f = irq_save();
+    m->locked = 0;
+    m->owner = -1;
+    irq_restore(f);
+}
+
+// ---------- a pthreads-shaped surface ----------
+// The core of the API, with the same meanings. Not the whole of pthreads --
+// detach, cancellation, barriers, thread-local storage and attributes are not
+// here, and calling this "pthreads" without saying that would be a lie.
+typedef long pthread_t;
+typedef struct Mutex pthread_mutex_t;
+
+long pthread_create(pthread_t *out, long entry, long arg) {
+    long id;
+    id = thread_create(entry, arg, "pthread");
+    if (id < 0) return -1;
+    if (out) *out = id;
+    return 0;
+}
+
+long pthread_join(pthread_t id, long *retval) {
+    long r;
+    r = thread_join(id);
+    if (retval) *retval = r;
+    return 0;
+}
+
+pthread_t pthread_self() { return g_current; }
+void pthread_exit(long v) { thread_exit(v); }
+long pthread_yield_() { thread_yield(); return 0; }
+
+long pthread_mutex_init(pthread_mutex_t *m) { mutex_init(m); return 0; }
+long pthread_mutex_lock(pthread_mutex_t *m) { mutex_lock(m); return 0; }
+long pthread_mutex_trylock(pthread_mutex_t *m) { return mutex_trylock(m) ? 0 : -1; }
+long pthread_mutex_unlock(pthread_mutex_t *m) { mutex_unlock(m); return 0; }
+
+#endif

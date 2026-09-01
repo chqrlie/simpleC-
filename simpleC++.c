@@ -1781,9 +1781,27 @@ static void e_imul_const(const char *reg, int n) {
 // are the same for signed and unsigned operands, so no sign handling is needed.
 static void e_imul_rax_rcx(void) {
     if (!g_minimal) { emit("    imul rax, rcx"); return; }
-    int top = label_id++, skip = label_id++, done = label_id++;
+    int top = label_id++, skip = label_id++, done = label_id++, pos = label_id++;
     emit("    mov rdx, rax");
     emit("    mov rax, 0");
+    // The loop below runs once per bit position of rcx, shifting it right until
+    // it is zero. A NEGATIVE rcx has its top bits set, so `x * -1` -- which is
+    // what `0 - x` becomes all over fixed-point code -- took the full 64
+    // iterations while `x * 1` took one.
+    //
+    // Negating both operands leaves the product alone and makes the iteration
+    // count follow the magnitude instead of the sign. The most negative long
+    // negates to itself and still runs 64 times, which is right: its magnitude
+    // genuinely needs bit 63.
+    emit("    cmp rcx, 0");
+    emit("    jge .L%d", pos);
+    emit("    mov r8, 0");
+    emit("    sub r8, rcx");
+    emit("    mov rcx, r8");
+    emit("    mov r8, 0");
+    emit("    sub r8, rdx");
+    emit("    mov rdx, r8");
+    emit(".L%d:", pos);
     emit(".L%d:", top);
     emit("    cmp rcx, 0");
     emit("    je .L%d", done);
@@ -1839,7 +1857,65 @@ static void gen_divmod_routine(void) {
     emit("    mov r11, 0");                // running quotient
     emit("    cmp rcx, 0");
     emit("    je .Ldm_dz");
+    // How many steps does this division actually need? The loop shifts the
+    // dividend left one bit at a time, and while the bit shifted out is zero
+    // the whole iteration is a no-op: the remainder stays zero, the quotient
+    // stays zero, and nothing is subtracted. So the leading zeros of the
+    // dividend are exactly the wasted work, and there is no reason to do them.
+    //
+    // Normalising costs six tests rather than counting a bit at a time, which
+    // would put the 64 iterations straight back. Each test asks whether the top
+    // k bits are all zero and, if they are, shifts them away.
+    //
+    // 123456789 is 27 significant bits, so dividing it takes 27 steps instead
+    // of 64. Programs built by --minimal have no idiv at all and come here for
+    // every single division, so this is on the hot path of everything the OS
+    // compiles for itself -- including the renderer's one divide per pixel.
+    emit("    cmp rax, 0");
+    emit("    je .Ldm_fin");               // 0/n = 0 rem 0, already in place
     emit("    mov r10, 64");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 32");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n32");
+    emit("    shl rax, 32");
+    emit("    sub r10, 32");
+    emit(".Ldm_n32:");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 48");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n16");
+    emit("    shl rax, 16");
+    emit("    sub r10, 16");
+    emit(".Ldm_n16:");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 56");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n8");
+    emit("    shl rax, 8");
+    emit("    sub r10, 8");
+    emit(".Ldm_n8:");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 60");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n4");
+    emit("    shl rax, 4");
+    emit("    sub r10, 4");
+    emit(".Ldm_n4:");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 62");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n2");
+    emit("    shl rax, 2");
+    emit("    sub r10, 2");
+    emit(".Ldm_n2:");
+    emit("    mov rsi, rax");
+    emit("    shr rsi, 63");
+    emit("    cmp rsi, 0");
+    emit("    jne .Ldm_n1");
+    emit("    shl rax, 1");
+    emit("    sub r10, 1");
+    emit(".Ldm_n1:");
     emit(".Ldm_loop:");
     emit("    cmp r10, 0");
     emit("    je .Ldm_fin");
