@@ -7,41 +7,34 @@
 #include <nano-nolibc.h>
 
 int main() {
-    int sum;
-    int i;
-
     // for-loop: 1 + 2 + ... + 10 = 55
-    sum = 0;
-    for (i = 1; i <= 10; i = i + 1) sum = sum + i;
-    _puts("for   1..10        = "); _print_int(sum); _puts("\n");
+    int sum = 0;
+    for (int i = 1; i <= 10; i = i + 1) sum = sum + i;
+    println("for   1..10        = ", sum);
 
     // for + break + continue + prefix ++: even numbers below 9 -> 2+4+6+8 = 20
     sum = 0;
-    for (i = 1; i <= 10; ++i) {
+    for (int i = 1; i <= 10; ++i) {
         if (i == 9) break;
         if (i % 2 == 1) continue;
         sum = sum + i;
     }
-    _puts("evens below 9      = "); _print_int(sum); _puts("\n");
+    println("evens below 9      = ", sum);
 
     // do/while: prints 3 2 1
-    int n;
-    n = 3;
-    _puts("do/while countdown = ");
-    do { _print_int(n); _puts(" "); --n; } while (n > 0);
+    int n = 3;
+    _puts("do/while countdown =");
+    do { print(" ", n); --n; } while (n > 0);
     _puts("\n");
 
     // prefix ++ returns the new value
-    int a; int b;
-    a = 5;
-    b = ++a;                         // a == 6, b == 6
-    _puts("prefix ++a         = "); _print_int(a); _puts(", b = "); _print_int(b); _puts("\n");
+    int a = 5;
+    int b = ++a;                         // a == 6, b == 6
+    print("prefix ++a         = ", a); println(", b = ", b);
 
     // ternary
-    int hi;
-    hi = (a > b) ? a : 99;           // a == b, so 99
-    _puts("ternary (a>b?a:99) = "); _print_int(hi); _puts("\n");
+    int hi = (a > b) ? a : 99;           // a == b, so 99
+    println("ternary (a>b?a:99) = ", hi);
 
     return 0;
 }
-

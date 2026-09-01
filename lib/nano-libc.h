@@ -12,17 +12,6 @@ typedef unsigned char bool;
 // stddef.h
 #ifndef NULL
 #define NULL  ((void*)0)
-typedef unsigned long size_t;
-typedef long ssize_t;
-#endif
-
-// stdarg.h on top of nano_cc's variadic built-ins ---
-#ifndef va_start
-#define va_list          __builtin_va_list
-#define va_start(ap, l)  __builtin_va_start(ap, l)
-#define va_arg(ap, t)    ((t)__builtin_va_arg(ap))
-#define va_copy(a1, a2)  ((a1) = (a2))
-#define va_end(ap)       __builtin_va_end(ap)
 #endif
 
 // limits.h
@@ -107,7 +96,7 @@ int strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-long __syscall(long n, ...);
+static void __bp() {}
 
 // --- Syscall numbers ---
 enum {
@@ -146,7 +135,9 @@ int creat(const char *path, int mode) {
     return __syscall(SYS_creat, path, mode);
 }
 int open(const char *path, int flags, ...) {
-    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    va_list ap; va_start(ap, flags);
+    int mode = va_arg(ap, int);
+    va_end(ap);
     return __syscall(SYS_open, path, flags, mode);
 }
 int close(int fd) { return __syscall(SYS_close, fd); }

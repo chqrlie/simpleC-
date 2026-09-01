@@ -26,19 +26,19 @@ int area(struct Rect *r) {                            // access via ->
 int main() {
     struct Point p;
     p.x = 3; p.y = 4;
-    _puts("p.x + p.y = "); _print_int(p.x + p.y); _puts("\n");    // 7
+    println("p.x + p.y = ", p.x + p.y);    // 7
 
     struct Rect r;
     r.tl.x = 0; r.tl.y = 0;
     r.br.x = 5; r.br.y = 4;
-    _puts("area      = "); _print_int(area(&r)); _puts("\n");     // 20
+    println("area      = ", area(&r));     // 20
 
     union Box b;
     b.l = 258;                                                  // 0x102
-    _puts("union .i  = "); _print_int(b.i);
-    _puts(", .c = ");      _print_int(b.c); _puts("\n");           // 258, 2
+    print("union .i  = ", b.i);
+    println(", .c = ", b.c);           // 258, 2
 
-    _puts("sizeof(struct Rect) = "); _print_int(sizeof(struct Rect)); _puts("\n");
+    println("sizeof(struct Rect) = ", sizeof(struct Rect));
 
     _puts("string return: ");
     _puts(label(1)); _puts(" / "); _puts(label(0)); _puts("\n");   // yes / no

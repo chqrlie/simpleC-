@@ -2,19 +2,22 @@
 #ifndef NANO_NOLIBC_H
 #define NANO_NOLIBC_H
 
+#ifdef __GNUC__
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#else
+
 typedef unsigned char bool;
 #define true 1
 #define false 0
 
-#define va_list          __builtin_va_list
-#define va_start(ap, l)  __builtin_va_start(ap, l)
-#define va_arg(ap, t)    ((t)__builtin_va_arg(ap))
-#define va_copy(a1, a2)  ((a1) = (a2))
-#define va_end(ap)       __builtin_va_end(ap)
-
 #define NULL  ((void*)0)
-typedef unsigned long size_t;
-typedef long ssize_t;
 
 // errno.h
 thread_local int errno;
@@ -36,36 +39,36 @@ enum {
     SYS_mmap  = 9,
     SYS_exit  = 60,
 };
-long __syscall(long n, ...);
 
 // --- POSIX wrappers ---
-ssize_t _read(int fd, void *buf, size_t len) {
+ssize_t read(int fd, void *buf, size_t len) {
     for (;;) {
         ssize_t n = __syscall(SYS_read, fd, buf, len);
         if (n >= 0 || errno != EINTR) return n;
     }
 }
-ssize_t _write(int fd, const void *buf, size_t len) {
+ssize_t write(int fd, const void *buf, size_t len) {
     for (;;) {
         ssize_t n = __syscall(SYS_write, fd, buf, len);
         if (n >= 0 || errno != EINTR) return n;
     }
 }
-int _open(const char *path, int flags, ...) {
+int open(const char *path, int flags, ...) {
     va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
     return __syscall(SYS_open, path, flags, mode);
 }
-int _close(int fd) { return __syscall(SYS_close, fd); }
+int close(int fd) { return __syscall(SYS_close, fd); }
 
 _Noreturn void exit(int code) {
     __syscall(SYS_exit, code);
     for(;;);
 }
+#endif
 
 // ancillary functions used in the examples
-void _putc(char c) { _write(1, &c, 1); }
-void _puts(const char *s) { _write(1, s, strlen(s)); }
-void _print_int(long n) {
+void _putc(char c) { write(1, &c, 1); }
+void _puts(const char *s) { write(1, s, strlen(s)); }
+void print_int(long n) {
     char buf[24]; unsigned long u = n;
     if (n < 0) u = -u;
     char *p = buf + sizeof(buf);
@@ -74,4 +77,6 @@ void _print_int(long n) {
     if (n < 0) *--p = '-';
     _puts(p);
 }
+void print(const char *str, long n) { if (str) _puts(str); print_int(n); }
+void println(const char *str, long n) { print(str, n); _putc('\n'); }
 #endif

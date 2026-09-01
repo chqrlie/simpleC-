@@ -13,9 +13,7 @@
 #define SET_BIT(x, n) ((x) | (1 << (n)))
 #define IS_ODD(x)     ((x) & 1)
 
-static void show(char *label, long v) {
-    _puts(label); _print_int(v); _puts("\n");
-}
+#define show(label, v) println(label, v)
 
 int main() {
     show("0x0F & 0x05      = ", 0x0F & 0x05);      // 5

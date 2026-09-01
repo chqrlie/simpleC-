@@ -61,6 +61,11 @@ $(TMP)/%_prog: examples/%.c $(BIN) build Makefile
 	$(AS) -nostdlib $@.s -o $@
 	$(RUN) ./$@
 
+%: %.c $(BIN) Makefile
+	$(BIN) $(FLAGS) $< -o $@.s
+	$(AS) -nostdlib $@.s -o $@
+	$(RUN) ./$@
+
 test: $(TMP)/test_prog
 hello: $(TMP)/hello_prog
 structs: $(TMP)/structs_prog
