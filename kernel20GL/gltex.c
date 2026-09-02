@@ -85,6 +85,12 @@ void expect_true(char *what, long got) {
 // the viewport and the textures
 // ============================================================
 
+// The animation's frame rate, in PIT ticks between redraws. The timer runs at
+// 100 Hz, so 3 is a redraw about thirty times a second. Set it to 1 for as
+// many frames as the machine can manage, at the cost of it being busy all the
+// time; the rotation rate does not change either way.
+#define FRAME_TICKS 3
+
 #define VPX  (WM_BORDER + 4)
 #define VPY  (WM_TITLE_H + 4)
 #define VPW  256
@@ -962,6 +968,13 @@ void demo_floor() {
 long g_scene_damage;
 long g_anim_in_view;
 
+// ...and WHERE it repainted, in window coordinates, so the widgets standing
+// on top of the viewport know whether the ground moved under them.
+long g_sdx;
+long g_sdy;
+long g_sdw;
+long g_sdh;
+
 void render_scene() {
     struct M4 clip;
     long i;
@@ -1017,6 +1030,12 @@ void render_scene() {
     // Did this frame change the viewport at all? Asked before the flush,
     // because the flush is what empties the damage box.
     g_scene_damage = (g_gl.dx1 >= g_gl.dx0);
+    if (g_scene_damage) {
+        g_sdx = g_gl.vx + g_gl.dx0;
+        g_sdy = g_gl.vy + g_gl.dy0;
+        g_sdw = g_gl.dx1 - g_gl.dx0 + 1;
+        g_sdh = g_gl.dy1 - g_gl.dy0 + 1;
+    }
     gl_flush(&g_gl);
 }
 
@@ -1085,6 +1104,13 @@ long frame_ui(long down, long pressed, long released, long key) {
     again = 0;
     ui_begin(&g_ui, g_win[g_win3d].used ? g_win3d : g_panel_win,
              VPX + 8, VPY + 8, 130);
+    // The scene has just been drawn into the middle of this window, over the
+    // top of whatever the HUD left there. Widgets inside that rectangle have
+    // to draw again even though nothing about them changed; widgets outside
+    // it -- the whole panel window, most frames -- are still on screen
+    // exactly as they were, and drawing them again is 600 us of writing
+    // pixels that are already correct.
+    if (g_scene_damage) ui_overpaint(&g_ui, g_win3d, g_sdx, g_sdy, g_sdw, g_sdh);
     ui_input(&g_ui, down, pressed, released, key);
 
     g_view.dx = 0; g_view.dy = 0; g_view.key = 0;
@@ -1140,8 +1166,10 @@ long g_ui_stale;
 
 void event_loop() {
     long last_tick;
+    long last_frame;
     long touched;
     last_tick = g_ticks;
+    last_frame = g_ticks;
     g_redraw = 1;
     g_ui_stale = 1;
     for (;;) {
@@ -1187,7 +1215,22 @@ void event_loop() {
         if (g_ticks != last_tick) {
             g_spin = (g_spin + (g_ticks - last_tick)) % 360;
             last_tick = g_ticks;
-            if (g_anim_in_view) g_redraw = 1;
+            // AND NOT MORE OFTEN THAN THE FRAME RATE.
+            //
+            // Without this the demo redraws on every tick it can, so making a
+            // frame cheaper does not make the machine quieter -- it just draws
+            // more frames. That is why turning on wireframe, which cuts the
+            // cost of a frame by five, barely moved the cpu at all: 47 frames
+            // a second at 15.7 ms became 98 a second at 5.5 ms, 73% against
+            // 54%, and it looked like wireframe had changed nothing.
+            //
+            // The rotation does not slow down. g_spin steps by the ticks that
+            // PASSED, above, so the model turns at the same rate whether it is
+            // sampled thirty times a second or a hundred.
+            if (g_anim_in_view && g_ticks - last_frame >= FRAME_TICKS) {
+                g_redraw = 1;
+                last_frame = g_ticks;
+            }
         }
 
         // THE SCENE FIRST, AND THEN DECIDE.
@@ -1479,11 +1522,46 @@ long idle_time_us(long what) {
         if (what == 0) render_scene();
         else if (what == 1) gl_clear(&g_gl);
         else if (what == 2) { frame_ui(0, 0, 0, 0); wm_present(); }
+        // The whole pass the event loop actually runs, in the order it runs
+        // it. Not the sum of the parts: the scene's damage is still on the
+        // list when present is reached, so this is the only one of these
+        // numbers that includes the compositor blitting it to the screen.
+        else if (what == 4) { render_scene(); frame_ui(0, 0, 0, 0); wm_present(); }
         else wm_present();
         r = r + 1;
     }
     b = pm_timer_read();
     return ((pm_timer_delta(a, b) * 1000000) / PM_TMR_HZ) / IDLE_ROUNDS;
+}
+
+// The same three numbers for whatever the camera is pointing at now.
+void idle_cost_row(char *what) {
+    long scene;
+    long iface;
+    long whole;
+    long blit;
+
+    render_scene();
+    render_scene();
+    scene = idle_time_us(0);
+    iface = idle_time_us(2);
+    whole = idle_time_us(4);
+
+    render_scene();
+    wm_reset_counters();
+    wm_present();
+    blit = wm_pixels;
+
+    printf("  %s\n", what);
+    printf("    tris %d, anim in view %d, clear %d px\n",
+           g_gl.tris_drawn, g_anim_in_view, g_gl.clearpix);
+    printf("    scene %d us, interface %d us, whole pass %d us\n",
+           scene, iface, whole);
+    printf("    so the compositor blit is about %d us for %d screen pixels\n",
+           whole - scene - iface, blit);
+    printf("    widgets drawn %d, of which pushed damage %d\n",
+           g_ui.drawn, g_ui.invalidations);
+    printf("    %d%% of a core at %d Hz\n", (whole * g_hz) / 10000, g_hz);
 }
 
 void idle_cost_report() {
@@ -1523,7 +1601,19 @@ void idle_cost_report() {
     else
         puts("  what this loop runs while nothing is on screen: nothing at all\n");
 
+    // AND THE CASE HE CAME BACK WITH: "as soon as i see a spinning cube one or
+    // all of them the cpu use climbs really high even in wireframe mode seems
+    // same or unchanged". Wireframe changing nothing is the tell -- it changes
+    // what the RASTERISER does, so whatever is expensive is not the fill.
     g_cam.pitch = savepitch;
+    puts("\n-- a pass with something in view --\n");
+    idle_cost_row("the scene the demo starts on, solid");
+    g_gl.wire = 1;
+    g_wire = 1;
+    idle_cost_row("the same scene, wireframe");
+    g_gl.wire = 0;
+    g_wire = 0;
+
     g_redraw = 1;
     g_ui_stale = 1;
     render_scene();

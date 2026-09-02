@@ -102,6 +102,12 @@ long win_hash(long win, long x, long y, long w, long h) {
 // the scene
 // ============================================================
 
+// The animation's frame rate, in PIT ticks between redraws. The timer runs at
+// 100 Hz, so 3 is a redraw about thirty times a second. Set it to 1 for as
+// many frames as the machine can manage, at the cost of it being busy all the
+// time; the rotation rate does not change either way.
+#define FRAME_TICKS 3
+
 #define VPX  (WM_BORDER + 4)
 #define VPY  (WM_TITLE_H + 4)
 #define VPW  300
@@ -1751,6 +1757,13 @@ void build_desktop() {
 long g_scene_damage;
 long g_anim_in_view;
 
+// ...and WHERE it repainted, in window coordinates, so the widgets sitting on
+// top of the viewport know whether the ground moved under them.
+long g_sdx;
+long g_sdy;
+long g_sdw;
+long g_sdh;
+
 void render_scene() {
     struct M4 clip;
     long i;
@@ -1801,6 +1814,12 @@ void render_scene() {
     // Did this frame change the viewport at all? Asked before the flush,
     // because the flush is what empties the damage box.
     g_scene_damage = (g_gl.dx1 >= g_gl.dx0);
+    if (g_scene_damage) {
+        g_sdx = g_gl.vx + g_gl.dx0;
+        g_sdy = g_gl.vy + g_gl.dy0;
+        g_sdw = g_gl.dx1 - g_gl.dx0 + 1;
+        g_sdh = g_gl.dy1 - g_gl.dy0 + 1;
+    }
     gl_flush(&g_gl);
 }
 
@@ -1811,9 +1830,11 @@ long g_ui_stale;
 
 void event_loop() {
     long last_tick;
+    long last_frame;
     long redraw;
     long touched;
     last_tick = g_ticks;
+    last_frame = g_ticks;
     redraw = 1;
     g_ui_stale = 1;
     for (;;) {
@@ -1858,7 +1879,16 @@ void event_loop() {
         if (g_ticks != last_tick) {
             g_spin = (g_spin + (g_ticks - last_tick)) % 360;
             last_tick = g_ticks;
-            if (g_anim_in_view) redraw = 1;
+            // AND NOT MORE OFTEN THAN THE FRAME RATE. Without this the demo
+            // redraws on every tick it can, so making a frame cheaper does not
+            // make the machine quieter -- it draws more frames instead. The
+            // rotation rate is unaffected: g_spin steps by the ticks that
+            // PASSED, so the model turns at the same speed whether it is
+            // sampled thirty times a second or a hundred.
+            if (g_anim_in_view && g_ticks - last_frame >= FRAME_TICKS) {
+                redraw = 1;
+                last_frame = g_ticks;
+            }
         }
 
         g_scene_damage = 0;
@@ -1886,6 +1916,13 @@ void event_loop() {
         }
         ui_begin(&g_ui, g_win[g_win3d].used ? g_win3d : g_panel_win,
                  WM_BORDER + 2, WM_TITLE_H + 2, VPW + 4);
+        // The scene has just been drawn into the middle of this window, over
+        // whatever the HUD left there. Widgets inside that rectangle have to
+        // draw again even though nothing about them changed; widgets outside
+        // it -- the entire panel window, most frames -- are still on screen
+        // exactly as they were drawn.
+        if (g_scene_damage)
+            ui_overpaint(&g_ui, g_win3d, g_sdx, g_sdy, g_sdw, g_sdh);
         ui_input(&g_ui, down, pressed, released, key);
 
         g_view.dx = 0;
