@@ -10,8 +10,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#define attr_printf(a, b)  __attribute__((format(printf, a, b)))
+#if __has_attribute(__fallthrough__)
+#define fallthrough  __attribute__((__fallthrough__))
+#else
+#define fallthrough  do {} while (0)  /* fallthrough */
+#endif
 
 #else
+
+#define attr_printf(a, b)
+#define fallthrough
 
 typedef unsigned char bool;
 #define true 1

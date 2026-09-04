@@ -14,6 +14,9 @@
 #include <sys/time.h>
 
 #if (defined(__GNUC__) || defined(__TINYC__))
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wpre-c11-compat"
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #else
 #define attr_printf(a, b)
@@ -31,13 +34,13 @@
 #include "../lib/nano-printf.h"
 #undef snprintf
 #undef vfprintf
-#define LIBSYM(sym)  nano_##sym
+//#define LIBSYM(sym)  nano_##sym
 #define ALT_FUNC  nano_snprintf
 #define ALT_FUNC_name  "nano_snprintf"
 #endif
 
 #if 0
-#define LIBSYM(sym)  subc_##sym
+//#define LIBSYM(sym)  subc_##sym
 #include "printf.h"
 #define ALT_FUNC     subc_snprintf
 #define ALT_FUNC_name  "subc_snprintf"
@@ -50,7 +53,7 @@
 #endif
 
 typedef struct sprint_int_type {
-    int line;
+    long line;
     long value;
     const char *result;
     const char *format_string;
@@ -5105,7 +5108,7 @@ static struct sprint_int_type const sprint_ints[] = {
 };
 
 typedef struct sprint_ll_type {
-    int line;
+    long line;
     long long int value;
     const char *result;
     const char *format_string;
@@ -5149,12 +5152,12 @@ static sprint_ll_type const sprint_lls[] = {
     { 0, 0, 0, 0 },
 };
 
-int use_clock;
+static int use_clock;
 typedef unsigned long long ptimer_t;    // microseconds or clocks
 static unsigned long long now(void) {
-    if (use_clock) return clock();
+    if (use_clock) return (unsigned long long)clock();
     struct timeval tv; gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000000 + tv.tv_usec;
+    return (unsigned long long)(tv.tv_sec * 1000000 + tv.tv_usec);
 }
 
 static inline void timer_start(ptimer_t *pt) {
@@ -5163,15 +5166,13 @@ static inline void timer_start(ptimer_t *pt) {
 static inline unsigned long timer_stop(const ptimer_t *pt) {
     unsigned long n = now() - *pt;
     if (use_clock) {
-        if (CLOCKS_PER_SEC % 1000000)
-            n = n * 1000000 / CLOCKS_PER_SEC;
-        else
-            n = n / (CLOCKS_PER_SEC / 1000000);
+        unsigned long rem = CLOCKS_PER_SEC % 1000000;
+        n = rem ? n * 1000000 / CLOCKS_PER_SEC : n / (CLOCKS_PER_SEC / 1000000);
     }
     return n;
 }
 
-static void usage(const char *progname) {
+static _Noreturn void usage(const char *progname) {
     fprintf(stderr, "usage: %s [options] [iterations]\n", progname);
     fprintf(stderr,
             "options:\n"
@@ -5211,7 +5212,7 @@ int main(int argc, char *argv[]) {
             arg = argv[i++];
             if (!arg) { fprintf(stderr, "missing limit\n"); return 1; }
             limit = (int)strtol(arg, NULL, 0);
-        } else if (isdigit((unsigned char)*arg)) repeat = strtol(arg, NULL, 0);
+        } else if (isdigit((unsigned char)*arg)) repeat = (int)strtol(arg, NULL, 0);
         else { fprintf(stderr, "invalid argument: %s\n", arg); return 1; }
     }
 
@@ -5241,28 +5242,28 @@ int main(int argc, char *argv[]) {
 
 #define XSTR(s)      #s
 #define STR(s)       XSTR(s)
-#define PAD(f, n, len)  do { int __i = (n) - (len);                         \
-                             while (__i-- > 0) putc(' ', f); } while (0)
 
 #define SINGLETEST(func, funcname, buf, testcount, errvar, SFMT)            \
-            ++(testcount);                                                  \
-            func(buf, sizeof(buf), iptr->format_string, iptr->value);       \
-            if (!iter && verbose)  {                                        \
-                pad_printf(stdout, 20, "%s:%d: ", __FILE__, iptr->line);    \
-                PAD(stdout, 27, printf("%s(\"%s\", " SFMT ") ", funcname,   \
-                               iptr->format_string, iptr->value));          \
-                printf("->  \"%s\"\n", buf);                                \
-            }                                                               \
-            if (!iter && strcmp(buf, iptr->result) != 0) {                  \
-                ++(errvar);                                                 \
-                if (limit && (errvar) > limit) exit(1);                     \
-                status = 1;                                                 \
-                pad_printf(stderr, 20, "%s:%d: ", __FILE__, iptr->line);    \
-                PAD(stderr, 27, fprintf(stderr, "%s(\"%s\", " SFMT ") ", funcname,  \
-                                        iptr->format_string, iptr->value)); \
-                PAD(stderr, 14, fprintf(stderr, "->  \"%s\"", buf));        \
-                fprintf(stderr, "  expected  \"%s\"\n", iptr->result);      \
-            }
+    do {                                                                    \
+        ++(testcount);                                                      \
+        func(buf, sizeof(buf), iptr->format_string, iptr->value);           \
+        if (!iter && verbose)  {                                            \
+            pad_printf(stdout, 20, "%s:%ld: ", __FILE__, iptr->line);       \
+            pad_printf(stdout, 27, "%s(\"%s\", " SFMT ") ", funcname,       \
+                       iptr->format_string, iptr->value);                   \
+            pad_printf(stdout, 0,  "->  \"%s\"\n", buf);                    \
+        }                                                                   \
+        if (!iter && strcmp(buf, iptr->result) != 0) {                      \
+            ++(errvar);                                                     \
+            if (limit && (errvar) > limit) exit(1);                         \
+            status = 1;                                                     \
+            pad_printf(stderr, 20, "%s:%ld: ", __FILE__, iptr->line);       \
+            pad_printf(stderr, 27, "%s(\"%s\", " SFMT ") ", funcname,       \
+                                    iptr->format_string, iptr->value);      \
+            pad_printf(stderr, 14, "->  \"%s\"", buf);                      \
+            pad_printf(stderr, 0,  "  expected  \"%s\"\n", iptr->result);   \
+        }                                                                   \
+    } while (0)
 
 #define RUNTESTS(STYPE, SNAME, SFMT, TEST)                                  \
     do {                                                                    \

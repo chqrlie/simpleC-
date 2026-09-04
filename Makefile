@@ -27,6 +27,9 @@ BIN     = ./nano_cc
 FLAGS	= -O
 TMP     = build
 
+ifeq (clang,$(CC))
+CFLAGS += -Weverything
+endif
 ifneq (,$(NOAS))
 AS	= @\#
 RUN	= @\#

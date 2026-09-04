@@ -6,16 +6,26 @@
 #else
 #include <stdarg.h>
 #include <stdbool.h>
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+#pragma GCC diagnostic ignored "-Wreserved-identifier"
+#pragma GCC diagnostic ignored "-Wswitch-default"
+#pragma GCC diagnostic ignored "-Wunsafe-buffer-usage"
+#if __has_attribute(__fallthrough__)
+#define fallthrough  __attribute__((__fallthrough__))
+#else
+#define fallthrough  do {} while (0)  /* fallthrough */
+#endif
 typedef struct nano_FILE { size_t pos, cap, size; unsigned char *buf; } nano_FILE;
 #define put1(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)(c) : EOF)
-ssize_t __fwrite(const void *p, size_t len, nano_FILE *fp) {
+static ssize_t __fwrite(const void *p, size_t len, nano_FILE *fp) {
     size_t nw = fp->cap - fp->pos; if (nw > len) nw = len;
     memcpy(fp->buf + fp->pos, p, nw); fp->pos += nw;
-    return nw;
+    return (ssize_t)nw;
 }
 #endif
 
-char *_cvulong(char *p, unsigned long n, int shft, char cc) {
+static char *_cvulong(char *p, unsigned long n, unsigned char shft, unsigned char cc) {
     if (!shft) while (n) { *--p = n % 10 + '0'; n = n / 10; }
     else {
         const char *digits = "0123456789ABCDEF";
@@ -25,12 +35,13 @@ char *_cvulong(char *p, unsigned long n, int shft, char cc) {
     return p;
 }
 
+int vfprintf(nano_FILE *fp, const char *fmt, va_list ap);
 int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
-    size_t total = 0;
+    unsigned total = 0;
     const char *q = fmt;
     for (;;) {
         if (*fmt && *fmt != '%') { fmt++; continue; }
-        int len = fmt - q;
+        unsigned len = (unsigned)(fmt - q);
         __fwrite(q, len, fp); total += len;
         q = fmt;
         if (!*fmt) return (int)total;
@@ -40,32 +51,32 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
 #ifndef SMALL
         switch (*fmt) {
         case 'd':;
-            int n1 = va_arg(ap, int); n = n1;  // force sign extension
+            int n1 = va_arg(ap, int); n = (unsigned long)(long)n1;  // force sign extension
             if (n1 < 0) { total++; put1('-', fp); n = -n; }
             do { *--s = n % 10 + '0'; } while (n /= 10);
-            total += e - s;
+            total += (unsigned)(e - s);
             while (s < e) put1(*s++, fp);
             q = ++fmt; continue;
         }
 #endif
         unsigned long mask = 0xffffffff, sbit = 0;
-        unsigned char cc, pref[2], sign = 0;
+        unsigned char cc, pref[2], sign = 0, shft = 0;
         bool minus = false, zero = false, val64 = false;
-        int width = 0, shft = 0, zeroes = 0, plen = 0, prec = -1;
+        unsigned int width = 0, zeroes = 0, plen = 0, prec = -1U;
     again:;
-        switch (cc = *fmt++) {
-        case 'o': plen >>= 1; shft -= 1; // 3
-        case 'x': case 'X':   shft += 3; // 4
+        switch (cc = (unsigned char)*fmt++) {
+        case 'o': plen >>= 1; shft -= 1; fallthrough; // 3
+        case 'x': case 'X':   shft += 3; fallthrough; // 4
         case 'b': case 'B':   shft += 1; pref[1] = cc; sign = 0; goto get_num; // 1
         case 'u': plen = 0; sign = 0; goto get_num;
         case 'd': case 'i': plen = 0; sbit = (mask >> 1) + 1;
         get_num:
             n = val64 ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
         has_num:
-            if (n & sbit) { sign = '-'; n = -n; };
+            if (n & sbit) { sign = '-'; n = -n; }
             if (!(n &= mask)) plen &= !prec;  // no prefix except #.0o
-            s = _cvulong(e, n, shft, cc); len = e - s;
-            if (prec < 0) prec = 1; else zero = false;
+            s = _cvulong(e, n, shft, cc); len = (unsigned)(e - s);
+            if ((int)prec < 0) prec = 1; else zero = false;
             if (prec > len) { zeroes = prec - len; plen &= 2; }
             if (sign) { *pref = sign; plen = 1; }
             if (zero && !minus && width > len + plen) zeroes = width - len - plen;
@@ -82,15 +93,15 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
         case 's':
             s = va_arg(ap, char *);
             if (!s) s = "(null)";
-            len = (int)strnlen(s, prec);
+            len = (unsigned)strnlen(s, prec);
         out_str:
-            if ((width -= plen + zeroes + len) < 0) width = 0;
+            if ((int)(width -= plen + zeroes + len) < 0) width = 0;
             total += width + plen + zeroes + len;
-            if (!minus) while (width --> 0) put1(' ', fp);
-            for (int i = 0; i < plen; i++) put1(pref[i], fp);
-            while (zeroes --> 0) put1('0', fp);
+            if (!minus) while (width) { put1(' ', fp); width--; }
+            for (unsigned i = 0; i < plen; i++) put1(pref[i], fp);
+            while (zeroes) { put1('0', fp); zeroes--; }
             __fwrite(s, len, fp);
-            while (width --> 0) put1(' ', fp);
+            while (width) { put1(' ', fp); width--; }
             q = fmt;
             continue;
         case 'p':
@@ -104,10 +115,10 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
         case 'h': mask = 0xffff; if (*fmt == 'h') { mask = 0xff; fmt++; } goto again;
         case '0': zero = true; goto again;
         case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
-            width = cc - '0'; while ((cc = *fmt - '0') < 10) { fmt++; width = width * 10 + cc; } goto again;
-        case '*': width = va_arg(ap, int); if (width < 0) { minus = true; width = -width; } goto again;
-        case '.': if (*fmt == '*') { fmt++; prec = va_arg(ap, int); goto again; }
-            prec = 0; while ((cc = *fmt - '0') < 10) { fmt++; prec = prec * 10 + cc; } goto again;
+            width = cc - '0'; while ((cc = (unsigned char)(*fmt - '0')) < 10) { fmt++; width = width * 10 + cc; } goto again;
+        case '*': width = (unsigned)va_arg(ap, int); if ((int)width < 0) { minus = true; width = -width; } goto again;
+        case '.': if (*fmt == '*') { fmt++; prec = (unsigned)va_arg(ap, int); goto again; }
+            prec = 0; while ((cc = (unsigned char)(*fmt - '0')) < 10) { fmt++; prec = prec * 10 + cc; } goto again;
         case '-': minus = true; goto again;
         case ' ': sign |= ' ';  goto again; // '+' has priority over ' '
         case '+': sign = '+';   goto again;
@@ -118,6 +129,7 @@ int vfprintf(nano_FILE *fp, const char *fmt, va_list ap) {
     }
 }
 
+int snprintf(char *buf, size_t size, const char *fmt, ...) attr_printf(3, 4);
 int snprintf(char *buf, size_t size, const char *fmt, ...) {
     nano_FILE f; memset(&f, 0, sizeof(f)); f.buf = (void*)buf; f.cap = f.size = size;
     va_list ap; va_start(ap, fmt);

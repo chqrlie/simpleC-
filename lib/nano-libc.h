@@ -2,17 +2,16 @@
 #ifndef NANO_LIBC_H
 #define NANO_LIBC_H
 
+#define attr_printf(a, b)
+#define fallthrough
+
 // stdbool.h (should make these keywords)
-#ifndef true
 typedef unsigned char bool;
 #define true 1
 #define false 0
-#endif
 
 // stddef.h
-#ifndef NULL
 #define NULL  ((void*)0)
-#endif
 
 // limits.h
 #define INT_MAX 2147483647
