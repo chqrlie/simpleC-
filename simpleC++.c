@@ -33,11 +33,17 @@ static void malloc_stats(void) {
 #endif
 
 #if defined(__GNUC__) || defined(__TINYC__)
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
+#if __has_attribute(__fallthrough__)
+# define fallthrough                    __attribute__((__fallthrough__))
+#else
+# define fallthrough                    do {} while (0)  /* fallthrough */
+#endif
 #else
 #define attr_printf(a, b)
+#define fallthrough
 #endif
-
 // ---------------------------------------------------------------------
 // Errors / allocation
 // ---------------------------------------------------------------------
@@ -145,7 +151,7 @@ static bool strstart(const char *s, const char *p, size_t *pk) {
 static bool strend(const char *s, const char *p, size_t *pk) {
     size_t k = strlen(s), kp = strlen(p);
     if (k < kp) return false;
-    for (s -= kp, p -= kp; kp--;) { if (*s++ != *p++) return false; }
+    for (s += k -= kp; kp--;) { if (*s++ != *p++) return false; }
     if (pk) *pk = k; return true;
 }
 
@@ -226,6 +232,7 @@ static size_t encode_string(char *buf, size_t size, const char *str, size_t slen
         case '\r': ch = 'r'; break;
         case '\\': break;
         case '"': case '\'': if (ch == sep) break;
+            fallthrough;
         default:
             if (ch < 32 || ch > 126) break;
             PUT(ch); continue;
@@ -331,7 +338,7 @@ static void atom_stats(void) {
 // 0.2. PREDEFINED ATOMS
 // =====================================================================
 enum {
-    T_EMPTY, T_EOF, T_NUM, T_ID, T_STR, T_CHAR,
+    T_EMPTY, T_EOF, T_NUM, T_CHAR, T_STR, T_ID,
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
     T_BITOR, T_AMP, T_BITXOR, T_SHL, T_SHR,
     T_EQ, T_NE, T_LT, T_GT, T_LE, T_GE,
@@ -372,7 +379,7 @@ enum {
     T_count
 };
 static const char *token_name[T_count] = {
-    "", "<EOF>", "number", "identifier", "string", "char const",
+    "", "<EOF>", "number", "char const", "string", "identifier",
     "+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>",
     "==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "~", "++", "--",
     "=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=",
@@ -1181,6 +1188,12 @@ static Type *promoted_type(Type *t) {
     return ty_long();  // default type
 }
 static Type *common_type(Type *t1, Type *t2) {
+    // this will no longer be needed once we perform type analysis@@@
+    if (!t1 || !t2) {
+        if (t1) return t1;
+        if (t2) return t2;
+        return ty_long();
+    }
     if (is_ptrish(t1)) {
         if (is_ptrish(t2)) return ty_long(); // ptrdiff_t
         return t1;
@@ -1888,7 +1901,7 @@ static Node *parse_eq(void) {
 // Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
 static Node *parse_band(void) {
     Node *n = parse_eq();
-    while (at(T_AMP)) { n = new_bin_node(n); P++; n->rhs = parse_eq(); }
+    while (at(T_AMP)) { n = new_bin_node(n); P++; n->rhs = parse_eq(); check_const_binary(n); }
     return n;
 }
 static Node *parse_bxor(void) {
@@ -2510,7 +2523,7 @@ static void check_used(Node *n) {
     if (!n) return;
     // should test if node is elided
     switch (n->kind) {
-    case N_DECL:  for (Sym *s = n->decl; s; s = s->next_decl) check_used(s->init);
+    case N_DECL:  for (Sym *s = n->decl; s; s = s->next_decl) check_used(s->init); break;
     case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
     case N_IF: case N_TERNARY:
         check_used(n->cond); check_used(n->lhs); check_used(n->rhs); break;
@@ -2671,6 +2684,21 @@ static void emit_reg_imm(const char *instr, int r, unsigned long val) {
 static void emit_cmp_imm(int r, unsigned long val) {
     if (val) emit_reg_imm("cmp", r, val);
     else emit("test %s, %s", reg64[r], reg64[r]);
+}
+static bool expr_less(Node *t1, Node *t2, Type *ct) {
+    if (ct->is_unsigned) return t1->uval < t2->uval;
+    return t1->ival < t2->ival;
+}
+static bool same_expr(Node *lhs, Node *rhs) {
+    if (lhs->kind != rhs->kind) return false;
+    if (lhs->type != rhs->type) return false;
+    switch (lhs->kind) {
+    case N_NUM:    return lhs->uval == rhs->uval;
+    case N_STR:    return lhs->str  == rhs->str;
+    case N_VAR:    return lhs->name == rhs->name;
+    case N_MEMBER: return lhs->name == rhs->name && same_expr(lhs->lhs, rhs->lhs);
+    }
+    return false;
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
@@ -3254,9 +3282,21 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         return promoted_type(t);
     }
     case N_LOGAND: {
+        Node *lhs = n->lhs, *rhs = n->rhs;
+        if (lhs->op == T_GE && rhs->op == T_LE
+        &&  (lhs->rhs->flags & rhs->rhs->flags & CONST_VAL)
+        &&  same_expr(lhs->lhs, rhs->lhs)
+        &&  expr_less(lhs->rhs, rhs->rhs, common_type(lhs->lhs->type, lhs->rhs->type))) {
+            gen_expr(n->lhs->lhs, r, save_rax);
+            emit_reg_imm("sub", r, lhs->rhs->uval);
+            emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
+            emit("setbe %s", reg8[r]);
+            emit("movsx %s, %s", reg, reg8[r]);
+            return ty_int();
+        }
         int lab = label_id++;
-        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", lab);
-        gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
+        gen_expr(lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", lab);
+        gen_expr(rhs, r, save_rax); emit("test %s, %s", reg, reg);
         emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
         return ty_int();
     }
@@ -3436,14 +3476,9 @@ static void loop_pop(void) { loop_sp--; }
 #ifndef OLD_SWITCH
 #define DEST_NONE    (-1)
 #define DEST_BREAK   (-2)
-static bool case_expr_less(Node *t1, Node *t2, bool is_unsigned) {
-    if (is_unsigned) return t1->uval < t2->uval;
-    return t1->ival < t2->ival;
-}
 // generate case labels, evaluate case expressions, return true if all sorted
 static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
     // evaluate and check case expressions
-    bool is_unsigned = ct->is_unsigned;
     Node *last_expr = NULL;
     bool sorted = true;
     for (Node *e = n; e; e = e->lhs) {
@@ -3471,7 +3506,7 @@ static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
                 warning(e->cond->pos, "'case' range expressions are inconsistent with condition type");
                 e->lab = DEST_NONE;
             }
-            if (case_expr_less(t2, t1, is_unsigned)) {
+            if (expr_less(t2, t1, ct)) {
                 warning(e->pos, "'case' range is empty");
                 e->lab = DEST_NONE;
             }
@@ -3482,7 +3517,7 @@ static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
             }
             value_cast(&v1, ct);
         }
-        if (last_expr) sorted &= case_expr_less(last_expr, t1, is_unsigned);
+        if (last_expr) sorted &= expr_less(last_expr, t1, ct);
         last_expr = t2 ? t2 : t1;
     }
 
@@ -3887,9 +3922,9 @@ static int output_token(FILE *fp, Token *t) {
             }
             s = p; break;
         }
-    case T_ID:    s = atom_str(t->name); break;
-    case T_STR:   encode_string(buf, sizeof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
     case T_CHAR:  c = (char)t->ival; encode_string(buf, sizeof(buf), &c, 1, '\''); break;
+    case T_STR:   encode_string(buf, sizeof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
+    case T_ID:    s = atom_str(t->name); break;
     default:      s = atom_str((atom_t)t->kind); break;
     }
     fputs(s, fp); return (int)strlen(s);

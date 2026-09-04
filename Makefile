@@ -16,11 +16,12 @@
 # temporary files are created in the build directory
 
 CC     ?= gcc
-CFLAGS ?= -std=gnu11 -O2 -Wall -Wextra
+CFLAGS += -std=gnu11 -O2 -Wall -Wextra
 SIZE   ?= size
 STRIP  ?= strip
-AS	    = $(CC) -no-pie
-RUN	    =
+NOPIE  ?= -no-pie
+AS	= gcc
+RUN	=
 SRC     = simpleC++.c
 BIN     = ./nano_cc
 FLAGS	= -O
@@ -58,12 +59,12 @@ extra: $(BIN) build
 # the linker produces a freestanding binary, and we run it.
 $(TMP)/%_prog: examples/%.c $(BIN) build Makefile
 	$(BIN) $(FLAGS) $< $@.s
-	$(AS) -nostdlib $@.s -o $@
+	$(AS) $(NOPIE) -nostdlib -static $@.s -o $@
 	$(RUN) ./$@
 
 %: %.c $(BIN) Makefile
 	$(BIN) $(FLAGS) $< -o $@.s
-	$(AS) -nostdlib $@.s -o $@
+	$(AS) $(NOPIE) -nostdlib -static $@.s -o $@
 	$(RUN) ./$@
 
 test: $(TMP)/test_prog
@@ -76,8 +77,8 @@ switch: $(TMP)/switch_prog
 nano: $(BIN) build Makefile
 	$(BIN) $(FLAGS) $(SRC) -time -memory -o $(TMP)/nano.s
 	$(BIN) $(FLAGS) $(SRC) -time -g -o $(TMP)/nano_g.s
-	$(AS) -nostdlib $(TMP)/nano.s   -o $(TMP)/nano_prog
-	$(AS) -nostdlib $(TMP)/nano_g.s -o $(TMP)/nano_prog_g -g
+	$(AS) $(NOPIE) -nostdlib -static $(TMP)/nano.s   -o $(TMP)/nano_prog
+	$(AS) $(NOPIE) -nostdlib -static $(TMP)/nano_g.s -o $(TMP)/nano_prog_g -g
 	$(STRIP) $(BIN) $(TMP)/nano_prog
 	$(SIZE) $(BIN) $(wildcard $(TMP)/nano_prog)
 	$(RUN) $(TMP)/nano_prog $(FLAGS) $(SRC) -time -memory -o $(TMP)/nano2.s
@@ -101,7 +102,7 @@ test-printf: build Makefile
 # test nano-printf compiled by nano as part of its C library
 nano-printf: $(BIN) build Makefile
 	$(BIN) $(FLAGS) test/printf-test.c -o $(TMP)/printf-test_prog_g.s -g
-	$(AS) -nostdlib $(TMP)/printf-test_prog_g.s -o $(TMP)/printf-test_prog_g
+	$(AS) $(NOPIE) -nostdlib -static $(TMP)/printf-test_prog_g.s -o $(TMP)/printf-test_prog_g
 	$(RUN) $(TMP)/printf-test_prog_g
 
 examples: test demo structs bitwise printf switch hello
