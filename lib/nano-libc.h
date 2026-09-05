@@ -466,7 +466,7 @@ int puts(const char *s) {
 
 // sys_err.c
 const int sys_nerr = 35;
-const char * /*const*/ sys_errlist[] = {
+const char * const sys_errlist[] = {
     "Success",
     "Operation not permitted",
     "No such file or directory",
