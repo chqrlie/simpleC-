@@ -68,19 +68,21 @@ typedef struct Type Type;
 typedef struct Sym Sym;
 typedef struct Member Member;
 typedef struct Func Func;
+typedef struct Label Label;
 
 // ---------------------------------------------------------------------
 // Errors / allocation
 // ---------------------------------------------------------------------
 static const char *progname;
 static bool use_library;
-static const char *src_name[32];
+static const char *src_name[64];
 static char include_path[1024];
 static srcloc_t src_loc;
-static int optimize;
+static unsigned char optimize;
 static unsigned char func_align = 1;
 static bool debug, verbose;
-#define LOC_SHIFT  27
+
+#define LOC_SHIFT  26
 #define MAKE_LOC(fn, lineno)  (((fn) << LOC_SHIFT) + (unsigned)lineno)
 #define get_lineno(loc) (int)((loc) & ((1 << LOC_SHIFT) - 1))
 #define get_filenum(loc) ((loc) >> LOC_SHIFT)
@@ -98,7 +100,7 @@ static void err_message(srcloc_t loc, const char *kind, const char *fmt, va_list
 }
 #pragma GCC diagnostic pop
 static _Noreturn void die(const char *fmt, ...) attr_printf(1,2);
-static void die(const char *fmt, ...) {
+static _Noreturn void die(const char *fmt, ...) {
     va_list a; va_start(a, fmt); err_message(src_loc, "error", fmt, a); va_end(a);
     exit(1);
 }
@@ -417,6 +419,7 @@ typedef enum TokenKind enum_type(unsigned char) {
     ID_STRLEN, ID_STRCPY, ID_MEMCPY, ID_MEMSET,
     T_count
 } TokenKind;
+
 static const char * const token_name[T_count] = {
     "", "<EOF>", "number", "char const", "string", "identifier",
     "+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>",
@@ -465,7 +468,7 @@ static void lex_init(void) {
 typedef struct Macro {
     atom_t name; srcloc_t loc; int nparams; unsigned len; atom_t params[8]; struct Macro *next; char def[8];
 } Macro;
-static Macro *macros;
+static Macro *macros;  // should use atoms symbol table
 
 static Macro *macro_find(atom_t name) {
     for (Macro *m = macros; m; m = m->next) {
@@ -1285,6 +1288,7 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
     HAS_TYPEDEF  = 1 << (K_TYPEDEF  - K_CONST),
     HAS_INLINE   = 1 << (K_INLINE   - K_CONST),
     HAS_NORETURN = 1 << (K_NORETURN - K_CONST),
+    HAS_FUNCTION = 2 << (K_NORETURN - K_CONST),
 };
 
 // =====================================================================
@@ -1323,7 +1327,7 @@ struct Node {
     };
     union {
         int offset;         // N_VAR (stack pos)
-        unsigned depth;     // N_BLOCK, N_FOR (scope depth)
+        unsigned scope_len; // N_BLOCK, N_FOR (initial scope_len)
     };
     union {
         Type *type;         // E-nodes
@@ -1370,7 +1374,11 @@ static Type *array_of(Type *base, int len, Node *len_expr) {
 
 // ---- symbols ----
 struct Sym {
-    unsigned char kind, flags, sflags, is_tag;
+    // XXX: should store scope_depth to detect invalid redefinitions
+    TokenKind kind;
+    unsigned char flags;   // CONST_VAL
+    unsigned char sflags;  // QualifierFlags (some missing)
+    unsigned char is_tag;  // should use flag in `flags`
     srcloc_t loc;
     union { long ival; unsigned long uval; };
     atom_t name; unsigned int offset; Type *type;
@@ -1386,53 +1394,61 @@ static unsigned int frame_pos, frame_max;
 
 static Sym **scope_list;
 static size_t scope_cap;
+static unsigned scope_depth;
 static unsigned scope_len;
 
 static Sym *sym_link(atom_t name, Sym *s) {
     Sym *prev = atom_sym(name);
-    // XXX: should check consistency with forward definition
-    if (prev && (prev->sflags & HAS_EXTERN)) prev = prev->next_sym;
-    if (prev) {
-        warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
-        note(prev->loc, "previous definition of '%s' is here", atom_str(name));
+    Sym *shadow = prev;
+   // XXX: should check consistency with forward definition
+    while (shadow) {
+        if ((shadow->sflags & HAS_EXTERN) || shadow->fn) shadow = shadow->next_sym;
+        else {
+            warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
+            note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
+        }
     }
     s->next_sym = prev;
     return atom_sym(name) = s;
 }
 static Sym *sym_unlink(Sym *s) { return atom_sym(s->name) = s->next_sym; }
 
-static Sym *add_global(atom_t name, srcloc_t loc, Type *t, unsigned int sflags) {
-    Sym *s = allocz(1, sizeof(Sym));
-    s->name = name; s->loc = loc; s->type = t; s->sflags = (unsigned char)sflags;
-    if (globals) globals_tail->next_decl = s; else globals = s;
-    return globals_tail = sym_link(name, s);
-}
 static void set_local_offset(Sym *s) {
     if (s->kind != K_AUTO) return;
     // Should allocate registers
     unsigned sz = ty_size(s->type); if (sz < 8) sz = 8; sz = (sz + 7) & ~7U;
     if ((s->offset = frame_pos += sz) > frame_max) frame_max = frame_pos;
 }
-static Sym *add_local(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) {
+static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) {
     Sym *s = allocz(1, sizeof(Sym));
     s->name = name; s->loc = loc; s->type = type; s->sflags = (unsigned char)sflags;
-    s->kind = (sflags & HAS_STATIC) ? K_STATIC : K_AUTO;
-    // should delay this until analysis to allocate registers
-    set_local_offset(s);
-    if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
-    return scope_list[scope_len++] = sym_link(name, s);
+    if (scope_depth) {
+        // XXX: should handle HAS_THREAD_LOCAL
+        switch (sflags & (HAS_FUNCTION | HAS_EXTERN | HAS_TYPEDEF | HAS_STATIC)) {
+        case HAS_STATIC:  s->kind = K_STATIC; break;
+        case 0:           s->kind = K_AUTO; set_local_offset(s); break; // should delay this until analysis to allocate registers
+        default:          break;
+        }
+        if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
+        return scope_list[scope_len++] = sym_link(name, s);
+    } else {
+        if (globals) globals_tail->next_decl = s; else globals = s;
+        return globals_tail = sym_link(name, s);
+    }
 }
 
 static Node *scope_push(Node *n) {
-    n->depth = scope_len;
+    scope_depth++;
+    n->scope_len = scope_len;
     return n;
 }
 static Node *scope_pop(Node *n) {
-    while (scope_len > n->depth) {
+    while (scope_len > n->scope_len) {
         Sym *s = scope_list[--scope_len];
         sym_unlink(s);
         frame_pos = s->offset;
     }
+    if (!scope_depth--) error(n, "scope depth error");
     return n;
 }
 
@@ -1511,6 +1527,7 @@ static bool value_cast(Value *vp, Type *t) {
 // 5. PARSER
 // =====================================================================
 static size_t P;                       // token cursor
+
 #define curloc()  (toks[P].loc)
 static Token *cur(void) { return &toks[P]; }
 static int at(int k)    { return toks[P].kind == k; }
@@ -1532,7 +1549,7 @@ static bool is_type_start(Token *t) {
 // ---- struct/union tag table ----
 // XXX: these should be global/local based
 typedef struct Tag { atom_t name; int kind; Type *type; struct Tag *next; } Tag;
-static Tag *tags;
+static Tag *tags;    // should use atoms symbol table
 static Type *tag_get(atom_t name, int kind, srcloc_t loc) { // find or forward-declare
     if (name) {
         for (Tag *e = tags; e; e = e->next) {
@@ -1549,15 +1566,17 @@ static Type *tag_get(atom_t name, int kind, srcloc_t loc) { // find or forward-d
     return t;
 }
 
+static Func *this_fn;
+static Node *this_switch;
+static Node *this_loop;
+
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(unsigned int *flags);
-
-static Node *this_switch;
-static Node *this_loop;
-static struct Label *add_label(Node *n);
-static struct Label *find_label(atom_t name);
+static Node *parse_decl_stmt(void);
+static Label *add_label(Node *n);
+static Label *find_label(atom_t name);
 static Node *parse_const_expr(void);
 static Node *parse_init(void);
 static bool eval_expr(Node *n, Value *vp);
@@ -1682,7 +1701,7 @@ static Type *parse_enum(void) {
         while (!at(T_RBRACE) && !at(T_EOF)) {
             srcloc_t ploc = curloc();
             atom_t name = getid();
-            Sym *s = add_global(name, ploc, st, 0);
+            Sym *s = add_sym(name, ploc, st, 0);
             s->kind = K_ENUM;
             if (eat(T_ASSIGN)) {
                 s->init = parse_const_expr();
@@ -2018,39 +2037,6 @@ static Node *parse_expr(void) {
     return n;
 }
 
-// a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
-static Node *parse_decl_stmt(void) {
-    unsigned int flags;
-    Type *base = parse_type_base_only(&flags);   // fwd-declared below
-    Node *n = new_node(N_DECL);
-    n->decl_flags = flags;
-    switch (base->kind) {   // check for bare struct/union/enum Foo { ... };
-    case TY_STRUCT: case TY_UNION: case TY_ENUM:
-        if (eat(T_SEMI)) return n;
-        break;
-    default:
-        break;
-    }
-    Sym **tailp = &n->decl;
-    for (;;) {
-        Type *t = parse_ptrs(base, &flags);
-        srcloc_t loc = curloc();
-        atom_t name = getid();
-        if (eat(T_LBRK)) t = parse_array(t);
-        Sym *s = add_local(name, loc, t, flags);
-        if (eat(T_ASSIGN)) {
-            Node *init = s->init = parse_init();
-            if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
-                t->arr_len = node_length(init->rhs);
-                t->arr_size = ty_size(base) * (unsigned)t->arr_len;
-            }
-        }
-        *tailp = s; tailp = &s->next_decl;
-        if (!eat(T_COMMA)) break;
-    }
-    expect(T_SEMI);
-    return n;
-}
 // parse just the base type (no trailing stars) — stars belong to each declarator
 static Type *parse_type_base_only(unsigned int *pflags) {
     Type *t = NULL; unsigned int sflags = 0, tflags = 0;
@@ -2419,13 +2405,10 @@ struct Func {
     atom_t name;
     unsigned char nparams; bool is_variadic, used;
     srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
-    Sym *params; Node *body; Type *rtype; struct Label *labels;
+    Sym *params; Node *body; Type *rtype; Label *labels;
     struct Func *next;
 };
-static Func *funcs, **funcs_tail;
-static Func *this_fn;
 
-typedef struct Label Label;
 struct Label { atom_t name; bool used; Node *n; Label *next; };
 static Label *add_label(Node *n) {
     Label *lab = allocz(1, sizeof(Label));
@@ -2441,90 +2424,158 @@ static Label *find_label(atom_t name) {
     return NULL;
 }
 
-static Func *find_func(atom_t name) {
+static Sym *find_func(atom_t name) {
     Sym *s = atom_sym(name);
-    return s ? s->fn : NULL;
+    return s && s->fn ? s : NULL;
+}
+
+static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t loc) {
+    if (flags & HAS_TYPEDEF) error(NULL, "function typedefs not supported");
+    frame_max = frame_pos = 0;
+    Node fun = {};
+    bool has_prototype = false;
+    Func *fn;
+    Sym *s = find_func(name);
+    if (s) {
+        fn = s->fn;
+        has_prototype = true;
+        if (!same_type(fn->rtype, rtype)) {
+            warning(curloc(), "return type mismatch with '%s' function prototype", atom_str(name));
+        }
+    } else {
+        // type and flags are not correct yet
+        s = add_sym(name, loc, rtype, flags | HAS_FUNCTION);
+        s->fn = fn = allocz(1, sizeof(Func));
+        fn->name = name;
+        fn->rtype = rtype;
+        fn->decl_flags = flags;
+    }
+    scope_push(&fun);
+    unsigned char np = 0;
+    bool is_variadic = false;
+    Sym **pp = &fn->params;
+    if (at(K_VOID) && toks[P+1].kind == T_RP) P++; // (void) -> ()
+    while (!at(T_RP)) {
+        if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
+        if (np >= MAX_ARGS) error(NULL, "too many function arguments");
+        unsigned int pflags;
+        srcloc_t ploc = curloc();
+        Type *pt = parse_ptrs(parse_type_base_only(&pflags), &pflags);
+        atom_t pname = 0;
+        if (at(T_ID)) pname = getid();   // argument name is optional
+        if (eat(T_LBRK)) {
+            pt = parse_array(pt);   // pseudo array function parameter
+            pt->kind = TY_PTR;
+            pt->align = 8;
+        }
+        // XXX should not recreate arglist if has_prototype
+        if (has_prototype && *pp && !same_type((*pp)->type, pt)) {
+            warning(ploc, "type mismatch with prototype on argument %d", np + 1);
+            warning((*pp)->loc, "function prototype is defined here");
+        }
+        Sym *pv = add_sym(pname, ploc, pt, pflags);
+        *pp = pv; pp = &pv->next_decl; np++;
+        if (!eat(T_COMMA)) break;
+    }
+    expect(T_RP);
+    if (has_prototype && (fn->nparams != np || fn->is_variadic != is_variadic)) {
+        warning(curloc(), "argument count mismatch with prototype");
+        warning(fn->loc, "function prototype is defined here");
+    }
+    fn->is_variadic = is_variadic;
+    fn->nparams = np;
+    if (at(T_LBRACE)) { // actual function definition
+        if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
+        fn->loc = loc;
+        this_fn = fn;
+        fn->body = parse_block();
+        this_fn = NULL;
+        fn->frame_size = frame_max;
+        fn->endloc = toks[P-1].loc;
+    }
+    scope_pop(&fun);
+    return s;
+}
+
+// a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
+static Node *parse_decl_stmt(void) {
+    unsigned int flags;
+    srcloc_t loc = curloc();
+    Type *base = parse_type_base_only(&flags);
+    Node *n = new_node(N_DECL);
+    n->loc = loc;
+    n->decl_flags = flags;
+    if (eat(T_SEMI)) {
+        switch (base->kind) {
+        case TY_STRUCT: case TY_UNION: case TY_ENUM:
+            // accept bare struct/union/enum Foo;
+            break;
+        default:
+            warning(loc, "empty declaration");
+            break;
+        }
+        return n;
+    }
+    Sym **tailp = &n->decl;
+    for (;;) {
+        Type *t = parse_ptrs(base, &flags);
+        srcloc_t nloc = curloc();
+        atom_t name = getid();
+        // XXX: should parse function pointers and such
+        Sym *s = NULL;
+        if (eat(T_LP)) {
+            s = parse_function(t, flags, name, nloc);
+            if (s->fn->body) {
+                warning(nloc, "local functions are not supported yet");
+                break;
+            }
+        } else {
+            if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
+            if (eat(T_LBRK)) t = parse_array(t);
+            s = add_sym(name, nloc, t, flags);
+            if (eat(T_ASSIGN)) {
+                Node *init = s->init = parse_init();
+                if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
+                    t->arr_len = node_length(init->rhs);
+                    t->arr_size = ty_size(base) * (unsigned)t->arr_len;
+                }
+            }
+        }
+        if (s) *tailp = s; tailp = &s->next_decl;
+        if (!eat(T_COMMA)) break;
+    }
+    expect(T_SEMI);
+    return n;
 }
 
 static void parse_toplevel(void) {
+#if 0
+    Node *n = new_node(N_BLOCK);
+    Node **tailp = &n->rhs;
+    while (!at(T_EOF)) {
+        // XXX: should only accept N_DECL and static asserts
+        Node *e = parse_stmt();
+        *tailp = e; tailp = &e->next;
+    }
+#else
     unsigned int flags;
     srcloc_t loc = curloc();
     Type *base = parse_type_base_only(&flags);
     if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
     Type *t = parse_ptrs(base, &flags);
+    srcloc_t nloc = curloc();
     atom_t name = getid();
-    // XXX: parse function pointers and such
-    if (eat(T_LP)) {                                   // function definition
-        if (flags & HAS_TYPEDEF) error(NULL, "function typedefs not supported");
-        frame_max = frame_pos = 0;
-        Node fun = {};
-        bool has_prototype = false;
-        Func *fn = find_func(name);
-        if (fn) {
-            has_prototype = true;
-            if (!same_type(fn->rtype, t))
-                warning(curloc(), "return type mismatch with '%s' function prototype", atom_str(name));
-        } else {
-            // type and flags are not correct yet
-            Sym *s = add_global(name, loc, t, flags);
-            s->fn = fn = allocz(1, sizeof(Func));
-            fn->name = name;
-            fn->rtype = t;
-            fn->decl_flags = flags;
-            if (!funcs_tail) funcs_tail = &funcs; *funcs_tail = fn; funcs_tail = &fn->next;
-        }
-        scope_push(&fun);
-        unsigned char np = 0;
-        bool is_variadic = false;
-        Sym **pp = &fn->params;
-        if (at(K_VOID) && toks[P+1].kind == T_RP) P++; // (void) -> ()
-        while (!at(T_RP)) {
-            if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
-            if (np >= MAX_ARGS) error(NULL, "too many function arguments");
-            unsigned int pflags;
-            srcloc_t ploc = curloc();
-            Type *pt = parse_ptrs(parse_type_base_only(&pflags), &pflags);
-            atom_t pname = 0;
-            if (at(T_ID)) pname = getid();   // argument name is optional
-            if (eat(T_LBRK)) {
-                pt = parse_array(pt);   // pseudo array function parameter
-                pt->kind = TY_PTR;
-                pt->align = 8;
-            }
-            // XXX should not recreate arglist if has_prototype
-            if (has_prototype && *pp && !same_type((*pp)->type, pt)) {
-                warning(ploc, "type mismatch with prototype on argument %d", np + 1);
-                warning((*pp)->loc, "function prototype is defined here");
-            }
-            Sym *pv = add_local(pname, ploc, pt, pflags);
-            *pp = pv; pp = &pv->next_decl; np++;
-            if (!eat(T_COMMA)) break;
-        }
-        expect(T_RP);
-        if (has_prototype && (fn->nparams != np || fn->is_variadic != is_variadic)) {
-            warning(curloc(), "argument count mismatch with prototype");
-            warning(fn->loc, "function prototype is defined here");
-        }
-        fn->is_variadic = is_variadic;
-        fn->nparams = np;
-        if (!eat(T_SEMI)) { // actual function definition
-            if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
-            fn->loc = loc;
-            this_fn = fn;
-            fn->body = parse_block();
-            this_fn = NULL;
-            fn->frame_size = frame_max;
-            fn->endloc = toks[P-1].loc;
-        }
-        scope_pop(&fun);
-        return;
+    // XXX: should parse function pointers and such
+    if (eat(T_LP)) {
+        Sym *s = parse_function(t, flags, name, nloc);
+        if (s->fn->body) return;
+        goto next;
     }
     if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
     // global variable(s):  type name [= ...] (, ...) ;
     for (;;) {
-        srcloc_t ploc = curloc();
         if (eat(T_LBRK)) t = parse_array(t);
-        Sym *sym = add_global(name, ploc, t, flags);
+        Sym *sym = add_sym(name, nloc, t, flags);
         sym->sflags = (unsigned char)flags;
         if (flags & HAS_TYPEDEF) sym->kind = K_TYPEDEF;
         else if (eat(T_ASSIGN)) {
@@ -2534,11 +2585,14 @@ static void parse_toplevel(void) {
                 t->arr_size = ty_size(base) * (unsigned)t->arr_len;
             }
         }
+    next:
         if (!eat(T_COMMA)) break;
         t = parse_ptrs(base, &flags);
+        nloc = curloc();
         name = getid();
     }
     expect(T_SEMI);
+#endif
 }
 
 // =====================================================================
@@ -2583,7 +2637,9 @@ static bool check_rewrite(Node *n) {
 
 static void check_used(Node *n);
 static void check_used_func(atom_t name) {
-    Func *fn = find_func(name);
+    Sym *s = find_func(name);
+    if (!s) return;
+    Func *fn = s->fn;
     if (fn && !fn->used) {
         fn->used = true;
         check_used(fn->body);
@@ -2642,6 +2698,7 @@ static bool out_comments;
 static char next_comment[48];
 static int next_label;
 static unsigned char no_tabs;
+
 static int emit_indent(int col, int indent) {
     if (col >= indent) indent = col + 1;
     if (!no_tabs) {
@@ -2715,11 +2772,11 @@ static const char * const reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil
 static int label_id = 10;  // labels 1-9 reserved as local labels
 static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
-static Type *gen_expr(Node *n, int r, bool save_rax);
-static void  gen_stmt(Node *n);
+static Type *gen_expr(Node *n, Register r, bool save_rax);
+static void gen_stmt(Node *n);
 static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsigned offset);
 
-static Type *promote_reg(Type *t, int r) {
+static Type *promote_reg(Type *t, Register r) {
     const char *mov = t->is_unsigned ? "movzx" : "movsx";
     switch (ty_size(t)) {
     case 1: emit("%s %s, %s", mov, reg64[r], reg8[r]); break;
@@ -2729,7 +2786,7 @@ static Type *promote_reg(Type *t, int r) {
     }
     return t;
 }
-static Type *load_ind(Type *t, int r2, int r1) {   // r2 = [r1] (size and type aware)
+static Type *load_ind(Type *t, Register r2, Register r1) {   // r2 = [r1] (size and type aware)
     const char *dest = reg64[r2], *src = reg64[r1];
     const char *mov = t->is_unsigned ? "movzx" : "movsx";
     switch (ty_size(t)) {
@@ -2741,7 +2798,7 @@ static Type *load_ind(Type *t, int r2, int r1) {   // r2 = [r1] (size and type a
     }
     return t;
 }
-static void store_ind(Type *t, int r1, int r2) {    // [r1] = r2 (size and type aware)
+static void store_ind(Type *t, Register r1, Register r2) {    // [r1] = r2 (size and type aware)
     const char *dest = reg64[r1];
     switch (ty_size(t)) {
     case 1: emit("mov [%s], %s", dest, reg8[r2]); return;
@@ -2750,7 +2807,7 @@ static void store_ind(Type *t, int r1, int r2) {    // [r1] = r2 (size and type 
     default: emit("mov [%s], %s", dest, reg64[r2]); return;
     }
 }
-static void emit_reg_imm(const char *instr, int r, unsigned long val) {
+static void emit_reg_imm(const char *instr, Register r, unsigned long val) {
     if ((int)val == (long)val) {
         emit("%s %s, %d", instr, reg64[r], (int)val);
     } else {
@@ -2758,7 +2815,7 @@ static void emit_reg_imm(const char *instr, int r, unsigned long val) {
         emit("%s %s, rdx", instr, reg64[r]);
     }
 }
-static void emit_cmp_imm(int r, unsigned long val) {
+static void emit_cmp_imm(Register r, unsigned long val) {
     if (val) emit_reg_imm("cmp", r, val);
     else emit("test %s, %s", reg64[r], reg64[r]);
 }
@@ -2779,7 +2836,7 @@ static bool same_expr(Node *lhs, Node *rhs) {
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
-static Type *gen_addr(Node *n, int r, bool save_rax) {
+static Type *gen_addr(Node *n, Register r, bool save_rax) {
     switch (n->kind) {
     case N_VAR: {
         Sym *s = resolve_name(n);
@@ -2841,7 +2898,7 @@ static void gen_string_def(atom_t id) {
     fprintf(fout, ".string %s\n", buf);
 }
 
-static Type *load_string(Node *n, int r) {
+static Type *load_string(Node *n, Register r) {
     atom_t id = n->str;
     if (out_comments) {
         char buf[37];
@@ -2854,7 +2911,7 @@ static Type *load_string(Node *n, int r) {
     return n->type;
 }
 
-static void emit_imul_imm(int r, unsigned long val) {
+static void emit_imul_imm(Register r, unsigned long val) {
     const char *reg = reg64[r];
     if (!val) {
         emit("sub %s, %s", reg, reg);
@@ -2873,7 +2930,7 @@ static void emit_imul_imm(int r, unsigned long val) {
     }
 }
 
-static void emit_idiv_imm(int r, unsigned long val, bool save_rax) {
+static void emit_idiv_imm(Register r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
@@ -2911,7 +2968,7 @@ static void emit_idiv_imm(int r, unsigned long val, bool save_rax) {
     }
 }
 
-static void emit_div_imm(int r, unsigned long val, bool save_rax) {
+static void emit_div_imm(Register r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
@@ -2939,7 +2996,7 @@ static void emit_div_imm(int r, unsigned long val, bool save_rax) {
     }
 }
 
-static void emit_imod_imm(int r, unsigned long val, bool save_rax) {
+static void emit_imod_imm(Register r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
@@ -2983,7 +3040,7 @@ static void emit_imod_imm(int r, unsigned long val, bool save_rax) {
     }
 }
 
-static void emit_mod_imm(int r, unsigned long val, bool save_rax) {
+static void emit_mod_imm(Register r, unsigned long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
@@ -3088,7 +3145,7 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     return ct;
 }
 
-static Type *gen_bin_imm(Node *n, int op, Type *lt, int r, bool save_rax) {
+static Type *gen_bin_imm(Node *n, int op, Type *lt, Register r, bool save_rax) {
     // rax = left, val = right
     Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
     unsigned long val = n->rhs->uval;
@@ -3123,7 +3180,7 @@ static Type *gen_bin_imm(Node *n, int op, Type *lt, int r, bool save_rax) {
     return ct;
 }
 
-static Type *load_var(Node *n, int r) {
+static Type *load_var(Node *n, Register r) {
     const char *reg = reg64[r];
     Sym *s = resolve_name(n);
     Type *t = s->type;
@@ -3135,6 +3192,7 @@ static Type *load_var(Node *n, int r) {
         case K_AUTO:   emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg, s->offset); break;
         case K_STATIC: break;  // TBI
         case K_TYPEDEF: break;  // error
+        default:       break;
         }
         break;
     default: {
@@ -3162,6 +3220,7 @@ static Type *load_var(Node *n, int r) {
         case K_ENUM:   break;  // never should be resolved as a constant already
         case K_STATIC: break;  // TBI
         case K_TYPEDEF: break;  // error
+        default:       break;
         }
         break;
     }}
@@ -3184,7 +3243,7 @@ static bool check_const(Sym *s, srcloc_t loc) {
     return true;
 }
 
-static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, int r) {
+static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register r) {
     char dest[64];
     if (!make_address(dest, sizeof(dest), s, loc)) return t;
     if (!check_const(s, loc)) return t;
@@ -3297,11 +3356,11 @@ static bool check_num_args(Node *n, int nargs) {
     if (nargs > 0 && n->nargs > nargs) warning(n->loc, "too many arguments for %s", atom_str(n->name));
     return true;
 }
-static void gen_arg(Node *n, int r, bool save_rax) {
+static void gen_arg(Node *n, Register r, bool save_rax) {
     if (check_num_args(n, 1)) gen_expr(n->rhs, r, save_rax);
 }
 
-static Type *gen_expr(Node *n, int r, bool save_rax) {
+static Type *gen_expr(Node *n, Register r, bool save_rax) {
     const char *reg = reg64[r];
     if (n->flags & CONST_VAL) goto has_num;
     switch (n->kind) {
@@ -3549,10 +3608,16 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         }
         if (save_rax) emit("push rax");
         // XXX: should look up symbol instead of global function to handle function pointers
-        Func *fn = find_func(n->name);
-        if (fn && fn->nparams != n->nargs && (!fn->is_variadic || fn->nparams > n->nargs)) {
-            warning(n->loc, "argument count mismatch '%s' expects %d, got %d",
-                    atom_str(n->name), fn->nparams, n->nargs);
+        Sym *s = find_func(n->name);
+        Func *fn = NULL;
+        if (s) {
+            fn = s->fn;
+            if (fn->nparams != n->nargs && (!fn->is_variadic || fn->nparams > n->nargs)) {
+                warning(n->loc, "argument count mismatch '%s' expects %d, got %d",
+                        atom_str(n->name), fn->nparams, n->nargs);
+            }
+        } else {
+            warning(n->loc, "call to an undeclared function '%s'", atom_str(n->name));
         }
         // XXX: should check and convert arguments according to prototype
         // XXX: here we could support default argument values
@@ -4235,7 +4300,10 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
         emit("hlt");
     }
 
-    for (Func *f = funcs; f; f = f->next) if (f->used) gen_func(f);
+    for (Sym *s = globals; s; s = s->next_decl) {
+        Func *fn = s->fn;
+        if (fn && fn->used && fn->body) gen_func(fn);
+    }
 
     // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
     // mode uses .data so the zero bytes are emitted into the object and survive

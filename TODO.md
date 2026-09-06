@@ -1,0 +1,101 @@
+# TODO list
+
+* improve hashing:
+```c
+for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 255);
+```
+* merge upstream
+* support function pointers
+* optimize code gen for condition expressions
+* [/] complete support for short/int/long semantics
+* [/] complete support of unsigned semantics
+* check and convert function arguments according to prototype
+* fix bogus 2D array handling
+* simplify varargs API: all optional arguments on the stack
+* add builtins for memcpy, memset, strcpy, strlen
+* compound literals
+* designated initializers
+* structure passing and returning
+* accept `__attribute__` syntax
+* accept `[[ attribute-list ]]` syntax
+* better macro processing (single pass, token based)
+* save locations as offsets with full range capabilities
+* output column in error messages
+* pass integer offset to `gen_expr()`
+* pass integer rhs argument to `gen_expr()`
+* optimize expressions with commutativity and associativity
+* add `get_loc` to generate better load/store/update code
+* `stdin`, `stdout` and `stderr` should be defined as pointers
+* should support `__func__`, a pre-defined static local `char` array
+* analyser pass for variable scoping and lazy constant folding
+* support `extern`, `static`, `typedef` correctly
+* accept flexible arrays at end of `struct`/`union` definition, and flag recursively
+* check if strings with embedded null bytes can be output as `.string`
+* split long strings on `\n` in assembly, using `.ascii`
+* further reduce `Node` size, distinguish `SNode` and `ENode`?
+* [/] proper structure alignment, layout and size (mostly done)
+* support bit-field syntax
+* support bit-field semantics
+* support bit-field proper layout
+* detect unreachable code
+* `expect_id()`, `expect_string()`: check kind, increment `P`, return data
+* [50%] add timings and other stats using helper program
+* emit static data initializers for non constant elements (eg: `char a, *p = &a;`)
+* more optimizations
+* direct load and store
+* improve inc / dec
+* complete library
+* more intrinsics
+* add more tests
+* support floating point:
+  - accept floating point literals
+  - support floating point arithmetics (``float` and `double`)
+  - parse floating point literals
+  - extend `fprintf` for floating point conversions
+  - make the whole thing optional
+* add C backend for bootstrapping
+* x86_64 binary backend
+* Arm64 mac backend (source and binary)
+* Intel 32-bit backend (source and binary)
+* Wasm backend
+* LLVM backend
+* add built-in assembler to generate binaries from .s files (Intel/ATT syntax, x86/arm
+* optimize member load and assignments:
+```c
+            if (lhs->kind == N_MEMBER && lhs->lhs->kind === N_VAR) {
+                gen_expr(n->rhs, r, save_rax);
+                resolve_name(lhs->lhs);
+                lt = store_var(lhs->decl, 0, lhs->decl->type, r);
+                if (!(n->flags & DISCARD)) promote_reg(lt, r);
+                return lt;
+            }
+```
+* += should not push previous value
+* support `\uxxxx`, `\Uxxxxxxxx`, `\u{x+}`, `\U{x+}`,
+  `\x{x+}`, `\o{o+}` in strings and character constants
+* `bool` type, `true` and `false` predefined constants
+* `nullptr_t` type and `nullptr` predefined constant
+# C grammar
+* support _generic-selection_ (a _primary-expression_)
+* support _compound-literal_ (a _postfix-expression_)
+* parse _call-expression_ as a _postfix-expression_
+* parse other _unary-expression_:
+  - `_Countof` _unary-expression_
+  - `_Countof` `(` _type-name_ `)`
+  - `alignof` `(` _type-name_ `)`
+  - _static-assertion_
+* parse _static-assertion_:
+  - `static_assert` `(` _constant-expression_ `,` _string-literal_ `)`
+  - `static_assert` `(` _constant-expression_ `)`
+* parse _static_assert-declaration_ as a _declaration_:
+  -  _static-assertion_ `;`
+* support initialized `const` variables as _constant-expression_
+* support _constant-range-expression_:
+  - _constant-expression_ `...` _constant-expression_
+* use correct terms:
+  - _type-qualifier_: `const`, `restrict`, `volatile`, `restrict`
+  - _function-specifier_: `inline`, `_Noreturn`
+  - _alignment-specifier_:
+    - `alignas` `(` _type-name_ `)`
+    - `alignas` `(` _constant-expression_ `)`
+* support `typeof` and `typeof_unqual`
