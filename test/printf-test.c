@@ -27,7 +27,7 @@
 #define STD_FUNC_name  "snprintf"
 //#endif
 
-#ifndef NANO_LIBC_H
+#ifndef __NANOCC__
 #undef snprintf
 #define snprintf nano_snprintf
 #define vfprintf nano_vfprintf

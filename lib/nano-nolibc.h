@@ -69,10 +69,11 @@ int open(const char *path, int flags, ...) {
 }
 int close(int fd) { return __syscall(SYS_close, fd); }
 
-_Noreturn void exit(int code) {
+_Noreturn void _exit(int code) {
     __syscall(SYS_exit, code);
     for(;;);
 }
+#define exit(code) _exit(code)
 #endif
 
 // ancillary functions used in the examples

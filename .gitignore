@@ -9,3 +9,4 @@ kernel/*.o
 kernel/*.elf
 kernel/*.bin
 build/
+perf.data

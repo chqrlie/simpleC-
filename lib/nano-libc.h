@@ -1,244 +1,41 @@
 // nano-libc.h — C library functions used by the compiler
+#ifndef NANO_NOLIBC_H
 #ifndef NANO_LIBC_H
 #define NANO_LIBC_H
 
 #define attr_printf(a, b)
 #define fallthrough
 
-// stdbool.h (should make these keywords)
-typedef unsigned char bool;
-#define true 1
-#define false 0
+#include <sys/syscall.h>
+#include <unistd.h>
 
-// stddef.h
-#define NULL  ((void*)0)
-
-// limits.h
-#define INT_MAX 2147483647
-#define INT_MIN (-INT_MAX-1)
-#define UINT_MAX 0xffffffffU
-#define LONG_MAX 9223372036854775807L
-#define LONG_MIN (-LONG_MAX-1)
-#define ULONG_MAX 0xffffffffffffffffUL
-
-// ctype.h
-// should use a byte table
-int islower(int c) { return c >= 'a' && c <= 'z'; }
-int isupper(int c) { return c >= 'A' && c <= 'Z'; }
-int isalpha(int c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
-int isdigit(int c) { return c >= '0' && c <= '9'; }
-int isxdigit(int c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'); }
-int isalnum(int c) { return isdigit(c) || isalpha(c); }
-int isblank(int c) { return c == ' ' || c == '\t'; }
-int isspace(int c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-int tolower(int c) { return isupper(c) ? c + ('a' - 'A') : c; }
-int toupper(int c) { return islower(c) ? c - ('a' - 'A') : c; }
-
-// errno.h
-thread_local int errno;
-enum {  // Linux error codes
-    EPERM = 1, ENOENT, ESRCH, EINTR, EIO, ENXIO, E2BIG, ENOEXEC, EBADF,
-    ECHILD, EAGAIN, ENOMEM, EACCES, EFAULT, ENOTBLK, EBUSY, EEXIST, EXDEV,
-    ENODEV, ENOTDIR, EISDIR, EINVAL, ENFILE, EMFILE, ENOTTY, ETXTBSY, EFBIG,
-    ENOSPC, ESPIPE, EROFS, EMLINK, EPIPE, EDOM, ERANGE,
-};
-
-// stdlib.h
-static int _xdigit(int d) {
-    if (d >= '0' && d <= '9') return d - '0';
-    if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
-    return 255;
-}
-long strtol(const char *s, char **endp, int base) {
-    int sign = 1, d;
-    long n = 0;
-    while (isspace((unsigned char)*s)) s++;
-    if (*s == '-') { sign = -1; s++; }
-    else if (*s == '+') { s++; }
-    if (!base) {
-        base = 10;
-        if (*s == '0') {
-            base = 8;
-            switch (s[1] | 0x20) {
-            case 'b': base -= 14;
-            case 'x': base += 8;
-            case 'o': s += 2; break;
-            }
-        }
-    }
-    while ((d = _xdigit((unsigned char)*s)) < base) { s++; n = n * base + sign * d; }
-    if (endp) *endp = (char*)s;
-    return n;
-}
-int atoi(const char *s) { return (int)strtol(s, 0, 0); }
-
-// string.h
-void *memcpy(void *d, const void *s, size_t n) {
-    unsigned char *a = d; const unsigned char *b = s;
-    while (n--) *a++ = *b++; return d;
-}
-void *memset(void *d, int c, size_t n) {
-    unsigned char *a = d; while (n--) *a++ = (unsigned char)c; return d;
-}
-int memcmp(const void *p1, const void *p2, size_t n) {
-    const unsigned char *a = p1, *b = p2;
-    for (; n--; a++, b++) { if (*a == *b) continue; return *a - *b; }
-    return 0;
-}
-size_t strlen(const char *s) { size_t i = 0; while (s[i]) i++; return i; }
-size_t strnlen(const char *s, size_t n) { size_t i = 0; while (i < n && s[i]) i++; return i; }
-char *strchr(const char *s, int c) { while (*s != (char)c) if (!*s++) return NULL; return (char*)s; }
-char *strrchr(const char *s, int c) { char *e = NULL; while (*s) if (*s == (char)c) e = (char*)s; return e; }
-char *strcpy(char *d, const char *s) { for (size_t i = 0; d[i] = s[i]; i++); return d; }
-int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (unsigned char)*a - (unsigned char)*b;
-}
-
-static void __bp() {}
-
-// --- Syscall numbers ---
-enum {
-    SYS_read  = 0,
-    SYS_write = 1,
-    SYS_open  = 2,
-    SYS_close = 3,
-    SYS_mmap  = 9,
-    SYS_ioctl = 16,
-    SYS_exit  = 60,
-    SYS_creat = 85,
-    SYS_gettimeofday = 96,
-    SYS_clock_gettime = 228,
-};
-
-#define O_RDONLY 0
-#define O_WRONLY 1
-#define O_RDWR   2
-#define O_CREAT  0x40
-#define O_TRUNC  0x200
-
-// --- POSIX wrappers ---
-ssize_t read(int fd, void *buf, size_t len) {
-    for (;;) {
-        ssize_t n = __syscall(SYS_read, fd, buf, len);
-        if (n >= 0 || errno != EINTR) return n;
-    }
-}
-ssize_t write(int fd, const void *buf, size_t len) {
-    for (;;) {
-        ssize_t n = __syscall(SYS_write, fd, buf, len);
-        if (n >= 0 || errno != EINTR) return n;
-    }
-}
-int creat(const char *path, int mode) {
-    return __syscall(SYS_creat, path, mode);
-}
-int open(const char *path, int flags, ...) {
-    va_list ap; va_start(ap, flags);
-    int mode = va_arg(ap, int);
-    va_end(ap);
-    return __syscall(SYS_open, path, flags, mode);
-}
-int close(int fd) { return __syscall(SYS_close, fd); }
-int ioctl(int fd, int cmd, ...) {
-    va_list ap; va_start(ap, flags);
-    unsigned long arg1 = va_arg(ap, unsigned long);
-    unsigned long arg2 = va_arg(ap, unsigned long);
-    unsigned long arg3 = va_arg(ap, unsigned long);
-    //unsigned long arg4 = va_arg(ap, unsigned long);
-    va_end(ap);
-    return __syscall(SYS_ioctl, fd, cmd, arg1, arg2, arg3 /*, arg4*/);
-}
-
-struct winsize {
-    unsigned short ws_row;     // rows, in characters
-    unsigned short ws_col;     // columns, in characters
-    unsigned short ws_xpixel;  // horizontal size, pixels
-    unsigned short ws_ypixel;  // vertical size, pixels
-};
-enum { TIOCGWINSZ = 0x5413 };
-
-int isatty(int fd) {
-    struct winsize wsz;
-    int r = __syscall(SYS_ioctl, fd, TIOCGWINSZ, &wsz);
-    if (r == 0) return 1;
-    if (errno != EBADF) errno = ENOTTY;
-    return 0;
-}
-
-struct FILE;
-int fflush(struct FILE *f);    // should use an atexit function table
-_Noreturn void exit(int code) {
+_Noreturn void _exit(int code) {
+#ifdef LIB_STDIO_H
     fflush(NULL);
+#endif
     __syscall(SYS_exit, code);
     while(1);
 }
 
-// time.h
-#if SYSTEM_DARWIN
-typedef long time_t;
-typedef int suseconds_t;
-#else
-// Same for Linux, FreeBSD and OpenBSD
-typedef long time_t;
-typedef long suseconds_t;
-#endif
+#ifdef LIB_STDIO_H
 
-typedef long clock_t;
-typedef int clockid_t;
-struct timespec { time_t tv_sec; long tv_nsec; };
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#define CLOCK_REALTIME           0
-#define CLOCK_MONOTONIC          1
-#define CLOCK_PROCESS_CPUTIME_ID 2
-#define CLOCK_THREAD_CPUTIME_ID  3
-int clock_gettime(clockid_t clock_id, struct timespec *tp) {
-    return __syscall(SYS_clock_gettime, clock_id, tp);
-}
-
-#define CLOCKS_PER_SEC 1000000L
-clock_t clock(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)) return -1;
-    //if (ts.tv_sec > LONG_MAX / 1000000 || ts.tv_nsec / 1000 > LONG_MAX - 1000000 * ts.tv_sec) return -1;
-    return (clock_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-// sys/time.h
-struct timeval { time_t tv_sec; suseconds_t tv_usec; };
-struct timezone { int tz_minuteswest; int tz_dsttime; };
-int gettimeofday(struct timeval *tv, struct timezone *tz) {
-    return __syscall(SYS_gettimeofday, tv, tz);
-}
-
-// stdio.h
-void *malloc(size_t size);
-void free(void *p);
-
-#define _IOFBF   0
-#define _IOLBF   1
-#define _IONBF   2
 #define _IOABF   3
 #define _IOREAD  1
 #define _IOWRITE 2
-#define BUFSIZ  4096
-typedef struct FILE {
-    int hd;
-    unsigned char bmode, flags;
-    bool alloc;
-    size_t size, pos, cap, len;
-    unsigned char *buf;
-} FILE;
-#define NFILE 20
+
 FILE _iob[NFILE] = {
     { 0, _IOFBF, _IOREAD,  false, BUFSIZ },
     { 1, _IOABF, _IOWRITE, false, BUFSIZ },
     { 2, _IONBF, _IOWRITE, false, 0 },
 };
-#define stdin  (&_iob[0])
-#define stdout (&_iob[1])
-#define stderr (&_iob[2])
-#define EOF   (-1)
 
 //#define _check_fp(fp) if (!(fp) || (fp) < _iob || (fp) >= &_iob[NFILE]) { errno = EINVAL; return -1; }
 #define _check_fp(fp) if (!(fp)) { errno = EINVAL; return -1; }
@@ -290,8 +87,6 @@ int _filbuf(FILE *fp) {
     if (read(fp->hd, &b, 1) == 1) return b & 255;
     return EOF;
 }
-#define getc(fp)  (((fp)->pos < (fp)->len) ? (fp)->buf[(fp)->pos++] : _filbuf(fp))
-#define getchar(c)  getc(stdin)
 int fgetc(FILE *fp) { return getc(fp); }
 char *fgets(char *buf, size_t n, FILE *fp) {
     size_t i = 0;
@@ -332,8 +127,6 @@ size_t fread(void *p, size_t size, size_t nmemb, FILE *fp) {
     size_t rlen = __fread(p, len, fp);
     if (rlen == len) return nmemb; else return rlen / size;
 }
-#define putc(c, fp)  (((fp)->pos < (fp)->cap) ? (fp)->buf[(fp)->pos++] = (unsigned char)(c) : _flsbuf(c, fp))
-#define putchar(c)  putc(c, stdout)
 int fputc(int c, FILE *fp) { return putc(c, fp); }
 
 int fflush(FILE *fp) {
@@ -422,8 +215,6 @@ ssize_t __fwrite(const void *pv, size_t len, FILE *fp) {
     return nw;
 }
 
-#include "nano-printf.h"
-
 int printf(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int n = vfprintf(stdout, fmt, ap);
@@ -464,7 +255,157 @@ int puts(const char *s) {
     return len + 1;
 }
 
+#include "nano-printf.h"
+
+#endif
+
+#ifdef LIB_STDLIB_H
+
+#include <ctype.h>
+
+// stdlib.h
+static int _xdigit(int d) {
+    if (d >= '0' && d <= '9') return d - '0';
+    if ((d |= 0x20) >= 'a' && d <= 'z') return d - 'a' + 10;
+    return 255;
+}
+long strtol(const char *s, char **endp, int base) {
+    int sign = 1, d;
+    long n = 0;
+    while (isspace((unsigned char)*s)) s++;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') { s++; }
+    if (!base) {
+        base = 10;
+        if (*s == '0') {
+            base = 8;
+            switch (s[1] | 0x20) {
+            case 'b': base -= 14;
+            case 'x': base += 8;
+            case 'o': s += 2; break;
+            }
+        }
+    }
+    while ((d = _xdigit((unsigned char)*s)) < base) { s++; n = n * base + sign * d; }
+    if (endp) *endp = (char*)s;
+    return n;
+}
+int atoi(const char *s) { return (int)strtol(s, 0, 0); }
+
+_Noreturn void exit(int code) { _exit(code); }
+
+#include "nano-malloc.h"
+#endif
+
+#ifdef LIB_STRING_H
+// string.h
+void *memcpy(void *d, const void *s, size_t n) {
+    unsigned char *a = d; const unsigned char *b = s;
+    while (n--) *a++ = *b++; return d;
+}
+void *memset(void *d, int c, size_t n) {
+    unsigned char *a = d; while (n--) *a++ = (unsigned char)c; return d;
+}
+int memcmp(const void *p1, const void *p2, size_t n) {
+    const unsigned char *a = p1, *b = p2;
+    for (; n--; a++, b++) { if (*a == *b) continue; return *a - *b; }
+    return 0;
+}
+size_t strlen(const char *s) { size_t i = 0; while (s[i]) i++; return i; }
+size_t strnlen(const char *s, size_t n) { size_t i = 0; while (i < n && s[i]) i++; return i; }
+char *strchr(const char *s, int c) { while (*s != (char)c) if (!*s++) return NULL; return (char*)s; }
+char *strrchr(const char *s, int c) { char *e = NULL; while (*s) if (*s == (char)c) e = (char*)s; return e; }
+char *strcpy(char *d, const char *s) { for (size_t i = 0; d[i] = s[i]; i++); return d; }
+int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+#endif
+
+#ifdef LIB_TIME_H
+#include <sys/syscall.h>
+#include <unistd.h>
+int clock_gettime(clockid_t clock_id, struct timespec *tp) {
+    return __syscall(SYS_clock_gettime, clock_id, tp);
+}
+clock_t clock(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts)) return -1;
+    //if (ts.tv_sec > LONG_MAX / 1000000 || ts.tv_nsec / 1000 > LONG_MAX - 1000000 * ts.tv_sec) return -1;
+    return (clock_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+#endif
+
+#ifdef LIB_SYS_TIME_H
+#include <sys/syscall.h>
+#include <unistd.h>
+int gettimeofday(struct timeval *tv, struct timezone *tz) {
+    return __syscall(SYS_gettimeofday, tv, tz);
+}
+#endif
+
+#ifdef LIB_FCNTL_H
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdarg.h>
+int creat(const char *path, int mode) {
+    return __syscall(SYS_creat, path, mode);
+}
+int open(const char *path, int flags, ...) {
+    va_list ap; va_start(ap, flags);
+    int mode = va_arg(ap, int);
+    va_end(ap);
+    return __syscall(SYS_open, path, flags, mode);
+}
+#endif
+
+#ifdef LIB_UNISTD_H
+#include <sys/syscall.h>
+#include <stdarg.h>
+// --- POSIX wrappers ---
+ssize_t read(int fd, void *buf, size_t len) {
+    for (;;) {
+        ssize_t n = __syscall(SYS_read, fd, buf, len);
+        if (n >= 0 || errno != EINTR) return n;
+    }
+}
+ssize_t write(int fd, const void *buf, size_t len) {
+    for (;;) {
+        ssize_t n = __syscall(SYS_write, fd, buf, len);
+        if (n >= 0 || errno != EINTR) return n;
+    }
+}
+int close(int fd) { return __syscall(SYS_close, fd); }
+int ioctl(int fd, int cmd, ...) {
+    va_list ap; va_start(ap, flags);
+    unsigned long arg1 = va_arg(ap, unsigned long);
+    unsigned long arg2 = va_arg(ap, unsigned long);
+    unsigned long arg3 = va_arg(ap, unsigned long);
+    //unsigned long arg4 = va_arg(ap, unsigned long);
+    va_end(ap);
+    return __syscall(SYS_ioctl, fd, cmd, arg1, arg2, arg3 /*, arg4*/);
+}
+
+struct winsize {
+    unsigned short ws_row;     // rows, in characters
+    unsigned short ws_col;     // columns, in characters
+    unsigned short ws_xpixel;  // horizontal size, pixels
+    unsigned short ws_ypixel;  // vertical size, pixels
+};
+enum { TIOCGWINSZ = 0x5413 };
+
+int isatty(int fd) {
+    struct winsize wsz;
+    int r = __syscall(SYS_ioctl, fd, TIOCGWINSZ, &wsz);
+    if (r == 0) return 1;
+    if (errno != EBADF) errno = ENOTTY;
+    return 0;
+}
+#endif
+
+#ifdef LIB_ERRNO_H
 // sys_err.c
+thread_local int errno;
 const int sys_nerr = 35;
 const char * const sys_errlist[] = {
     "Success",
@@ -514,6 +455,6 @@ void perror(const char *s) {
     if (s && *s) fprintf(stderr, "%s: ", s);
     fprintf(stderr, "%s\n", strerror(errnum));
 }
-
-#include "nano-malloc.h"
+#endif
+#endif
 #endif

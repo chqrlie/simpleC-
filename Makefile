@@ -90,9 +90,9 @@ nano: $(BIN) build Makefile
 	$(RUN) diff $(TMP)/nano_g.s $(TMP)/nano2_g.s | head -50
 	@if [ '!' -f STATS.csv ] ; then echo "Source lines,Source bytes,Library lines,Library bytes,nano.s lines,nano.s bytes,nano_cc bytes,nano_prog bytes" > STATS.csv ; fi
 	@if [ -f $(TMP)/nano_prog ] ; then \
-	    echo `wc -l < simpleC++.c`,`wc -c < simpleC++.c`,`cat lib/nano-*.h | wc -l`,`cat lib/nano-*.h | wc -c`,`wc -l < $(TMP)/nano.s`,`wc -c < $(TMP)/nano.s`,`wc -c < nano_cc`,`wc -c < $(TMP)/nano_prog`   >> STATS.csv ; \
+	    echo `wc -l < simpleC++.c`,`wc -c < simpleC++.c`,`cat lib/*.h lib/sys/*.h | wc -l`,`cat lib/*.h lib/sys/*.h | wc -c`,`wc -l < $(TMP)/nano.s`,`wc -c < $(TMP)/nano.s`,`wc -c < nano_cc`,`wc -c < $(TMP)/nano_prog`   >> STATS.csv ; \
         else \
-	    echo `wc -l < simpleC++.c`,`wc -c < simpleC++.c`,`cat lib/nano-*.h | wc -l`,`cat lib/nano-*.h | wc -c`,`wc -l < $(TMP)/nano.s`,`wc -c < $(TMP)/nano.s`,`wc -c < nano_cc`   >> STATS.csv ; \
+	    echo `wc -l < simpleC++.c`,`wc -c < simpleC++.c`,`cat lib/*.h lib/sys/*.h | wc -l`,`cat lib/*.h lib/sys/*.h | wc -c`,`wc -l < $(TMP)/nano.s`,`wc -c < $(TMP)/nano.s`,`wc -c < nano_cc`   >> STATS.csv ; \
         fi
 	@if [ `wc -l < STATS.csv` -gt 4 ] ; then head -1 < STATS.csv ; fi
 	@tail -4 < STATS.csv

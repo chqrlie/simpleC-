@@ -43,6 +43,8 @@ static void malloc_stats(void) {
 #pragma GCC diagnostic ignored "-Wgnu-case-range"
 #pragma GCC diagnostic ignored "-Wunsafe-buffer-usage"
 #pragma GCC diagnostic ignored "-Wc23-extensions"
+#pragma GCC diagnostic ignored "-Wfixed-enum-extension"
+#pragma GCC diagnostic ignored "-Wswitch-enum"
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #if __has_attribute(__fallthrough__)
 # define fallthrough                    __attribute__((__fallthrough__))
@@ -54,6 +56,8 @@ static void malloc_stats(void) {
 #define fallthrough
 #define SMALL
 #endif
+
+#define enum_type(type)  : type
 
 // ---------------------------------------------------------------------
 // Types
@@ -69,7 +73,7 @@ typedef struct Func Func;
 // Errors / allocation
 // ---------------------------------------------------------------------
 static const char *progname;
-static bool has_library;
+static bool use_library;
 static const char *src_name[32];
 static char include_path[1024];
 static srcloc_t src_loc;
@@ -208,6 +212,12 @@ static unsigned long now(void) {
     struct timeval tv; gettimeofday(&tv, NULL);
     return (unsigned long)(tv.tv_sec * 1000000 + tv.tv_usec);
 }
+static char *make_output_file(const char *path, const char *ext, const char *new_ext) {
+    size_t len = strlen(path); strend(path, ext, &len);
+    char *p = alloc(len + strlen(new_ext) + 1, 1);
+    memcpy(p, path, len); strcpy(p + len, new_ext);
+    return p;
+}
 
 // Reallocatable string buffer
 typedef struct sbuf_t { char *buf; size_t len, cap; } sbuf_t;
@@ -282,8 +292,9 @@ static size_t encode_string(char *buf, size_t size, const char *str, size_t slen
 // =====================================================================
 
 typedef unsigned int atom_t;
-#define ATOM_MACRO  1
-#define ATOM_USED   2
+#define ATOM_MACRO       1
+#define ATOM_USED        2
+#define ATOM_SYS_HEADER  4
 typedef struct Atom {
     atom_t next; unsigned int len;
     Sym *sym;
@@ -364,7 +375,7 @@ static void atom_stats(void) {
 // =====================================================================
 // 0.2. PREDEFINED ATOMS
 // =====================================================================
-enum {
+typedef enum TokenKind enum_type(unsigned char) {
     T_EMPTY, T_EOF, T_NUM, T_CHAR, T_STR, T_ID,
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
     T_BITOR, T_AMP, T_BITXOR, T_SHL, T_SHR,
@@ -402,10 +413,10 @@ enum {
 
     ID_SIZE_T, ID_SSIZE_T, ID__BUILTIN_VA_LIST, ID_VA_LIST,
 
-    ID__START, ID_EXIT, ID_MAIN, ID_PRINTF, ID_PUTS,
+    ID__START, ID__EXIT, ID_MAIN, ID_PRINTF, ID_PUTS,
     ID_STRLEN, ID_STRCPY, ID_MEMCPY, ID_MEMSET,
     T_count
-};
+} TokenKind;
 static const char * const token_name[T_count] = {
     "", "<EOF>", "number", "char const", "string", "identifier",
     "+", "-", "*", "/", "%", "|", "&", "^", "<<", ">>",
@@ -428,7 +439,7 @@ static const char * const token_name[T_count] = {
     "__builtin_rotate_left",  "__builtin_rotate_right",
     "__syscall", "__rdtsc", "__rdtscp", "abs", "labs",
     "size_t", "ssize_t", "__builtin_va_list", "va_list",
-    "_start", "exit", "main", "printf", "puts",
+    "_start", "_exit", "main", "printf", "puts",
     "strlen", "strcpy", "memcpy", "memset",
 };
 
@@ -693,14 +704,18 @@ static void process_include(const char *name, bool sys, sbuf_t *sb) {
     char path[256];
     const char *curfile = sys ? NULL : get_filename(src_loc);
     const char *filename = find_file(path, sizeof(path), name, curfile, include_path);
-    if (!filename && sys) {
-        if (has_library) return;
-        has_library = true;  // at least has tried!
-        filename = find_file(path, sizeof(path), "nano-libc.h", NULL, include_path);
-        if (!filename) error(NULL, "cannot find standard library");
+    if (filename) {
+        atom_t a = new_atom(filename);
+        if (sys) {
+            if (atom_flags(a) & ATOM_SYS_HEADER) return;
+            atom_flags(a) |= ATOM_SYS_HEADER;
+            use_library = true;
+        }
+        preprocess(filename, sys, sb);
+    } else {
+        if (sys) warning(src_loc, "cannot find standard header <%s>", name);
+        else warning(src_loc, "cannot find include file '%s'", name);
     }
-    if (filename) { preprocess(filename, sys, sb); }
-    else warning(src_loc, "cannot find include file '%s'", name);
 }
 
 // Process already-comment-stripped text of one file.
@@ -882,8 +897,8 @@ static void preprocess(const char *path, bool sys, sbuf_t *sb) {
 // 2. LEXER
 // =====================================================================
 
-typedef struct {
-    unsigned char kind;
+typedef struct Token {
+    TokenKind kind;
     bool  is_unsigned;   // T_NUM
     bool  is_long;       // T_NUM
     unsigned char base;  // T_NUM
@@ -1086,11 +1101,11 @@ static size_t lex(const char *p) {
 // =====================================================================
 // 3. TYPES
 // =====================================================================
-enum {
+typedef enum TypeKind enum_type(unsigned char) {
     TY_INT, TY_SCHAR, TY_SHORT, TY_LONG, // signed types
     TY_UINT, TY_UCHAR, TY_USHORT, TY_ULONG, // unsigned types
     TY_CHAR, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM
-};
+} TypeKind;
 static const char * const type_name[] = {
     "int", "signed char", "short", "long",
     "unsigned int", "unsigned char", "unsigned short", "unsigned long",
@@ -1099,7 +1114,8 @@ static const char * const type_name[] = {
 
 struct Type {
     // should have flags for unsigned, ptrish, const, volatile, has_len
-    unsigned char kind, align; bool is_unsigned, is_ptrish;
+    TypeKind kind;
+    unsigned char align; bool is_unsigned, is_ptrish;
     srcloc_t loc;
     union {
         struct {            // TY_INT ... TY_ULONG
@@ -1108,7 +1124,7 @@ struct Type {
         };
         struct {            // TY_ENUM
             unsigned enum_size;
-            unsigned enum_count;
+            atom_t enum_tag;
             Type *enum_type;
             Sym *enum_syms;
         };
@@ -1120,7 +1136,7 @@ struct Type {
         };
         struct {            // TY_STRUCT / TY_UNION
             unsigned struct_size;
-            atom_t tag;
+            atom_t struct_tag;
             Member *members; // TY_STRUCT / TY_UNION
         };
         unsigned size;      // all types
@@ -1197,11 +1213,16 @@ static unsigned int elem_size(Type *t) {
 }
 static bool same_type(Type *t1, Type *t2) {
     if (t1 && t2) {
+        if (t1 == t2) return true;
         if (t1->kind != t2->kind) return false;
         switch (t1->kind) {
         case TY_ARRAY: return t1->arr_len == t2->arr_len && same_type(t1->ptr, t2->ptr);
         case TY_PTR:   return same_type(t1->ptr, t2->ptr);
-        case TY_STRUCT: case TY_UNION: case TY_ENUM: return t1->tag == t2->tag;
+        case TY_STRUCT: case TY_UNION: case TY_ENUM:
+            // XXX: this is not strictly sufficient because of possible shadowing
+            // XXX: also this is incorrect if tag is 0
+            return t1->struct_tag == t2->struct_tag;
+        default: break;
         }
     }
     return t1 == t2;
@@ -1241,7 +1262,7 @@ static Type *common_type(Type *t1, Type *t2) {
     return ty_int();
 }
 
-enum {  // tflags
+enum TypeFlags enum_type(unsigned) {  // tflags
     HAS_INT      = 1 << (K_INT      - K_INT),
     HAS_LONG     = 1 << (K_LONG     - K_INT),
     HAS_CHAR     = 1 << (K_CHAR     - K_INT),
@@ -1253,7 +1274,7 @@ enum {  // tflags
     HAS_UNSIGNED = 1 << (K_UNSIGNED - K_INT),
     HAS_TYPE     = 1 << (K_ENUM     - K_INT),  // typename, enum, struct, union
 };
-enum {  // sflags
+enum QualifierFlags enum_type(unsigned) {  // sflags
     HAS_CONST    = 1 << (K_CONST    - K_CONST),
     HAS_VOLATILE = 1 << (K_VOLATILE - K_CONST),
     //HAS_AUTO     = 1 << (K_AUTO     - K_CONST),
@@ -1269,17 +1290,17 @@ enum {  // sflags
 // =====================================================================
 // 4. AST
 // =====================================================================
-enum {
+typedef enum NodeKind enum_type(unsigned char) {
     N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_COMMA, N_UNARY,
     N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
     N_MEMBER, N_SIZEOF, N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
-};
+} NodeKind;
 
 struct Node {
-    unsigned char kind;
-    unsigned char op;       // token kind for N_BIN / N_POST (T_INC/T_DEC)
+    NodeKind kind;
+    TokenKind op;           // N_BIN / N_POST (T_INC/T_DEC)
 #define DISCARD       1     // expression value is discarded: no need to preserve reg value
 #define CONST_VAL     2     // expression is integer constant, value in n->ival
 #define HAS_BREAK     4     // N_SWITCH, N_FOR, N_DO, N_WHILE
@@ -1319,12 +1340,12 @@ struct Node {
 };
 
 static Token *cur(void);
-static Node *new_node(int k) {
+static Node *new_node(NodeKind k) {
     Node *n = allocz(1, sizeof(Node));
-    n->kind = (unsigned char)k; n->loc = cur()->loc; n->op = (unsigned char)cur()->kind;
+    n->kind = k; n->loc = cur()->loc; n->op = cur()->kind;
     return n;
 }
-static Node *new_node1(int k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
+static Node *new_node1(NodeKind k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
 static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
 static Node *set_num_node(Node *n, Type *t, unsigned long uval) { n->kind = N_NUM; n->flags |= CONST_VAL; n->type = t; n->uval = uval; return n; }
 static Node *new_num_node(Type *t, unsigned long uval) { return set_num_node(new_node(N_NUM), t, uval); }
@@ -1369,6 +1390,8 @@ static unsigned scope_len;
 
 static Sym *sym_link(atom_t name, Sym *s) {
     Sym *prev = atom_sym(name);
+    // XXX: should check consistency with forward definition
+    if (prev && (prev->sflags & HAS_EXTERN)) prev = prev->next_sym;
     if (prev) {
         warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
         note(prev->loc, "previous definition of '%s' is here", atom_str(name));
@@ -1476,9 +1499,10 @@ static bool value_cast(Value *vp, Type *t) {
             vp->type = t; return true;
         case TY_ARRAY: case TY_STRUCT: case TY_UNION: // error?
             return false;
-        case TY_ENUM:    t = t->enum_type; continue;
-        default: return false;
+        case TY_ENUM:
+            t = t->enum_type; continue;
         }
+        return false;
     }
     return false;
 }
@@ -1516,7 +1540,7 @@ static Type *tag_get(atom_t name, int kind, srcloc_t loc) { // find or forward-d
         }
     }
     Type *t = allocz(1, sizeof(Type)); t->kind = (unsigned char)kind;
-    t->loc = loc; t->tag = name;
+    t->loc = loc; t->struct_tag = name;
     if (name) {
         Tag *e = allocz(1, sizeof(Tag));
         e->name = name; e->kind = kind; e->type = t;
@@ -1543,13 +1567,13 @@ static Type *static_typeof(Node *n, Type *def);
 static Type *parse_ptrs(Type *base, unsigned *flagsp) {
     while (eat(T_STAR)) {
         base = ptr_to(base);
-        unsigned flags = 0;
+        unsigned flags = *flagsp & ~(HAS_CONST | HAS_VOLATILE);
         for (;;) {
             if (eat(K_CONST) && !(flags & HAS_CONST)) { flags |= HAS_CONST; continue; }
             if (eat(K_VOLATILE) && !(flags & HAS_VOLATILE)) { flags |= HAS_VOLATILE; continue; }
             break;
         }
-        if (flagsp) *flagsp = flags;
+        *flagsp = flags;
     }
     return base;
 }
@@ -1592,7 +1616,7 @@ static Type *parse_struct(int kind) {
                     if (eat(T_LBRK)) mt = parse_array(mt);
                 } else {
                     // accept unnamed members, must be untagged aggregate types (except bit-fields)
-                    if (!(mt->kind == TY_STRUCT || mt->kind == TY_UNION) && !mt->tag)
+                    if (!(mt->kind == TY_STRUCT || mt->kind == TY_UNION) && !mt->struct_tag)
                         error(NULL, "anonymous members must be untagged struct or union definitions");
                 }
                 unsigned msz = ty_size(mt);
@@ -1635,13 +1659,13 @@ static Type *parse_struct(int kind) {
 // enum specifier:  enum [tag] [ : impl-type] [ { members [= value], } ]
 static Type *parse_enum(void) {
     srcloc_t loc = curloc(); P++;
+    atom_t tag = at(T_ID) ? getid() : 0;
     Type *et = NULL;
     if (eat(T_COLON)) {
         unsigned int flags;
         et = parse_type_base_only(&flags);
         if (et->kind >= TY_VOID) error(NULL, "invalid enum underlying type");
     }
-    atom_t tag = at(T_ID) ? getid() : 0;
     Type *st = tag_get(tag, TY_ENUM, loc);
     if (st->enum_type) {
         if (at(T_LBRACE)) warning(loc, "enum type already defined");
@@ -1659,7 +1683,6 @@ static Type *parse_enum(void) {
             srcloc_t ploc = curloc();
             atom_t name = getid();
             Sym *s = add_global(name, ploc, st, 0);
-            s->name = name;
             s->kind = K_ENUM;
             if (eat(T_ASSIGN)) {
                 s->init = parse_const_expr();
@@ -1674,21 +1697,20 @@ static Type *parse_enum(void) {
                 v.uval++;
             }
             if (et) {
-                if (!value_check_range(&v, st->enum_type)) {
+                if (!value_check_range(&v, et)) {
                     warning(ploc, "enum value exceeds range of underlying type %s", type_str(et));
                 }
                 value_cast(&v, et);
             } else {
                 if (v.type->is_unsigned) { if (v.uval > max_val) max_val = v.uval; }
                 else if (v.ival >= 0) { if (v.uval > max_val) max_val = v.uval; }
-                else  { has_negative = true; if (~v.uval > max_val) max_val = ~v.uval; }
+                else { has_negative = true; if (~v.uval > max_val) max_val = ~v.uval; }
             }
             s->type = v.type;
             s->ival = v.ival;
             s->flags |= CONST_VAL;
             *tailp = s;
             tailp = &s->next_decl;
-            st->enum_count++;
             if (!eat(T_COMMA)) break;
         }
         if (!et) {
@@ -1786,7 +1808,8 @@ static Node *parse_primary(void) {
             case ID__BUILTIN_VA_ARG:
             case ID_VA_ARG:
                 n->lhs = parse_assign();
-                expect(T_COMMA); n->type = n->type_arg = parse_type(NULL);
+                unsigned int flags;
+                expect(T_COMMA); n->type = n->type_arg = parse_type(&flags);
                 goto done_builtin;
             case ID__BUILTIN_VA_END:
             case ID_VA_END:
@@ -1829,8 +1852,9 @@ static Node *parse_primary(void) {
         n->flags |= HAS_PAREN; return n;
     }
     //case K_GENERIC: error(NULL, "_Generic selection not supported");
+    default:
+        error(NULL, "expected expression, got '%s'", token_str(cur())); return 0;
     }
-    error(NULL, "expected expression, got '%s'", token_str(cur())); return 0;
 }
 
 // postfix: primary ( [expr] | ++ | -- )*
@@ -1870,16 +1894,6 @@ static Node *parse_postfix(void) {
 static Node *parse_unary(bool accept_cast) {
     Node *n;
     switch (toks[P].kind) {
-    case T_LP:
-        if (accept_cast && is_type_start(&toks[P+1])) {
-            n = new_node(N_CAST); P++;
-            unsigned int flags;
-            n->type = parse_type(&flags);
-            expect(T_RP);
-            n->lhs = parse_cast_expression();
-            return check_const_unary(n);
-        }
-        break;
     //case K_ALIGNOF:  // alignof(type)
     //case K_COUNTOF:
     case K_SIZEOF: {
@@ -1889,7 +1903,8 @@ static Node *parse_unary(bool accept_cast) {
             // XXX: should accept `sizeof(char[xxx])`
             // Should support delayed type resolution and
             // dynamic type expressions: sizeof(char[expr])
-            P++; n->type_arg = t = parse_type(NULL); expect(T_RP);
+            unsigned int flags;
+            P++; n->type_arg = t = parse_type(&flags); expect(T_RP);
         } else {
             n->lhs = parse_unary(false);
             t = static_typeof(n->lhs, NULL);
@@ -1908,8 +1923,19 @@ static Node *parse_unary(bool accept_cast) {
     case T_INC:
     case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
     //case K_STATIC_ASSERT:
+    case T_LP:
+        if (accept_cast && is_type_start(&toks[P+1])) {
+            n = new_node(N_CAST); P++;
+            unsigned int flags;
+            n->type = parse_type(&flags);
+            expect(T_RP);
+            n->lhs = parse_cast_expression();
+            return check_const_unary(n);
+        }
+        fallthrough;
+    default:
+        return parse_postfix();
     }
-    return parse_postfix();
 }
 
 static Node *parse_mul(void) {
@@ -1982,6 +2008,7 @@ static Node *parse_assign(void) {
     case T_XOREQ:   case T_SHLEQ:     case T_SHREQ:
         n = new_node1(N_ASSIGN, n); P++; n->rhs = parse_assign();
         break;
+    default: break;
     }
     return n;
 }
@@ -1998,7 +2025,11 @@ static Node *parse_decl_stmt(void) {
     Node *n = new_node(N_DECL);
     n->decl_flags = flags;
     switch (base->kind) {   // check for bare struct/union/enum Foo { ... };
-    case TY_STRUCT: case TY_UNION: case TY_ENUM: if (eat(T_SEMI)) return n;
+    case TY_STRUCT: case TY_UNION: case TY_ENUM:
+        if (eat(T_SEMI)) return n;
+        break;
+    default:
+        break;
     }
     Sym **tailp = &n->decl;
     for (;;) {
@@ -2024,7 +2055,7 @@ static Node *parse_decl_stmt(void) {
 static Type *parse_type_base_only(unsigned int *pflags) {
     Type *t = NULL; unsigned int sflags = 0, tflags = 0;
     for (;;) {
-        if (pflags) *pflags = sflags | (tflags << 16);
+        *pflags = sflags | (tflags << 16);
         unsigned int k;
         switch (k = cur()->kind) {
         case K_CONST:
@@ -2583,6 +2614,7 @@ static void check_used(Node *n) {
         for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
     case N_SWITCH: check_used(n->cond); check_used(n->rhs); break;
     case N_VAR: break; // XXX: should look up symbol and set used bit
+    default: break;
     }
 }
 
@@ -2672,14 +2704,16 @@ static void emit_jmp(Node *n, const char *jmp, int lab) {
 // =====================================================================
 // 7.1 CODE GENERATION
 // =====================================================================
-enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+typedef enum Register enum_type(unsigned char) {
+    RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15
+} Register;
 static const char * const reg64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
 static const char * const reg32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d" };
 static const char * const reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
 static const char * const reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
 
 static int label_id = 10;  // labels 1-9 reserved as local labels
-static unsigned char const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
 
 static Type *gen_expr(Node *n, int r, bool save_rax);
 static void  gen_stmt(Node *n);
@@ -2740,8 +2774,8 @@ static bool same_expr(Node *lhs, Node *rhs) {
     case N_STR:    return lhs->str  == rhs->str;
     case N_VAR:    return lhs->name == rhs->name;
     case N_MEMBER: return lhs->name == rhs->name && same_expr(lhs->lhs, rhs->lhs);
+    default:       return false;
     }
-    return false;
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
@@ -2750,11 +2784,12 @@ static Type *gen_addr(Node *n, int r, bool save_rax) {
     case N_VAR: {
         Sym *s = resolve_name(n);
         switch (s->kind) {
-        case 0:        emit("lea %s, [rip + %s]", reg64[r], atom_str(n->name)); break;
-        case K_AUTO:   emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg64[r], s->offset); break;
-        case K_ENUM:   error(n, "enum constants are not lvalues"); break;
-        case K_STATIC: break;  // TBI
+        case 0:         emit("lea %s, [rip + %s]", reg64[r], atom_str(n->name)); break;
+        case K_AUTO:    emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg64[r], s->offset); break;
+        case K_ENUM:    error(n, "enum constants are not lvalues"); break;
+        case K_STATIC:  break;  // TBI
         case K_TYPEDEF: break;  // error
+        default:        break;
         }
         return s->type;
     }
@@ -2770,12 +2805,14 @@ static Type *gen_addr(Node *n, int r, bool save_rax) {
     case N_MEMBER: {   // &(s.field)
         Type *st = gen_addr(n->lhs, r, save_rax); // reg = &struct
         Member *m = find_member(st, n->name);
-        if (!m) error(n, "no such struct member: %s.%s", atom_str(st->tag), atom_str(n->name));
+        if (!m) error(n, "struct member '%s' not found", atom_str(n->name));
         emit_comment(atom_str(n->name));
         if (m->offset) { emit("add %s, %u", reg64[r], m->offset); }
         return m->type;
-    }}
-    error(n, "not an lvalue"); return 0;
+    }
+    default:
+        error(n, "not an lvalue"); return 0;
+    }
 }
 
 // best-effort static type inference (used only by sizeof(expr))
@@ -3248,8 +3285,8 @@ static bool is_simple_load(Node *n) {
     case N_ASSIGN: // would qualify if lhs is simple and op is neither generic mul, div or rem
         break;
 #endif
+    default: return false;
     }
-    return false;
 }
 static bool all_simple_load(Node *n) {
     for (Node *arg = n->rhs; arg; arg = arg->next) if (!is_simple_load(arg)) return false;
@@ -3382,6 +3419,7 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
         case T_MINUS:   emit("neg %s", reg); break;
         case T_BITNOT:  emit("not %s", reg); break;
         case T_NOT:     emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); return ty_int();
+        default:        break;
         }
         return promoted_type(t);
     }
@@ -3463,7 +3501,7 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
             if (save_rax) emit("push rax");
             gen_expr(n->rhs, RAX, false);
             gen_expr(n->rhs->next, RCX, true);
-            if (n->kind == ID__BUILTIN_ROTATE_LEFT) emit("rol rax, cl"); else emit("ror rax, cl");
+            if (n->name == ID__BUILTIN_ROTATE_LEFT) emit("rol rax, cl"); else emit("ror rax, cl");
             goto done_pop_rax;
         case ID__SYSCALL:
             if (!check_num_args(n, -1)) return ty_long();
@@ -3507,6 +3545,7 @@ static Type *gen_expr(Node *n, int r, bool save_rax) {
             if (save_rax) emit("pop rax");
         done_long:
             return ty_long();
+        default: break;
         }
         if (save_rax) emit("push rax");
         // XXX: should look up symbol instead of global function to handle function pointers
@@ -4192,7 +4231,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
         emit_comment("envp"); emit("lea rdx, [rsi+8*rdi+8]");
         emit("call main");
         emit("mov rdi, rax");
-        emit("call exit");
+        emit("call _exit");
         emit("hlt");
     }
 
@@ -4208,7 +4247,9 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
     // - uninitialized data in .bss sections
     emit_section(".data", 0);
     for (Sym *s = globals; s; s = s->next_decl) {
-        if (s->kind || s->fn) continue;
+        if (s->kind) continue;
+        if (s->fn) continue;
+        if (s->sflags & HAS_EXTERN) continue;
         if (!kernel_mode && !s->init) {
             if (s->sflags & HAS_STATIC) emit(".local %s", atom_str(s->name));
             unsigned sz = ty_size(s->type); if (sz < 1) sz = 8;
@@ -4235,7 +4276,7 @@ static bool add_path(char *buf, size_t size, const char *path) {
 
 int main(int argc, char **argv) {
     // Optional flags may precede the file names.  --kernel suppresses the
-    // Linux _start/exit stub so a bare-metal boot stub can provide the entry
+    // Linux _start/_exit stub so a bare-metal boot stub can provide the entry
     // point and simply call main() (no Linux syscalls exist in a kernel).
     progname = argv[0];
     if (argc == 1) usage(true);
@@ -4271,6 +4312,8 @@ int main(int argc, char **argv) {
 
     sbuf_t src[1]; sbuf_init(src, 128 * 1024);
     preprocess(inpath, false, src);
+    // XXX: should include relevant library source files
+    if (use_library) process_include("nano-libc.h", true, src);
     if (preprocess_mode == 1) {
         open_output(outpath, stdout);
         fputs(sbuf_getptr(src), fout);
@@ -4287,13 +4330,9 @@ int main(int argc, char **argv) {
 
     while (!at(T_EOF)) parse_toplevel();
     check_used_func(ID_MAIN);
-    if (!kernel_mode) check_used_func(ID_EXIT);
+    if (!kernel_mode) check_used_func(ID__EXIT);
 
-    if (!outpath) {
-        size_t len = strlen(inpath); strend(inpath, ".c", &len);
-        char *p = alloc(len + 3, 1);
-        outpath = memcpy(p, inpath, len); strcpy(p + len, ".s");
-    }
+    if (!outpath) outpath = make_output_file(inpath, ".c", ".s");
     open_output(outpath, NULL);
     rc = emit_x86_intel(kernel_mode, libc_mode);
     if (fout != stdout) fclose(fout);
