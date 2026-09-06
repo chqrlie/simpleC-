@@ -1,20 +1,19 @@
 # TODO list
 
-* improve hashing:
-```c
-for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 255);
-```
 * merge upstream
 * support function pointers
-* optimize code gen for condition expressions
-* [/] complete support for short/int/long semantics
-* [/] complete support of unsigned semantics
+* merge `parse_tolevel` and `parse_decl` or `parse_stmt`
+* [90%] optimize code gen for condition expressions
+* [50%] complete support for short/int/long semantics
+* [50%] complete support of unsigned semantics
+* `return cond ? a : b` ->  `if (cond) return a; else return b;`
 * check and convert function arguments according to prototype
 * fix bogus 2D array handling
 * simplify varargs API: all optional arguments on the stack
-* add builtins for memcpy, memset, strcpy, strlen
+* add builtins for `memcpy`, `memset`, `strcpy`, `strlen`
 * compound literals
 * designated initializers
+* structure assignment
 * structure passing and returning
 * accept `__attribute__` syntax
 * accept `[[ attribute-list ]]` syntax
@@ -60,6 +59,10 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 * Wasm backend
 * LLVM backend
 * add built-in assembler to generate binaries from .s files (Intel/ATT syntax, x86/arm
+* improve hashing:
+```c
+for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 255);
+```
 * optimize member load and assignments:
 ```c
             if (lhs->kind == N_MEMBER && lhs->lhs->kind === N_VAR) {

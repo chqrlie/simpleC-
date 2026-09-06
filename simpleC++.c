@@ -3360,6 +3360,61 @@ static void gen_arg(Node *n, Register r, bool save_rax) {
     if (check_num_args(n, 1)) gen_expr(n->rhs, r, save_rax);
 }
 
+static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_true) {
+    switch (n->kind) {
+    case N_STR:     // always true
+    case N_ADDR:    // always true (should report during analysis and set CONST_VAL?)
+        if (lab_true) { emit_jmp(n, "jmp", lab_true); return false; }
+        return false;
+    case N_UNARY:
+        switch (n->op) {
+        case T_PLUS:
+        case T_MINUS:   return gen_test(n->lhs, r, save_rax, lab_false, lab_true);
+        case T_BITNOT:  gen_expr(n, r, save_rax); emit("not %s", reg64[r]); goto notest;
+        case T_NOT:     return gen_test(n->lhs, r, save_rax, lab_true, lab_false);
+        default:        return false; // error
+        }
+    case N_LOGAND:
+        if (lab_false) {
+            return gen_test(n->lhs, r, save_rax, lab_false, 0)
+            &&     gen_test(n->rhs, r, save_rax, lab_false, lab_true);
+        } else {
+            int lab = label_id++;
+            if (gen_test(n->lhs, r, save_rax, lab, 0)) {
+                gen_test(n->rhs, r, save_rax, 0, lab_true);
+            }
+            emit_label(lab);
+            return true;
+        }
+    case N_LOGOR:
+        if (lab_true) {
+            return gen_test(n->lhs, r, save_rax, 0, lab_true)
+            &&     gen_test(n->rhs, r, save_rax, lab_false, lab_true);
+        } else {
+            int lab = label_id++;
+            if (gen_test(n->lhs, r, save_rax, 0, lab)) {
+                gen_test(n->rhs, r, save_rax, lab_false, 0);
+            }
+            emit_label(lab);
+            return true;
+        }
+    //case N_CMP:  // should optimize comparisons
+    default:
+        gen_expr(n, r, save_rax);
+        emit("test %s, %s", reg64[r], reg64[r]);
+    notest:
+        if (lab_false) {
+            emit_jmp(n, "jz", lab_false);
+            if (!lab_true) return true;
+            emit_jmp(n, "jmp", lab_true);
+            return false;
+        } else {
+            emit_jmp(n, "jnz", lab_true);
+            return true;
+        }
+    }
+}
+
 static Type *gen_expr(Node *n, Register r, bool save_rax) {
     const char *reg = reg64[r];
     if (n->flags & CONST_VAL) goto has_num;
@@ -3465,7 +3520,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_TERNARY: {
         int els = label_id++, end = label_id++;
-        gen_expr(n->cond, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", els);
+        gen_test(n->cond, r, save_rax, els, 0);
         gen_expr(n->lhs, r, save_rax); emit_jmp(n, "jmp", end);
         emit_label(els); gen_expr(n->rhs, r, save_rax);
         emit_label(end);
@@ -3888,7 +3943,7 @@ static void gen_stmt(Node *n) {
             break;
         }
         int els = label_id++;
-        gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", els);
+        gen_test(cond, RAX, false, els, 0);
         gen_stmt(n->lhs);
         if (n->rhs) {
             int end = label_id++; emit_jmp(n, "jmp", end);
@@ -3904,7 +3959,7 @@ static void gen_stmt(Node *n) {
         if (cond->flags & CONST_VAL) {
             if (!cond->uval) break;
         } else {
-            gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end);
+            gen_test(cond, RAX, false, end, 0);
         }
         loop_push(n, end, top); gen_stmt(n->lhs); loop_pop();
         // XXX: should duplicate test
@@ -3923,7 +3978,7 @@ static void gen_stmt(Node *n) {
         if (cond->flags & CONST_VAL) {
             if (cond->uval) emit_jmp(n, "jmp", top);
         } else {
-            gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jnz", top);
+            gen_test(cond, RAX, false, 0, top);
         }
         emit_label(end);
         break;
@@ -3939,7 +3994,7 @@ static void gen_stmt(Node *n) {
             if (cond->flags & CONST_VAL) {
                 if (!cond->uval) break; // no code to emit
             } else {
-                gen_expr(cond, RAX, false); emit("test rax, rax"); emit_jmp(n, "jz", end);
+                gen_test(cond, RAX, false, end, 0);
             }
         }
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();

@@ -1,0 +1,4 @@
+// Tab-width for assembly output is 8
+set_tab_width(8);
+//indent_tabs_mode = 0;
+indent_width = 4;
