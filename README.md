@@ -19,10 +19,9 @@ make -C kernel          # compile the kernel
   - no compound literals
   - no bit-fields
   - 2D arrays are defective
-  - no initializers for local structures / unions
   - no non trivial initializers (eg: `FILE *stdin = &_iob[0];`)
-  - `static`, `extern`, `const`, `volatile` are ignored
-  - no floating point types
+  - `static`, `extern`, `const`, `volatile` are mostly ignored
+  - no floating point support
 - **Expressions:**
   - signed / unsigned promotions and arithmetics may be incomplete
   - no check and convert function arguments according to prototype
@@ -56,9 +55,11 @@ make -C kernel          # compile the kernel
 # Project goals
 
 - make a mostly c23 compliant compiler that can be used for educational purposes.
-- keep it small and fast, which requires it to produce efficient code :)
+- keep it small, fast, performant and friendly, which requires it to produce efficient code :)
 - _small_ means less than 5K lines and less than 128KB binary
-- _fast_ means the executables produced should be faster than if compiled with `gcc -O2`.
+- _fast_ means compile itself in less than 10ms on a laptop
+- _performant_ means the executables produced should be at most 50% slower than if compiled with `gcc -O2` or `clang -O2`
+- _friendly_ means produce meaningful diagnostics and prevent stupid mistakes
 - incorporate a number of extensions to simplify the language and make it safer
 - at the user option, produce:
   - preprocessor output

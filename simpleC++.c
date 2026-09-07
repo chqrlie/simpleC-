@@ -1194,20 +1194,6 @@ static unsigned int ty_size(Type *t) {
     default:        return t->align;
     }
 }
-static Member *find_member(Type *st, atom_t name) {
-    if (st->kind == TY_PTR) st = st->ptr;
-    for (Member *m = st->members; m; m = m->next) {
-        if (m->name == name) return m;
-        if (!m->name) {
-            Type *mt = m->type;
-            if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
-                Member *mm = find_member(mt, name);
-                if (mm) return mm;
-            }
-        }
-    }
-    return NULL;
-}
 // element size for pointer/array arithmetic (bytes per step); 0 if not a pointer
 static unsigned int elem_size(Type *t) {
     if (t->kind == TY_ARRAY) return ty_size(t->ptr);
@@ -2694,6 +2680,22 @@ static bool has_flow(Node *n) {
     }
 }
 
+static Member *find_member(Type *st, atom_t name, Node *n) {
+    if (st->kind == TY_PTR) st = st->ptr;
+    for (Member *m = st->members; m; m = m->next) {
+        if (m->name == name) return m;
+        if (!m->name) {
+            Type *mt = m->type;
+            if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
+                Member *mm = find_member(mt, name, NULL);
+                if (mm) return mm;
+            }
+        }
+    }
+    if (n) error(n, "struct member '%s' not found", atom_str(n->name));
+    return NULL;
+}
+
 // =====================================================================
 // 7. ASSEMBLY OUTPUT
 // =====================================================================
@@ -2790,26 +2792,37 @@ static Type *promote_reg(Type *t, Register r) {
     }
     return t;
 }
-static Type *load_ind(Type *t, Register r2, Register r1) {   // r2 = [r1] (size and type aware)
-    const char *dest = reg64[r2], *src = reg64[r1];
+static void make_reg_address(char *buf, size_t size, Register r, unsigned offset) {
+    if (offset) snprintf(buf, size, "%s + %u", reg64[r], offset);
+    else pstrcpy(buf, size, reg64[r]);
+}
+static Type *load_ind(Type *t, Register r1, Register r2, unsigned offset) {   // r1 = [r2+offset] (size and type aware)
+    char src[32]; make_reg_address(src, sizeof(src), r2, offset);
+    const char *dest = reg64[r1];
     const char *mov = t->is_unsigned ? "movzx" : "movsx";
     switch (ty_size(t)) {
     case 1: emit("%s %s, byte ptr [%s]", mov, dest, src); break;
     case 2: emit("%s %s, word ptr [%s]", mov, dest, src); break;
-    case 4: if (t->is_unsigned) emit("mov %s, [%s]", reg32[r2], src);
+    case 4: if (t->is_unsigned) emit("mov %s, [%s]", reg32[r1], src);
             else emit("movsx %s, dword ptr [%s]", dest, src); break;
     default: emit("mov %s, [%s]", dest, src); break;
     }
     return t;
 }
-static void store_ind(Type *t, Register r1, Register r2) {    // [r1] = r2 (size and type aware)
-    const char *dest = reg64[r1];
+static void store_ind(Type *t, Register r1, Register r2, unsigned offset) {    // [r1+offset] = r2 (size and type aware)
+    char dest[32]; make_reg_address(dest, sizeof(dest), r1, offset);
     switch (ty_size(t)) {
     case 1: emit("mov [%s], %s", dest, reg8[r2]); return;
     case 2: emit("mov [%s], %s", dest, reg16[r2]); return;
     case 4: emit("mov [%s], %s", dest, reg32[r2]); return;
     default: emit("mov [%s], %s", dest, reg64[r2]); return;
     }
+}
+static void emit_reg(const char *instr, Register r) {
+    emit("%s %s", instr, reg64[r]);
+}
+static void emit_reg_reg(const char *instr, Register r1, Register r2) {
+    emit("%s %s, %s", instr, reg64[r1], reg64[r2]);
 }
 static void emit_reg_imm(const char *instr, Register r, unsigned long val) {
     if ((int)val == (long)val) {
@@ -2821,7 +2834,7 @@ static void emit_reg_imm(const char *instr, Register r, unsigned long val) {
 }
 static void emit_cmp_imm(Register r, unsigned long val) {
     if (val) emit_reg_imm("cmp", r, val);
-    else emit("test %s, %s", reg64[r], reg64[r]);
+    else emit_reg_reg("test", r, r);
 }
 static bool expr_less(Node *t1, Node *t2, Type *ct) {
     if (ct->is_unsigned) return t1->uval < t2->uval;
@@ -2847,13 +2860,14 @@ static bool is_range_test(Node *lhs, Node *rhs) {
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
-static Type *gen_addr(Node *n, Register r, bool save_rax) {
+static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     switch (n->kind) {
     case N_VAR: {
         Sym *s = resolve_name(n);
+        // XXX: use `make_address`
         switch (s->kind) {
-        case 0:         emit("lea %s, [rip + %s]", reg64[r], atom_str(n->name)); break;
-        case K_AUTO:    emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg64[r], s->offset); break;
+        case 0:         emit("lea %s, [rip + %s + %u]", reg64[r], atom_str(n->name), offset); break;
+        case K_AUTO:    emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg64[r], s->offset - offset); break;
         case K_ENUM:    error(n, "enum constants are not lvalues"); break;
         case K_STATIC:  break;  // TBI
         case K_TYPEDEF: break;  // error
@@ -2864,16 +2878,18 @@ static Type *gen_addr(Node *n, Register r, bool save_rax) {
     case N_DEREF: {    // &*p  ==  p
 #ifndef XXX//@@@
         Type *t = gen_expr(n->lhs, r, save_rax);
+        if (offset) emit_reg_imm("add", r, offset);
         //return t; //is_ptrish(t) ? t->ptr : ty_long(); @@@
         return is_ptrish(t) ? t->ptr : ty_long();
 #else
-        return gen_expr(n->lhs, r, save_rax);
+        Type *t = gen_expr(n->lhs, r, save_rax);
+        if (offset) emit_reg_imm("add", r, offset);
+        return t;
 #endif
     }
     case N_MEMBER: {   // &(s.field)
-        Type *st = gen_addr(n->lhs, r, save_rax); // reg = &struct
-        Member *m = find_member(st, n->name);
-        if (!m) error(n, "struct member '%s' not found", atom_str(n->name));
+        Type *st = gen_addr(n->lhs, r, save_rax, offset); // reg = &struct
+        Member *m = find_member(st, n->name, n);
         emit_comment(atom_str(n->name));
         if (m->offset) { emit("add %s, %u", reg64[r], m->offset); }
         return m->type;
@@ -2892,7 +2908,7 @@ static Type *static_typeof(Node *n, Type *def) {
     case N_VAR:    { Sym *s = lookup(n->name, NULL); return s ? s->type : def; }
     case N_MEMBER: {
         Type *st = static_typeof(n->lhs, NULL); if (!st) return def;
-        Member *m = find_member(st, n->name);
+        Member *m = find_member(st, n->name, n);
         return m ? m->type : def;
     }
     case N_DEREF:  { Type *t = static_typeof(n->lhs, NULL); return t && is_ptrish(t) ? t->ptr : def; } // should report error
@@ -2931,7 +2947,7 @@ static void emit_imul_imm(Register r, unsigned long val) {
         // nothing
     } else
     if ((long)val == -1) {
-        emit("neg %s", reg);
+        emit_reg("neg", r);
     } else
     if ((val & (val - 1)) == 0) { // power of 2
         emit("shl %s, %d", reg, __builtin_ctzl(val));
@@ -3253,15 +3269,18 @@ static Type *load_var(Node *n, Register r) {
     return t;
 }
 
-static char *make_address(char *dest, size_t size, Sym *s, srcloc_t loc) {
+static char *make_address(char *dest, size_t size, Sym *s, unsigned offset, srcloc_t loc) {
+    size_t len;
     switch (s->kind) {
-    case 0:         snprintf(dest, size, "rip + %s", atom_str(s->name)); return dest;
-    case K_AUTO:    snprintf(dest, size, "rbp - %u", s->offset); return dest;
-    case K_STATIC:  snprintf(dest, size, "rip + %s_%u", atom_str(s->name), s->loc); return dest;
+    case 0:         len = (size_t)snprintf(dest, size, "rip + %s", atom_str(s->name)); break;
+    case K_AUTO:    snprintf(dest, size, "rbp - %u", s->offset - offset); return dest;
+    case K_STATIC:  len = (size_t)snprintf(dest, size, "rip + %s_%u", atom_str(s->name), s->loc); break;
     case K_ENUM:
     case K_TYPEDEF:
     default:        warning(loc, "not an lvalue"); return NULL;
     }
+    if (offset && len < size) snprintf(dest + len, size - len, " + %u", offset);
+    return dest;
 }
 
 static bool check_const(Sym *s, srcloc_t loc) {
@@ -3271,7 +3290,7 @@ static bool check_const(Sym *s, srcloc_t loc) {
 
 static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register r) {
     char dest[64];
-    if (!make_address(dest, sizeof(dest), s, loc)) return t;
+    if (!make_address(dest, sizeof(dest), s, offset, loc)) return t;
     if (!check_const(s, loc)) return t;
     switch (t->kind) {
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:
@@ -3281,10 +3300,10 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
         if (s->kind == K_AUTO) emit_comment(atom_str(s->name));
         // XXX: assigning to structures with a different size should be supported
         switch (ty_size(t)) {
-        case 1: emit("mov [%s + %u], %s", dest, offset, reg8[r]); break;
-        case 2: emit("mov [%s + %u], %s", dest, offset, reg16[r]); break;
-        case 4: emit("mov [%s + %u], %s", dest, offset, reg32[r]); break;
-        case 8: emit("mov [%s + %u], %s", dest, offset, reg64[r]); break;
+        case 1: emit("mov [%s], %s", dest, reg8[r]); break;
+        case 2: emit("mov [%s], %s", dest, reg16[r]); break;
+        case 4: emit("mov [%s], %s", dest, reg32[r]); break;
+        case 8: emit("mov [%s], %s", dest, reg64[r]); break;
         default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
         }
         break;
@@ -3294,7 +3313,7 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
 
 static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
     char dest[64];
-    if (!make_address(dest, sizeof(dest), s, loc)) return;
+    if (!make_address(dest, sizeof(dest), s, 0, loc)) return;
     if (!check_const(s, loc)) return;
     if (size > 256) {
         emit("lea %s, [%s + %u]", reg64[ARGREG[0]], dest, offset);
@@ -3323,7 +3342,7 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
 
 static Type *store_var_val(Sym *s, srcloc_t loc, unsigned offset, Type *t, unsigned long uval) {
     char dest[64];
-    if (!make_address(dest, sizeof(dest), s, loc)) return t;
+    if (!make_address(dest, sizeof(dest), s, offset, loc)) return t;
     if (!check_const(s, loc)) return t;
     long lval = (long)uval;
     if (lval != (int)uval) {
@@ -3335,10 +3354,10 @@ static Type *store_var_val(Sym *s, srcloc_t loc, unsigned offset, Type *t, unsig
     if (s->kind == K_AUTO) emit_comment(atom_str(s->name));
     // XXX: storing to structures with a different size should be supported
     switch (size) {
-    case 8: emit("mov qword ptr [%s + %u], %ld", dest, offset, lval); break;
-    case 4: emit("mov dword ptr [%s + %u], %ld", dest, offset, lval); break;
-    case 2: emit("mov word ptr [%s + %u], %ld", dest, offset, lval); break;
-    case 1: emit("mov byte ptr [%s + %u], %ld", dest, offset, lval); break;
+    case 8: emit("mov qword ptr [%s], %ld", dest, lval); break;
+    case 4: emit("mov dword ptr [%s], %ld", dest, lval); break;
+    case 2: emit("mov word ptr [%s], %ld", dest, lval); break;
+    case 1: emit("mov byte ptr [%s], %ld", dest, lval); break;
     default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
     }
     return t;
@@ -3480,7 +3499,7 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_
     default:
     regular:
         gen_expr(n, r, save_rax);
-        emit("test %s, %s", reg64[r], reg64[r]);
+        emit_reg_reg("test", r, r);
     notest:
         if (lab_false) {
             emit_jmp(n, "jz", lab_false);
@@ -3503,9 +3522,20 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     case N_STR:  return load_string(n, r);
     case N_VAR:  return load_var(n, r);
     case N_MEMBER: {
-        Type *mt = gen_addr(n, r, save_rax);  // reg = &member
+        if (n->lhs->kind == N_DEREF) { // optimize p->member -> *((*p).member)
+            Type *lt = gen_addr(n->lhs, r, save_rax, 0);
+            Member *m = find_member(lt, n->name, n);
+            emit_comment(atom_str(n->name));
+            Type *mt = m->type;
+            if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
+                if (m->offset) emit("add %s, %u", reg, m->offset);
+                return mt;   // decay@@@
+            }
+            return load_ind(mt, r, r, m->offset);
+        }
+        Type *mt = gen_addr(n, r, save_rax, 0);  // reg = &member
         if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) return mt;   // decay
-        return load_ind(mt, r, r);
+        return load_ind(mt, r, r, 0);
     }
     case N_SIZEOF: {
         Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
@@ -3518,10 +3548,10 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     case N_DEREF: {
         Type *t = gen_expr(n->lhs, r, save_rax);
         Type *pt = is_ptrish(t) ? t->ptr : ty_long();
-        return load_ind(pt, r, r);
+        return load_ind(pt, r, r, 0);
     }
     case N_ADDR: {
-        Type *t = gen_addr(n->lhs, r, save_rax);
+        Type *t = gen_addr(n->lhs, r, save_rax, 0);
         return ptr_to(t); // XXX why allocate new type!
     }
     case N_ASSIGN: {
@@ -3542,16 +3572,16 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             // XXX optimize <expr> = <const> and <expr> = <sym>
             if (save_rax) emit("push rax");
             gen_expr(n->rhs, RAX, false);
-            lt = gen_addr(lhs, RCX, true);
-            store_ind(lt, RCX, RAX);
+            lt = gen_addr(lhs, RCX, true, 0);
+            store_ind(lt, RCX, RAX, 0);
         } else {
             if (lhs->kind == N_VAR && r == RAX) {
                 lt = gen_expr(lhs, RAX, false);
             } else {
                 if (save_rax) emit("push rax");
-                lt = gen_addr(lhs, RAX, save_rax);
+                lt = gen_addr(lhs, RAX, save_rax, 0);
                 emit("push rax");
-                load_ind(lt, RAX, RAX);
+                load_ind(lt, RAX, RAX, 0);
             }
             TokenKind op = n->op - T_PLUSEQ + T_PLUS;
             if (n->rhs->flags & CONST_VAL) {
@@ -3564,7 +3594,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 store_var(lhs->decl, n->loc, 0, lt, RAX);
             } else {
                 emit("pop rcx");
-                store_ind(lt, RCX, RAX);
+                store_ind(lt, RCX, RAX, 0);
             }
         }
         if (r != RAX) emit("mov %s, rax", reg);
@@ -3576,7 +3606,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     case N_PRE: {                                  // ++x / --x  (returns new value)
         // XXX: should optimize if address is simple
         if (save_rax) emit("push rax");
-        Type *lt = gen_addr(n->lhs, RCX, false);
+        Type *lt = gen_addr(n->lhs, RCX, false, 0);
         unsigned int step = is_ptrish(lt) ? elem_size(lt) : 1;
         const char *add = n->op == T_INC ? "add" : "sub";
         const char *inc = n->op == T_INC ? "inc" : "dec";
@@ -3592,15 +3622,15 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             else emit("%s %s[rcx], %u", add, prefix, step);
         } else
         if (n->kind == N_PRE) {
-            load_ind(lt, RAX, RCX);                // rax = old
+            load_ind(lt, RAX, RCX, 0);             // rax = old
             if (step == 1) emit("%s rax", inc);
             else emit("%s rax, %u", add, step);
-            store_ind(lt, RCX, RAX);               // *&x = new (rax)
+            store_ind(lt, RCX, RAX, 0);            // *&x = new (rax)
         } else {
-            load_ind(lt, RAX, RCX);                // rax = old
+            load_ind(lt, RAX, RCX, 0);             // rax = old
             if (n->op == T_INC) emit("lea rdx, [rax + %u]", step);
             else emit("lea rdx, [rax - %u]", step);
-            store_ind(lt, RCX, RDX);
+            store_ind(lt, RCX, RDX, 0);
         }
         if (r != RAX) emit("mov %s, rax", reg);
         if (save_rax) emit("pop rax");
@@ -3618,9 +3648,9 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         Type *t = gen_expr(n->lhs, r, save_rax);
         switch (n->op) {
         case T_PLUS:    break;
-        case T_MINUS:   emit("neg %s", reg); break;
-        case T_BITNOT:  emit("not %s", reg); break;
-        case T_NOT:     emit("test %s, %s", reg, reg); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); return ty_int();
+        case T_MINUS:   emit_reg("neg", r); break;
+        case T_BITNOT:  emit_reg("not", r); break;
+        case T_NOT:     emit_reg_reg("test", r, r); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); return ty_int();
         default:        break;
         }
         return promoted_type(t);
@@ -3636,15 +3666,15 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             return ty_int();
         }
         int lab = label_id++;
-        gen_expr(lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jz", lab);
-        gen_expr(rhs, r, save_rax); emit("test %s, %s", reg, reg);
+        gen_expr(lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jz", lab);
+        gen_expr(rhs, r, save_rax); emit_reg_reg("test", r, r);
         emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
         return ty_int();
     }
     case N_LOGOR: {
         int lab = label_id++;
-        gen_expr(n->lhs, r, save_rax); emit("test %s, %s", reg, reg); emit_jmp(n, "jnz", lab);
-        gen_expr(n->rhs, r, save_rax); emit("test %s, %s", reg, reg);
+        gen_expr(n->lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jnz", lab);
+        gen_expr(n->rhs, r, save_rax); emit_reg_reg("test", r, r);
         emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
         return ty_int();
     }
@@ -3663,13 +3693,13 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 store_var(s, n->loc, 0, s->type, r);
                 return ty_void();
             }
-            gen_addr(lhs, r, save_rax);     // rcx = &ap
+            gen_addr(lhs, r, save_rax, 0);  // rcx = &ap
             emit("lea rdx, [rbp - %u]", this_fn->va_off);  // &save[named]
             emit("mov [%s], rdx", reg);     // ap = first vararg slot
             return ty_void();
         case ID__BUILTIN_VA_ARG:
         case ID_VA_ARG:
-            gen_addr(lhs, RCX, false);      // rcx = &ap
+            gen_addr(lhs, RCX, false, 0);   // rcx = &ap
             emit("mov rdx, [rcx]");         // rdx = ap
             emit_comment("va_arg");
             emit("mov rax, [rdx]");         // rax = *ap  (the argument value)
@@ -3679,8 +3709,8 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         case ID__BUILTIN_VA_COPY:
         case ID_VA_COPY:
             gen_expr(n->rhs, RAX, false);
-            Type *lt = gen_addr(lhs, RCX, true);
-            store_ind(lt, RCX, RAX);
+            Type *lt = gen_addr(lhs, RCX, true, 0);
+            store_ind(lt, RCX, RAX, 0);
             fallthrough;
         case ID__BUILTIN_VA_END:
         case ID_VA_END:
@@ -3746,18 +3776,18 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         case ID_LABS:
             gen_arg(n, r, save_rax);
             emit("mov rdx, %s", reg);
-            emit("neg %s", reg);
+            emit_reg("neg", r);
             emit("cmovs %s, rdx", reg);
             goto done_long; // type?
         case ID__RDTSC:
             check_num_args(n, 0);
             if (save_rax) emit("push rax");
-            emit("rdtsc"); emit("shl rdx,32"); emit("or rax, rdx");
+            emit("rdtsc"); emit("shl rdx, 32"); emit("or rax, rdx");
             goto done_pop_rax;
         case ID__RDTSCP:
             check_num_args(n, 0);
             if (save_rax) emit("push rax");
-            emit("rdtscp"); emit("shl rdx,32"); emit("or rax, rdx");
+            emit("rdtscp"); emit("shl rdx, 32"); emit("or rax, rdx");
             goto done_pop_rax;
         done_pop_rax:
             if (r != RAX) emit("mov %s, rax", reg);
@@ -4234,7 +4264,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
                 if (init->kind == N_STR) {
                     atom_flags(init->str) |= ATOM_USED;
                     if (s) {
-                        gen_addr(init, RAX, false);
+                        gen_addr(init, RAX, false, 0);
                         store_var(s, init->loc, offset, t, RAX);
                         return;
                     }

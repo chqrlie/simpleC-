@@ -2,6 +2,18 @@
 
 * merge upstream
 * support function pointers
+* add analysis pass:
+  - constant folding
+  - type resolution
+  - register allocation, stack usage
+  - discard information
+  - dead code elimination
+* `gen_stmt` should return flow state
+* `gen_expr` should return flow state and flags state
+* elide register reload
+* use generic save mask
+* use spill area and stop `push`/`pop` method
+* use unpromoted ABI and promote if needed
 * merge `parse_tolevel` and `parse_decl` or `parse_stmt`
 * [95%] optimize code gen for condition expressions
 * [50%] complete support for short/int/long semantics
@@ -9,6 +21,7 @@
 * `return cond ? a : b` ->  `if (cond) return a; else return b;`
 * check and convert function arguments according to prototype
 * fix bogus 2D array handling
+* accept more than 6 function arguments
 * simplify varargs API: all optional arguments on the stack
 * add builtins for `memcpy`, `memset`, `strcpy`, `strlen`
 * compound literals
@@ -18,6 +31,10 @@
 * accept `__attribute__` syntax
 * accept `[[ attribute-list ]]` syntax
 * better macro processing (single pass, token based)
+* accept more than 8 macro arguments
+* accept varargs macros
+* accept stringization
+* accept token pasting
 * save locations as offsets with full range capabilities
 * output column in error messages
 * pass integer offset to `gen_expr()`
