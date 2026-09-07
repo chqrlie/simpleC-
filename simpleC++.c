@@ -1295,8 +1295,8 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
 // 4. AST
 // =====================================================================
 typedef enum NodeKind enum_type(unsigned char) {
-    N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_COMMA, N_UNARY,
-    N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
+    N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP,
+    N_COMMA, N_UNARY, N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
     N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
     N_MEMBER, N_SIZEOF, N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
@@ -1304,7 +1304,7 @@ typedef enum NodeKind enum_type(unsigned char) {
 
 struct Node {
     NodeKind kind;
-    TokenKind op;           // N_BIN / N_POST (T_INC/T_DEC)
+    TokenKind op;           // N_BIN / N_CMP / N_POST (T_INC/T_DEC)
 #define DISCARD       1     // expression value is discarded: no need to preserve reg value
 #define CONST_VAL     2     // expression is integer constant, value in n->ival
 #define HAS_BREAK     4     // N_SWITCH, N_FOR, N_DO, N_WHILE
@@ -1975,12 +1975,12 @@ static Node *parse_shift(void) {
 }
 static Node *parse_rel(void) {
     Node *n = parse_shift();
-    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_bin_node(n); P++; n->rhs = parse_shift(); check_const_binary(n); }
+    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_node1(N_CMP, n); P++; n->rhs = parse_shift(); check_const_binary(n); }
     return n;
 }
 static Node *parse_eq(void) {
     Node *n = parse_rel();
-    while (at(T_EQ) || at(T_NE)) { n = new_bin_node(n); P++; n->rhs = parse_rel(); check_const_binary(n); }
+    while (at(T_EQ) || at(T_NE)) { n = new_node1(N_CMP, n); P++; n->rhs = parse_rel(); check_const_binary(n); }
     return n;
 }
 // Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
@@ -2338,6 +2338,7 @@ static bool eval_expr(Node *n, Value *vp) {
         if (!eval_expr(n->rhs, &v1)) return false;
         break;
     case N_BIN:
+    case N_CMP:
         if (!eval_expr(n->lhs, &v1)) return false;
         Value v2; v2.type = NULL; v2.uval = 0;
         if (!eval_expr(n->rhs, &v2)) return false;
@@ -2662,7 +2663,7 @@ static void check_used(Node *n) {
     case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
     case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
         check_used(n->lhs); break;
-    case N_ASSIGN: case N_BIN: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
+    case N_ASSIGN: case N_BIN: case N_CMP: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
         check_used(n->lhs); check_used(n->rhs); break;
     case N_CALL:
         if (check_rewrite(n)) { check_used(n); break; }
@@ -2833,6 +2834,13 @@ static bool same_expr(Node *lhs, Node *rhs) {
     case N_MEMBER: return lhs->name == rhs->name && same_expr(lhs->lhs, rhs->lhs);
     default:       return false;
     }
+}
+static bool is_range_test(Node *lhs, Node *rhs) {
+    if (lhs->op == T_GE && rhs->op == T_LE
+    &&  (lhs->rhs->flags & rhs->rhs->flags & CONST_VAL)
+    &&  same_expr(lhs->lhs, rhs->lhs)
+    &&  expr_less(lhs->rhs, rhs->rhs, common_type(lhs->lhs->type, lhs->rhs->type))) return true;
+    return false;
 }
 
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
@@ -3071,19 +3079,31 @@ static void emit_mod_imm(Register r, unsigned long val, bool save_rax) {
     }
 }
 
-static const char *get_cc(int op, bool is_unsigned) {
+static TokenKind get_rop(TokenKind op) {
     switch (op) {
-    case T_EQ: return "e";
-    case T_NE: return "ne";
-    case T_LT: return is_unsigned ? "b" : "l";
-    case T_GT: return is_unsigned ? "a" : "g";
-    case T_LE: return is_unsigned ? "be" : "le";
-    case T_GE: return is_unsigned ? "ae" : "ge";
-    default: return "";
+    case T_EQ: return T_NE;
+    case T_NE: return T_EQ;
+    case T_LT: return T_GE;
+    case T_GT: return T_LE;
+    case T_LE: return T_GT;
+    case T_GE: return T_LT;
+    default: return op;
     }
 }
 
-static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
+static const char *get_jcc(TokenKind op, bool is_unsigned) {
+    switch (op) {
+    case T_EQ: return "je";
+    case T_NE: return "jne";
+    case T_LT: return is_unsigned ? "jb" : "jl";
+    case T_GT: return is_unsigned ? "ja" : "jg";
+    case T_LE: return is_unsigned ? "jbe" : "jle";
+    case T_GE: return is_unsigned ? "jae" : "jge";
+    default: return " ";
+    }
+}
+
+static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
     // rax = left, rcx = right
     Type *ct = common_type(lt = promoted_type(lt), rt);
     switch (op) {
@@ -3136,16 +3156,16 @@ static Type *gen_bin(Node *n, int op, Type *lt, Type *rt) {
     case T_SHR:     if (lt->is_unsigned) emit("shr rax, cl"); else emit("sar rax, cl"); return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
         emit("cmp rax, rcx");
-        emit("set%s al", get_cc(op, ct->is_unsigned));
+        emit("set%s al", get_jcc(op, ct->is_unsigned) + 1);
         emit("movzx rax, al");
-        break;
+        return ty_int();
     }
     default: error(n, "bad binary operator '%s'", token_name[op]);
     }
     return ct;
 }
 
-static Type *gen_bin_imm(Node *n, int op, Type *lt, Register r, bool save_rax) {
+static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_rax) {
     // rax = left, val = right
     Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
     unsigned long val = n->rhs->uval;
@@ -3172,7 +3192,7 @@ static Type *gen_bin_imm(Node *n, int op, Type *lt, Register r, bool save_rax) {
     case T_SHR:     if (val &= 63) { if (lt->is_unsigned) emit("shr rax, %lu", val); else emit("sar rax, %lu", val); } return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE:
         emit_cmp_imm(RAX, val);
-        emit("set%s al", get_cc(op, ct->is_unsigned));
+        emit("set%s al", get_jcc(op, ct->is_unsigned) + 1);
         emit("movzx rax, al");
         break;
     default: error(n, "bad binary operator '%s'", token_name[op]);
@@ -3336,6 +3356,7 @@ static bool is_simple_load(Node *n) {
         return false;
 #if 0
     case N_BIN:
+    case N_CMP:
         // would qualify if one of the operands is a N_NUM and the other is simple
         // and the op is not a shift or rotate operation
     case N_COMMA:
@@ -3361,6 +3382,7 @@ static void gen_arg(Node *n, Register r, bool save_rax) {
 }
 
 static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_true) {
+    Node *lhs = n->lhs, *rhs = n->rhs;
     switch (n->kind) {
     case N_STR:     // always true
     case N_ADDR:    // always true (should report during analysis and set CONST_VAL?)
@@ -3369,37 +3391,72 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_
     case N_UNARY:
         switch (n->op) {
         case T_PLUS:
-        case T_MINUS:   return gen_test(n->lhs, r, save_rax, lab_false, lab_true);
+        case T_MINUS:   return gen_test(lhs, r, save_rax, lab_false, lab_true);
         case T_BITNOT:  gen_expr(n, r, save_rax); emit("not %s", reg64[r]); goto notest;
-        case T_NOT:     return gen_test(n->lhs, r, save_rax, lab_true, lab_false);
+        case T_NOT:     return gen_test(lhs, r, save_rax, lab_true, lab_false);
         default:        return false; // error
         }
     case N_LOGAND:
+        if (is_range_test(lhs, rhs)) {
+            gen_expr(lhs->lhs, r, save_rax);
+            emit_reg_imm("sub", r, lhs->rhs->uval);
+            emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
+            if (lab_false) {
+                emit_jmp(n, get_jcc(T_GT, true), lab_false);
+                if (!lab_true) return true;
+                emit_jmp(n, "jmp", lab_true);
+                return false;
+            } else {
+                emit_jmp(n, get_jcc(T_LE, true), lab_true);
+                return true;
+            }
+        }
         if (lab_false) {
-            return gen_test(n->lhs, r, save_rax, lab_false, 0)
-            &&     gen_test(n->rhs, r, save_rax, lab_false, lab_true);
+            return gen_test(lhs, r, save_rax, lab_false, 0)
+            &&     gen_test(rhs, r, save_rax, lab_false, lab_true);
         } else {
             int lab = label_id++;
-            if (gen_test(n->lhs, r, save_rax, lab, 0)) {
-                gen_test(n->rhs, r, save_rax, 0, lab_true);
+            if (gen_test(lhs, r, save_rax, lab, 0)) {
+                gen_test(rhs, r, save_rax, 0, lab_true);
             }
             emit_label(lab);
             return true;
         }
     case N_LOGOR:
         if (lab_true) {
-            return gen_test(n->lhs, r, save_rax, 0, lab_true)
-            &&     gen_test(n->rhs, r, save_rax, lab_false, lab_true);
+            return gen_test(lhs, r, save_rax, 0, lab_true)
+            &&     gen_test(rhs, r, save_rax, lab_false, lab_true);
         } else {
             int lab = label_id++;
-            if (gen_test(n->lhs, r, save_rax, 0, lab)) {
-                gen_test(n->rhs, r, save_rax, lab_false, 0);
+            if (gen_test(lhs, r, save_rax, 0, lab)) {
+                gen_test(rhs, r, save_rax, lab_false, 0);
             }
             emit_label(lab);
             return true;
         }
-    //case N_CMP:  // should optimize comparisons
+    case N_CMP: {
+        if (r != RAX) goto regular;
+        Type *lt = gen_expr(lhs, RAX, false);
+        Type *rt = rhs->type;
+        if (rhs->flags & CONST_VAL) {
+            emit_cmp_imm(RAX, rhs->uval);
+        } else {
+            rt = gen_expr(rhs, RCX, true);
+            emit("cmp rax, rcx");
+        }
+        Type *ct = common_type(promoted_type(lt), rt);
+        if (lab_false) {
+            emit_jmp(n, get_jcc(get_rop(n->op), ct->is_unsigned), lab_false);
+            if (!lab_true) return true;
+            emit_jmp(n, "jmp", lab_true);
+            return false;
+        } else {
+            emit_jmp(n, get_jcc(n->op, ct->is_unsigned), lab_true);
+            return true;
+        }
+    }
     default:
+    regular:
         gen_expr(n, r, save_rax);
         emit("test %s, %s", reg64[r], reg64[r]);
     notest:
@@ -3469,7 +3526,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             if (save_rax) emit("push rax");
             lt = gen_addr(lhs, RAX, save_rax); emit("push rax");
             load_ind(lt, RAX, RAX);
-            int op = n->op - T_PLUSEQ + T_PLUS;
+            TokenKind op = n->op - T_PLUSEQ + T_PLUS;
             if (n->rhs->flags & CONST_VAL) {
                 gen_bin_imm(n, op, lt, RAX, false);
             } else {
@@ -3539,11 +3596,8 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_LOGAND: {
         Node *lhs = n->lhs, *rhs = n->rhs;
-        if (lhs->op == T_GE && rhs->op == T_LE
-        &&  (lhs->rhs->flags & rhs->rhs->flags & CONST_VAL)
-        &&  same_expr(lhs->lhs, rhs->lhs)
-        &&  expr_less(lhs->rhs, rhs->rhs, common_type(lhs->lhs->type, lhs->rhs->type))) {
-            gen_expr(n->lhs->lhs, r, save_rax);
+        if (is_range_test(lhs, rhs)) {
+            gen_expr(lhs->lhs, r, save_rax);
             emit_reg_imm("sub", r, lhs->rhs->uval);
             emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
             emit("setbe %s", reg8[r]);
@@ -3696,6 +3750,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         n->rhs->flags |= n->flags & DISCARD;
         return gen_expr(n->rhs, r, save_rax);
     case N_BIN:
+    case N_CMP:
         if (save_rax) emit("push rax");
         Type *lt = gen_expr(n->lhs, RAX, false);
         if (n->rhs->flags & CONST_VAL) {
