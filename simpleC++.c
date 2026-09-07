@@ -407,7 +407,7 @@ typedef enum TokenKind enum_type(unsigned char) {
 
 #define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) <= ID_LABS)
     ID__BUILTIN_VA_START, ID_VA_START, ID__BUILTIN_VA_ARG, ID_VA_ARG,
-    ID__BUILTIN_VA_END, ID_VA_END, ID__BUILTIN_VA_COPY, ID_VA_COPY,
+    ID__BUILTIN_VA_COPY, ID_VA_COPY, ID__BUILTIN_VA_END, ID_VA_END,
     ID__BUILTIN_BSWAP16, ID__BUILTIN_BSWAP32, ID__BUILTIN_BSWAP64,
     ID__BUILTIN_CLZ, ID__BUILTIN_CLZL, ID__BUILTIN_CTZ, ID__BUILTIN_CTZL,
     ID__BUILTIN_ROTATE_LEFT, ID__BUILTIN_ROTATE_RIGHT,
@@ -436,7 +436,7 @@ static const char * const token_name[T_count] = {
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
     "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
     "__builtin_va_start", "va_start", "__builtin_va_arg", "va_arg",
-    "__builtin_va_end", "va_end", "__builtin_va_copy", "va_copy",
+    "__builtin_va_copy", "va_copy", "__builtin_va_end", "va_end",
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
     "__builtin_clz", "__builtin_clzl", "__builtin_ctz", "__builtin_ctzl",
     "__builtin_rotate_left",  "__builtin_rotate_right",
@@ -1821,6 +1821,9 @@ static Node *parse_primary(void) {
             switch (name) { // check builtins
             case ID__BUILTIN_VA_START:
             case ID_VA_START:
+                // actual prototype is void va_start(va_list ap, ...)
+            case ID__BUILTIN_VA_COPY:
+            case ID_VA_COPY:
                 n->lhs = parse_assign();
                 expect(T_COMMA); n->rhs = parse_assign();
                 goto done_builtin;
@@ -3523,9 +3526,14 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             lt = gen_addr(lhs, RCX, true);
             store_ind(lt, RCX, RAX);
         } else {
-            if (save_rax) emit("push rax");
-            lt = gen_addr(lhs, RAX, save_rax); emit("push rax");
-            load_ind(lt, RAX, RAX);
+            if (lhs->kind == N_VAR && r == RAX) {
+                lt = gen_expr(lhs, RAX, false);
+            } else {
+                if (save_rax) emit("push rax");
+                lt = gen_addr(lhs, RAX, save_rax);
+                emit("push rax");
+                load_ind(lt, RAX, RAX);
+            }
             TokenKind op = n->op - T_PLUSEQ + T_PLUS;
             if (n->rhs->flags & CONST_VAL) {
                 gen_bin_imm(n, op, lt, RAX, false);
@@ -3533,11 +3541,15 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 Type *rt = gen_expr(n->rhs, RCX, true);
                 gen_bin(n, op, lt, rt);
             }
-            emit("pop rcx");
-            store_ind(lt, RCX, RAX);
+            if (lhs->kind == N_VAR && r == RAX) {
+                store_var(lhs->decl, n->loc, 0, lt, RAX);
+            } else {
+                emit("pop rcx");
+                store_ind(lt, RCX, RAX);
+            }
         }
-        if (!(n->flags & DISCARD)) promote_reg(lt, r);
         if (r != RAX) emit("mov %s, rax", reg);
+        if (!(n->flags & DISCARD)) promote_reg(lt, r);
         if (save_rax) emit("pop rax");
         return lt;
     }
@@ -3617,49 +3629,63 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
         return ty_int();
     }
-    case N_BUILTIN:
+    case N_BUILTIN: {
+        Node *lhs = n->lhs;
         switch (n->name) {
         case ID__BUILTIN_VA_START:
         case ID_VA_START:
             if (!this_fn->is_variadic) {
                 error(n, "function %s is not variadic", atom_str(this_fn->name));
             }
-            gen_addr(n->lhs, r, save_rax);     // rcx = &ap
             emit_comment("va_start");
+            if (lhs->kind == N_VAR) {
+                Sym *s = resolve_name(lhs);
+                emit("lea %s, [rbp - %u]", reg, this_fn->va_off);
+                store_var(s, n->loc, 0, s->type, r);
+                return ty_void();
+            }
+            gen_addr(lhs, r, save_rax);     // rcx = &ap
             emit("lea rdx, [rbp - %u]", this_fn->va_off);  // &save[named]
-            emit("mov [%s], rdx", reg64[r]);   // ap = first vararg slot
-            return ty_long();
+            emit("mov [%s], rdx", reg);     // ap = first vararg slot
+            return ty_void();
         case ID__BUILTIN_VA_ARG:
         case ID_VA_ARG:
-            gen_addr(n->lhs, RCX, false);   // rcx = &ap
+            gen_addr(lhs, RCX, false);      // rcx = &ap
             emit("mov rdx, [rcx]");         // rdx = ap
             emit_comment("va_arg");
             emit("mov rax, [rdx]");         // rax = *ap  (the argument value)
             emit("add rdx, 8");             // ap += 8
             emit("mov [rcx], rdx");
             return n->type_arg;
+        case ID__BUILTIN_VA_COPY:
+        case ID_VA_COPY:
+            gen_expr(n->rhs, RAX, false);
+            Type *lt = gen_addr(lhs, RCX, true);
+            store_ind(lt, RCX, RAX);
+            fallthrough;
         case ID__BUILTIN_VA_END:
         case ID_VA_END:
             return ty_void();   // no-op
         case ID__BUILTIN_BSWAP16:
-            gen_expr(n->lhs, r, save_rax); emit("rol %s, 16", reg16[r]);
-            return ty_long();
+            gen_expr(lhs, r, save_rax); emit("rol %s, 16", reg16[r]);
+            return ty_ushort();
         case ID__BUILTIN_BSWAP32:
-            gen_expr(n->lhs, r, save_rax); emit("bswap %s", reg32[r]);
-            return ty_long();
+            gen_expr(lhs, r, save_rax); emit("bswap %s", reg32[r]);
+            return ty_uint();
         case ID__BUILTIN_BSWAP64:
-            gen_expr(n->lhs, r, save_rax); emit("bswap %s", reg);
-            return ty_long();
+            gen_expr(lhs, r, save_rax); emit("bswap %s", reg);
+            return ty_ulong();
         case ID__BUILTIN_CLZ:
         case ID__BUILTIN_CLZL:
-            gen_expr(n->lhs, r, save_rax); emit("bsr %s, %s", reg, reg); emit("xor %s, 63", reg);
-            return ty_long();
+            gen_expr(lhs, r, save_rax); emit("bsr %s, %s", reg, reg); emit("xor %s, 63", reg);
+            return ty_int();
         case ID__BUILTIN_CTZ:
         case ID__BUILTIN_CTZL:
-            gen_expr(n->lhs, r, save_rax); emit("rep bsf %s, %s", reg, reg);
-            return ty_long();
+            gen_expr(lhs, r, save_rax); emit("rep bsf %s, %s", reg, reg);
+            return ty_int();
         }
         return ty_void();
+    }
     case N_CALL: {
         // ---- variadic built-ins (handled inline, not real calls) ----
         switch (n->name) {

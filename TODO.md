@@ -3,7 +3,7 @@
 * merge upstream
 * support function pointers
 * merge `parse_tolevel` and `parse_decl` or `parse_stmt`
-* [90%] optimize code gen for condition expressions
+* [95%] optimize code gen for condition expressions
 * [50%] complete support for short/int/long semantics
 * [50%] complete support of unsigned semantics
 * `return cond ? a : b` ->  `if (cond) return a; else return b;`
