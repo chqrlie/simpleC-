@@ -2930,6 +2930,9 @@ static void emit_imul_imm(Register r, unsigned long val) {
     if (val == 1) {
         // nothing
     } else
+    if ((long)val == -1) {
+        emit("neg %s", reg);
+    } else
     if ((val & (val - 1)) == 0) { // power of 2
         emit("shl %s, %d", reg, __builtin_ctzl(val));
     } else
@@ -3169,7 +3172,7 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
 }
 
 static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_rax) {
-    // rax = left, val = right
+    // r = left and result, val = right
     Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
     unsigned long val = n->rhs->uval;
     switch (op) {
@@ -3179,7 +3182,7 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
     case T_MINUS:
         if (is_ptrish(lt)) val *= elem_size(lt);
         if (val) emit_reg_imm("sub", r, val); break;
-    case T_STAR:    emit_imul_imm(RAX, val); break;
+    case T_STAR:    emit_imul_imm(r, val); break;
     case T_SLASH:
         if (ct->is_unsigned) emit_div_imm(r, val, save_rax);
         else emit_idiv_imm(r, val, save_rax);
@@ -3188,15 +3191,15 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
         if (ct->is_unsigned) emit_mod_imm(r, val, save_rax);
         else emit_imod_imm(r, val, save_rax);
         break;
-    case T_AMP:     if (val + 1) emit_reg_imm("and", RAX, val); break;
-    case T_BITOR:   if (val) emit_reg_imm("or", RAX, val);      break;
-    case T_BITXOR:  if (val) emit_reg_imm("xor", RAX, val);     break;
-    case T_SHL:     if (val &= 63) emit("shl rax, %lu", val);   return lt;
-    case T_SHR:     if (val &= 63) { if (lt->is_unsigned) emit("shr rax, %lu", val); else emit("sar rax, %lu", val); } return lt;
+    case T_AMP:     if (val + 1) emit_reg_imm("and", r, val); break;
+    case T_BITOR:   if (val) emit_reg_imm("or", r, val);      break;
+    case T_BITXOR:  if (val) emit_reg_imm("xor", r, val);     break;
+    case T_SHL:     if (val &= 63) emit_reg_imm("shl", r, val); return lt;
+    case T_SHR:     if (val &= 63) { if (lt->is_unsigned) emit_reg_imm("shr", r, val); else emit_reg_imm("sar", r, val); } return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE:
-        emit_cmp_imm(RAX, val);
-        emit("set%s al", get_jcc(op, ct->is_unsigned) + 1);
-        emit("movzx rax, al");
+        emit_cmp_imm(r, val);
+        emit("set%s %s", get_jcc(op, ct->is_unsigned) + 1, reg8[r]);
+        emit("movzx %s, %s", reg64[r], reg8[r]);
         break;
     default: error(n, "bad binary operator '%s'", token_name[op]);
     }
@@ -3350,6 +3353,7 @@ static bool is_simple_load(Node *n) {
     case N_DEREF: case N_CAST: case N_ADDR: case N_UNARY:
         return true;
     case N_BUILTIN: // va_start, va_arg, va_end
+    case N_MEMBER:
         return !n->lhs || is_simple_load(n->lhs);
     case N_CALL:
         //switch (n->name) {
@@ -3391,6 +3395,21 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_
     case N_ADDR:    // always true (should report during analysis and set CONST_VAL?)
         if (lab_true) { emit_jmp(n, "jmp", lab_true); return false; }
         return false;
+    case N_BIN:
+        switch (n->op) {
+        case T_AMP:
+            if ((n->rhs->flags & CONST_VAL) && !(n->rhs->uval + 1)) goto regular;
+            goto optim;
+        case T_PLUS:
+        case T_MINUS:
+        case T_BITOR:
+        case T_BITXOR:
+            if ((n->rhs->flags & CONST_VAL) && !n->rhs->uval) goto regular;
+        optim:
+            gen_expr(n, r, save_rax); goto notest;
+        default:
+            goto regular;
+        }
     case N_UNARY:
         switch (n->op) {
         case T_PLUS:
@@ -3692,6 +3711,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         case ID__BUILTIN_ROTATE_LEFT:
         case ID__BUILTIN_ROTATE_RIGHT:
             if (!check_num_args(n, 2)) return ty_long();
+            // should optimize CONST_VAL rhs
             if (save_rax) emit("push rax");
             gen_expr(n->rhs, RAX, false);
             gen_expr(n->rhs->next, RCX, true);
@@ -3702,12 +3722,17 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             if (save_rax) emit("push rax");
             if (all_simple_load(n)) {
                 int i = 0;
-                for (Node *arg = n->rhs->next; arg; arg = arg->next) gen_expr(arg, ARGREG[i++], false);
+                for (Node *arg = n->rhs->next; arg; arg = arg->next, i++) {
+                    gen_expr(arg, ARGREG[i], false);
+                }
                 gen_expr(n->rhs, RAX, false);
             } else {
-                for (Node *arg = n->rhs->next; arg; arg = arg->next) { gen_expr(arg, RAX, false); emit("push rax"); }
+                int i = 0;
+                for (Node *arg = n->rhs->next; arg; arg = arg->next, i++) {
+                    gen_expr(arg, RAX, false); emit("push rax");
+                }
                 gen_expr(n->rhs, RAX, false);
-                for (int i = n->nargs - 1; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
+                while (i-- > 0) emit("pop %s", reg64[ARGREG[i]]);
             }
             emit("syscall");
             emit("test rax, rax");
@@ -3758,10 +3783,16 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         // XXX: here we could support default argument values
         if (all_simple_load(n)) {
             int i = 0;
-            for (Node *arg = n->rhs; arg; arg = arg->next) gen_expr(arg, ARGREG[i++], false);
+            for (Node *arg = n->rhs; arg; arg = arg->next, i++) gen_expr(arg, ARGREG[i], false);
         } else {
-            for (Node *arg = n->rhs; arg; arg = arg->next) { gen_expr(arg, RAX, false); emit("push rax"); }
-            for (int i = n->nargs; i-- > 0;) emit("pop %s", reg64[ARGREG[i]]);
+            int i = 0, last = n->nargs - 1;
+            for (Node *arg = n->rhs; arg; arg = arg->next, i++) {
+                if (i < last) { gen_expr(arg, RAX, false); emit("push rax"); continue; }
+                if (is_simple_load(arg)) gen_expr(arg, ARGREG[i], false);
+                else { gen_expr(arg, RAX, false); emit("mov %s, rax", reg64[ARGREG[i]]); }
+                break;
+            }
+            while (i-- > 0) emit("pop %s", reg64[ARGREG[i]]);
         }
         if (!fn || fn->is_variadic) emit("xor eax, eax"); // variadic-safe; harmless otherwise
         emit("call %s", atom_str(n->name));
@@ -3777,17 +3808,18 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         return gen_expr(n->rhs, r, save_rax);
     case N_BIN:
     case N_CMP:
-        if (save_rax) emit("push rax");
-        Type *lt = gen_expr(n->lhs, RAX, false);
         if (n->rhs->flags & CONST_VAL) {
-            lt = gen_bin_imm(n, n->op, lt, RAX, false);
+            Type *lt = gen_expr(n->lhs, r, save_rax);
+            return gen_bin_imm(n, n->op, lt, r, save_rax);
         } else {
+            if (save_rax) emit("push rax");
+            Type *lt = gen_expr(n->lhs, RAX, false);
             Type *rt = gen_expr(n->rhs, RCX, true);
             lt = gen_bin(n, n->op, lt, rt);
+            if (r != RAX) emit("mov %s, rax", reg);
+            if (save_rax) emit("pop rax");
+            return lt;
         }
-        if (r != RAX) emit("mov %s, rax", reg);
-        if (save_rax) emit("pop rax");
-        return lt;
     default:
         error(n, "cannot generate expression type %d", n->kind);
         return NULL;
