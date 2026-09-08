@@ -300,11 +300,82 @@ _Noreturn void exit(int code) { _exit(code); }
 #ifdef LIB_STRING_H
 // string.h
 void *memcpy(void *d, const void *s, size_t n) {
+#ifdef __x86_64__
+    __asm__("    mov rax,rdi\n"
+            "    cmp rdx,8\n"
+            "    jb 3f\n"
+            "    test edi,7\n"
+            "    jz 1f\n"
+            "2:  movsb\n"
+            "    dec rdx\n"
+            "    test edi,7\n"
+            "    jnz 2b\n"
+            "1:  mov rcx,rdx\n"
+            "    shr rcx,3\n"
+            "    rep movsq\n"
+            "3:  and edx,7\n"
+            "    jz 1f\n"
+            "2:  movsb\n"
+            "    dec edx\n"
+            "    jnz 2b\n"
+            "1:  ret\n");
+#else
     unsigned char *a = d; const unsigned char *b = s;
     while (n--) *a++ = *b++; return d;
+#endif
+}
+void *memmove(void *d, const void *s, size_t n) {
+#ifdef __x86_64__
+    __asm__("    mov rax,rdi\n"
+            "    sub rax,rsi\n"
+            "    cmp rax,rdx\n"
+            "    jae 1f\n"
+            "    mov rcx,rdx\n"
+            "    lea rdi,[rdi+rdx-1]\n"
+            "    lea rsi,[rsi+rdx-1]\n"
+            "    std\n"
+            "    rep movsb\n"
+            "    cld\n"
+            "    lea rax,[rdi+1]\n"
+            "    ret\n"
+            "1:\n");
+#else
+    if ((unsigned long)d - (unsigned long)s < n) {
+        unsigned char *dd = (unsigned char *)d + n - 1;
+        const unsigned char *ss = (const unsigned char*)s + n - 1;
+        while (n--) *dd-- = *ss--;
+        return dd + 1;
+    }
+#endif
+    return memcpy(d, s, n);
 }
 void *memset(void *d, int c, size_t n) {
+#ifdef __x86_64__
+    __asm__("    push rdi\n"
+            "    movzx rax,sil\n"
+            "    cmp rdx,8\n"
+            "    jb 3f\n"
+            "    mov rcx,0x101010101010101\n"
+            "    imul rax,rcx\n"
+            "    test edi,7\n"
+            "    jz 2f\n"
+            "1:  stosb\n"
+            "    dec rdx\n"
+            "    test edi,7\n"
+            "    jnz 1b\n"
+            "2:  mov rcx,rdx\n"
+            "    shr rcx,3\n"
+            "    rep stosq\n"
+            "3:  and edx,7\n"
+            "    jz 1f\n"
+            "2:  stosb\n"
+            "    dec edx\n"
+            "    jnz 2b\n"
+            "1:  pop rax\n"
+            "    ret\n");
+#else
     unsigned char *a = d; while (n--) *a++ = (unsigned char)c; return d;
+#endif
 }
 int memcmp(const void *p1, const void *p2, size_t n) {
     const unsigned char *a = p1, *b = p2;

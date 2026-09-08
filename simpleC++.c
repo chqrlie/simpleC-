@@ -501,11 +501,19 @@ static void macro_undef(atom_t name) {
     }
 }
 
+static void def_macro(const char *name) {
+    macro_define(new_atom(name), 0, -1, NULL, 1, "1");
+}
+
 static void create_builtin_macros(void) {
-    macro_define(new_atom("__NANOCC__"), 0, -1, NULL, 1, "1");
+    def_macro("__NANOCC__");
     macro_define(new_atom("__VERSION__"), 0, -1, NULL, 3, "0.1");
     atom_t a = ID_MAIN;
     macro_define(new_atom("__attribute__"), 0, 1, &a, 0, "");
+    def_macro("__amd64");
+    def_macro("__amd64__");
+    def_macro("__x86_64");
+    def_macro("__x86_64__");
 }
 
 typedef struct MacroArguments {
@@ -1118,31 +1126,34 @@ static const char * const type_name[] = {
 struct Type {
     // should have flags for unsigned, ptrish, const, volatile, has_len
     TypeKind kind;
-    unsigned char align; bool is_unsigned, is_ptrish;
+#define IS_PTRISH    1
+//#define IS_UNSIGNED  2
+#define HAS_LEN      4
+    unsigned char align, flags; bool is_unsigned;
     srcloc_t loc;
     union {
-        struct {            // TY_INT ... TY_ULONG
+        struct {                // TY_INT ... TY_ULONG
             int size_;
             unsigned long max;
         };
-        struct {            // TY_ENUM
+        struct {                // TY_ENUM
             unsigned enum_size;
             atom_t enum_tag;
             Type *enum_type;
             Sym *enum_syms;
         };
-        struct {            // TY_ARRAY / TY_PTR
-            unsigned arr_size;   // TY_ARRAY
-            int arr_len;    // TY_ARRAY (-1 if unspecified)
-            Type *ptr;      // TY_ARRAY / TY_PTR
+        struct {                // TY_ARRAY / TY_PTR
+            unsigned arr_size;  // TY_ARRAY
+            unsigned arr_len;   // TY_ARRAY
+            Type *ptr;          // TY_ARRAY / TY_PTR
             Node *arr_len_expr; // TY_ARRAY
         };
-        struct {            // TY_STRUCT / TY_UNION
+        struct {                // TY_STRUCT / TY_UNION
             unsigned struct_size;
             atom_t struct_tag;
-            Member *members; // TY_STRUCT / TY_UNION
+            Member *members;
         };
-        unsigned size;      // all types
+        unsigned size;          // all types
     };
 };
 struct Member {
@@ -1150,16 +1161,16 @@ struct Member {
     Type *type; Node *init; Member *next;
 };
 
-static Type ty_char_s   = { TY_CHAR,   1, false, false, 0, {{ 1, 127 }}}; // should be unsigned
-static Type ty_schar_s  = { TY_SCHAR,  1, false, false, 0, {{ 1, 127 }}};
-static Type ty_short_s  = { TY_SHORT,  2, false, false, 0, {{ 2, 32768 }}};
-static Type ty_int_s    = { TY_INT,    4, false, false, 0, {{ 4, INT_MAX }}};
-static Type ty_long_s   = { TY_LONG,   8, false, false, 0, {{ 8, LONG_MAX }}};
-static Type ty_uchar_s  = { TY_UCHAR,  1, true,  false, 0, {{ 1, 255 }}};
-static Type ty_ushort_s = { TY_USHORT, 2, true,  false, 0, {{ 2, 65535 }}};
-static Type ty_uint_s   = { TY_UINT,   4, true,  false, 0, {{ 4, UINT_MAX }}};
-static Type ty_ulong_s  = { TY_ULONG,  8, true,  false, 0, {{ 8, ULONG_MAX }}};
-static Type ty_void_s   = { TY_VOID,   1, false, false, 0, {{ 0, 0 }}};
+static Type ty_char_s   = { TY_CHAR,   1, 0, false, 0, {{ 1, 127 }}}; // should be unsigned
+static Type ty_schar_s  = { TY_SCHAR,  1, 0, false, 0, {{ 1, 127 }}};
+static Type ty_short_s  = { TY_SHORT,  2, 0, false, 0, {{ 2, 32768 }}};
+static Type ty_int_s    = { TY_INT,    4, 0, false, 0, {{ 4, INT_MAX }}};
+static Type ty_long_s   = { TY_LONG,   8, 0, false, 0, {{ 8, LONG_MAX }}};
+static Type ty_uchar_s  = { TY_UCHAR,  1, 0, true,  0, {{ 1, 255 }}};
+static Type ty_ushort_s = { TY_USHORT, 2, 0, true,  0, {{ 2, 65535 }}};
+static Type ty_uint_s   = { TY_UINT,   4, 0, true,  0, {{ 4, UINT_MAX }}};
+static Type ty_ulong_s  = { TY_ULONG,  8, 0, true,  0, {{ 8, ULONG_MAX }}};
+static Type ty_void_s   = { TY_VOID,   1, 0, false, 0, {{ 0, 0 }}};
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -1173,7 +1184,8 @@ static Type ty_void_s   = { TY_VOID,   1, false, false, 0, {{ 0, 0 }}};
 #define ty_void()    &ty_void_s
 #define ty_size_t()  &ty_ulong_s
 
-#define is_ptrish(t)  ((t)->is_ptrish)
+#define is_ptrish(t)  ((t)->flags & IS_PTRISH)
+#define ty_is_unsigned(t)  ((t)->is_unsigned)
 
 static const char *type_str(const Type *t) {
     if (!t) return "<null>";
@@ -1183,12 +1195,12 @@ static const char *type_str(const Type *t) {
 
 static Type *ptr_to(Type *base) {
     Type *t = allocz(1, sizeof(Type));
-    t->kind = TY_PTR; t->size = 8; t->align = 8; t->is_ptrish = true;
+    t->kind = TY_PTR; t->size = 8; t->align = 8; t->flags |= IS_PTRISH;
     t->ptr = base; return t;
 }
 static unsigned int ty_size(Type *t) {
     switch (t->kind) {
-    case TY_ARRAY:  return ty_size(t->ptr) * (unsigned)t->arr_len;
+    case TY_ARRAY:  return ty_size(t->ptr) * t->arr_len;
     case TY_VOID:   return 0;
     case TY_STRUCT: case TY_UNION: return t->struct_size;
     default:        return t->align;
@@ -1205,7 +1217,7 @@ static bool same_type(Type *t1, Type *t2) {
         if (t1 == t2) return true;
         if (t1->kind != t2->kind) return false;
         switch (t1->kind) {
-        case TY_ARRAY: return t1->arr_len == t2->arr_len && same_type(t1->ptr, t2->ptr);
+        case TY_ARRAY: return t1->flags == t2->flags && t1->arr_len == t2->arr_len && same_type(t1->ptr, t2->ptr);
         case TY_PTR:   return same_type(t1->ptr, t2->ptr);
         case TY_STRUCT: case TY_UNION: case TY_ENUM:
             // XXX: this is not strictly sufficient because of possible shadowing
@@ -1340,20 +1352,21 @@ static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
 static Node *set_num_node(Node *n, Type *t, unsigned long uval) { n->kind = N_NUM; n->flags |= CONST_VAL; n->type = t; n->uval = uval; return n; }
 static Node *new_num_node(Type *t, unsigned long uval) { return set_num_node(new_node(N_NUM), t, uval); }
 static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
-static int node_length(Node *n) { int len = 0; while (n) { len++; n = n->next; } return len; }
+static unsigned node_length(Node *n) { unsigned len = 0; while (n) { len++; n = n->next; } return len; }
 
 static void error(Node *n, const char *fmt, ...) {
     srcloc_t loc = n ? n->loc : cur()->loc;
     va_list a; va_start(a, fmt); err_message(loc, "error", fmt, a); va_end(a);
     if (1) exit(1);
 }
-static Type *array_of(Type *base, int len, Node *len_expr) {
+static Type *array_of(Type *base, bool has_len, size_t len, Node *len_expr) {
     Type *arr = allocz(1, sizeof(Type));
-    arr->kind = TY_ARRAY; arr->align = base->align; arr->is_ptrish = true;
-    arr->ptr = base; arr->arr_len = len; arr->arr_len_expr = len_expr;
+    arr->kind = TY_ARRAY; arr->align = base->align; arr->flags |= IS_PTRISH;
+    arr->ptr = base; arr->arr_len = (unsigned)len; arr->arr_len_expr = len_expr;
+    if (has_len) arr->flags |= HAS_LEN;
     if (len_expr && (len_expr->flags & CONST_VAL)) {
-        arr->arr_len = (int)len_expr->ival;
-        arr->arr_size = ty_size(base) * (unsigned)arr->arr_len;  // XXX: problem if base is incomplete
+        arr->arr_len = (unsigned)len_expr->uval;
+        arr->arr_size = ty_size(base) * arr->arr_len;  // XXX: problem if base is incomplete
     }
     return arr;
 }
@@ -1365,6 +1378,7 @@ struct Sym {
     unsigned char flags;   // CONST_VAL
     unsigned char sflags;  // QualifierFlags (some missing)
     unsigned char is_tag;  // should use flag in `flags`
+    unsigned char scope_depth, is_reg, reg;
     srcloc_t loc;
     union { long ival; unsigned long uval; };
     atom_t name; unsigned int offset; Type *type;
@@ -1380,8 +1394,8 @@ static unsigned int frame_pos, frame_max;
 
 static Sym **scope_list;
 static size_t scope_cap;
-static unsigned scope_depth;
 static unsigned scope_len;
+static unsigned char scope_depth;
 
 static Sym *sym_link(atom_t name, Sym *s) {
     Sym *prev = atom_sym(name);
@@ -1408,11 +1422,13 @@ static void set_local_offset(Sym *s) {
 static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) {
     Sym *s = allocz(1, sizeof(Sym));
     s->name = name; s->loc = loc; s->type = type; s->sflags = (unsigned char)sflags;
+    s->scope_depth = scope_depth;
     if (scope_depth) {
         // XXX: should handle HAS_THREAD_LOCAL
+        // Do not test HAS_AUTO because `auto` now means infer type and can be applied to any storage class
         switch (sflags & (HAS_FUNCTION | HAS_EXTERN | HAS_TYPEDEF | HAS_STATIC)) {
-        case HAS_STATIC:  s->kind = K_STATIC; break;
         case 0:           s->kind = K_AUTO; set_local_offset(s); break; // should delay this until analysis to allocate registers
+        case HAS_STATIC:  s->kind = K_STATIC; break;
         default:          break;
         }
         if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
@@ -1468,7 +1484,7 @@ static bool value_init(Value *vp, Type *t, long ival) {
     return true;
 }
 static size_t value_str(Value *vp, char *buf, size_t size) {
-    size_t len = (size_t)((vp->type->is_unsigned) ?
+    size_t len = (size_t)(ty_is_unsigned(vp->type) ?
                           snprintf(buf, size, "%lu", vp->uval) :
                           snprintf(buf, size, "%ld", vp->ival));
     return len > size ? size : len;
@@ -1508,6 +1524,17 @@ static bool value_cast(Value *vp, Type *t) {
     }
     return false;
 }
+
+// functions
+struct Func {
+    atom_t name;
+#define HAS_CALLS  1  // function calls other functions
+#define HAS_ADDR   2  // function uses addressof operator `&`
+    unsigned char nparams; bool is_variadic, used, flags;
+    srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
+    Sym *params; Node *body; Type *rtype; Label *labels;
+    struct Func *next;
+};
 
 // =====================================================================
 // 5. PARSER
@@ -1584,10 +1611,12 @@ static Type *parse_ptrs(Type *base, unsigned *flagsp) {
 }
 
 static Type *parse_array(Type *t) {
-    Node *len_expr = at(T_RBRK) ? NULL : parse_const_expr();
+    bool has_len = false;
+    Node *len_expr = NULL;
+    if (!at(T_RBRK)) { has_len = true; len_expr = parse_const_expr(); }
     expect(T_RBRK);
     if (eat(T_LBRK)) t = parse_array(t);
-    return array_of(t, -1, len_expr);
+    return array_of(t, has_len, 0, len_expr);
 }
 
 static void shift_members(Member *m) {
@@ -1707,7 +1736,7 @@ static Type *parse_enum(void) {
                 }
                 value_cast(&v, et);
             } else {
-                if (v.type->is_unsigned) { if (v.uval > max_val) max_val = v.uval; }
+                if (ty_is_unsigned(v.type)) { if (v.uval > max_val) max_val = v.uval; }
                 else if (v.ival >= 0) { if (v.uval > max_val) max_val = v.uval; }
                 else { has_negative = true; if (~v.uval > max_val) max_val = ~v.uval; }
             }
@@ -1839,6 +1868,7 @@ static Node *parse_primary(void) {
         // XXX: this is actually a postfix expression
         if (eat(T_LP)) {  // function call
             n->kind = N_CALL;
+            if (this_fn) this_fn->flags |= HAS_CALLS;
             Node **ap = &n->rhs;
             while (!at(T_RP)) {
                 if (n->nargs >= MAX_ARGS) error(NULL, "too many function arguments");
@@ -1927,7 +1957,9 @@ static Node *parse_unary(bool accept_cast) {
     case T_PLUS: case T_MINUS: case T_NOT:
     case T_BITNOT: n = new_node(N_UNARY); P++; n->lhs = parse_cast_expression(); return check_const_unary(n);
     case T_STAR:   n = new_node(N_DEREF); P++; n->lhs = parse_cast_expression(); return n;
-    case T_AMP:    n = new_node(N_ADDR);  P++; n->lhs = parse_cast_expression(); return n;
+    case T_AMP:    n = new_node(N_ADDR);  P++; n->lhs = parse_cast_expression();
+                   if (this_fn) this_fn->flags |= HAS_ADDR;
+                   return n;
     case T_INC:
     case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
     //case K_STATIC_ASSERT:
@@ -2333,7 +2365,7 @@ static bool eval_expr(Node *n, Value *vp) {
         if (!eval_expr(n->rhs, &v2)) return false;
         // XXX: should find common type
         // XXX: signed/unsigned arithmetics still not correct in case of different sizes
-        bool is_unsigned = v1.type->is_unsigned | v2.type->is_unsigned;
+        unsigned char is_unsigned = ty_is_unsigned(v1.type) | ty_is_unsigned(v2.type);
         switch (n->op) {
         case T_PLUS:    v1.uval += v2.uval; break;
         case T_MINUS:   v1.uval -= v2.uval; break;
@@ -2350,7 +2382,7 @@ static bool eval_expr(Node *n, Value *vp) {
         case T_SHL:     v1.uval <<= v2.uval & 63; break;
         case T_SHR:     v1.uval >>= (v2.uval &= 63);
                         // emulate signed right shift
-                        if (!v1.type->is_unsigned) v1.uval |= ~(((1UL << (63 - v2.uval)) & v1.uval) - 1); break;
+                        if (!ty_is_unsigned(v1.type)) v1.uval |= ~(((1UL << (63 - v2.uval)) & v1.uval) - 1); break;
         case T_LT:      if (is_unsigned) v1.uval = v1.uval <  v2.uval; else v1.uval = v1.ival <  v2.ival; break;
         case T_GT:      if (is_unsigned) v1.uval = v1.uval >  v2.uval; else v1.uval = v1.ival >  v2.ival; break;
         case T_LE:      if (is_unsigned) v1.uval = v1.uval <= v2.uval; else v1.uval = v1.ival <= v2.ival; break;
@@ -2391,14 +2423,6 @@ static bool eval_const_expr(Node *n, Value *vp, const char *context) {
 }
 
 // ---- top level ----
-struct Func {
-    atom_t name;
-    unsigned char nparams; bool is_variadic, used;
-    srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
-    Sym *params; Node *body; Type *rtype; Label *labels;
-    struct Func *next;
-};
-
 struct Label { atom_t name; bool used; Node *n; Label *next; };
 static Label *add_label(Node *n) {
     Label *lab = allocz(1, sizeof(Label));
@@ -2525,9 +2549,10 @@ static Node *parse_decl_stmt(void) {
             s = add_sym(name, nloc, t, flags);
             if (eat(T_ASSIGN)) {
                 Node *init = s->init = parse_init();
-                if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
+                if (t->kind == TY_ARRAY && !(t->flags & HAS_LEN) && init->kind == N_BLOCK) {
+                    t->flags |= HAS_LEN;
                     t->arr_len = node_length(init->rhs);
-                    t->arr_size = ty_size(base) * (unsigned)t->arr_len;
+                    t->arr_size = ty_size(base) * t->arr_len;
                 }
             }
         }
@@ -2570,9 +2595,10 @@ static void parse_toplevel(void) {
         if (flags & HAS_TYPEDEF) sym->kind = K_TYPEDEF;
         else if (eat(T_ASSIGN)) {
             Node *init = sym->init = parse_init();
-            if (t->kind == TY_ARRAY && t->arr_len < 0 && init->kind == N_BLOCK) {
+            if (t->kind == TY_ARRAY && !(t->flags & HAS_LEN) && init->kind == N_BLOCK) {
+                t->flags |= HAS_LEN;
                 t->arr_len = node_length(init->rhs);
-                t->arr_size = ty_size(base) * (unsigned)t->arr_len;
+                t->arr_size = ty_size(base) * t->arr_len;
             }
         }
     next:
@@ -2732,6 +2758,7 @@ static void emit(const char *fmt, ...) {
     putc('\n', fout);
 }
 static void emit_label(int lab) { if (lab <= 0) return; if (next_label) emit(" "); next_label = lab; }
+//#define hide_comment()  (*next_comment = '\0')
 static void emit_comment(const char *comment) {
     if (out_comments) {
         if (*next_comment) emit(" ");
@@ -2753,6 +2780,7 @@ static void emit_entry(atom_t name, unsigned char align, bool globl, bool skip) 
     if (*next_comment | next_label) emit(" "); // flush label and comments
     if (skip) putc('\n', fout);
     if (globl) emit(".globl %s", atom_str(name));
+    // should output ".type xxx,@function" for functions
     if (align > 1) emit(".align %d", align);
     fprintf(fout, "%s:\n", atom_str(name));
 }
@@ -2777,45 +2805,46 @@ static const char * const reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil
 
 static int label_id = 10;  // labels 1-9 reserved as local labels
 static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
+static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };
 
 static Type *gen_expr(Node *n, Register r, bool save_rax);
 static void gen_stmt(Node *n);
 static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsigned offset);
 
 static Type *promote_reg(Type *t, Register r) {
-    const char *mov = t->is_unsigned ? "movzx" : "movsx";
+    const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
     switch (ty_size(t)) {
     case 1: emit("%s %s, %s", mov, reg64[r], reg8[r]); break;
     case 2: emit("%s %s, %s", mov, reg64[r], reg16[r]); break;
-    case 4: if (t->is_unsigned) emit("mov %s, %s", reg32[r], reg32[r]);
-            else emit("movsx %s, %s", reg64[r], reg32[r]); break;
+    case 4: if (ty_is_unsigned(t)) emit("mov %s, %s", reg32[r], reg32[r]);
+            else emit("%s %s, %s", mov, reg64[r], reg32[r]); break;
     }
     return t;
 }
 static void make_reg_address(char *buf, size_t size, Register r, unsigned offset) {
-    if (offset) snprintf(buf, size, "%s + %u", reg64[r], offset);
-    else pstrcpy(buf, size, reg64[r]);
+    if (offset) snprintf(buf, size, "[%s + %u]", reg64[r], offset);
+    else snprintf(buf, size, "[%s]", reg64[r]);
 }
 static Type *load_ind(Type *t, Register r1, Register r2, unsigned offset) {   // r1 = [r2+offset] (size and type aware)
     char src[32]; make_reg_address(src, sizeof(src), r2, offset);
     const char *dest = reg64[r1];
-    const char *mov = t->is_unsigned ? "movzx" : "movsx";
+    const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
     switch (ty_size(t)) {
-    case 1: emit("%s %s, byte ptr [%s]", mov, dest, src); break;
-    case 2: emit("%s %s, word ptr [%s]", mov, dest, src); break;
-    case 4: if (t->is_unsigned) emit("mov %s, [%s]", reg32[r1], src);
-            else emit("movsx %s, dword ptr [%s]", dest, src); break;
-    default: emit("mov %s, [%s]", dest, src); break;
+    case 1:  emit("%s %s, byte ptr %s", mov, dest, src); break;
+    case 2:  emit("%s %s, word ptr %s", mov, dest, src); break;
+    case 4:  if (ty_is_unsigned(t)) emit("mov %s, %s", reg32[r1], src);
+             else emit("%s %s, dword ptr %s", mov, dest, src); break;
+    default: emit("mov %s, %s", dest, src); break;
     }
     return t;
 }
 static void store_ind(Type *t, Register r1, Register r2, unsigned offset) {    // [r1+offset] = r2 (size and type aware)
     char dest[32]; make_reg_address(dest, sizeof(dest), r1, offset);
     switch (ty_size(t)) {
-    case 1: emit("mov [%s], %s", dest, reg8[r2]); return;
-    case 2: emit("mov [%s], %s", dest, reg16[r2]); return;
-    case 4: emit("mov [%s], %s", dest, reg32[r2]); return;
-    default: emit("mov [%s], %s", dest, reg64[r2]); return;
+    case 1:  emit("mov %s, %s", dest, reg8[r2]);  return;
+    case 2:  emit("mov %s, %s", dest, reg16[r2]); return;
+    case 4:  emit("mov %s, %s", dest, reg32[r2]); return;
+    default: emit("mov %s, %s", dest, reg64[r2]); return;
     }
 }
 static void emit_reg(const char *instr, Register r) {
@@ -2837,7 +2866,7 @@ static void emit_cmp_imm(Register r, unsigned long val) {
     else emit_reg_reg("test", r, r);
 }
 static bool expr_less(Node *t1, Node *t2, Type *ct) {
-    if (ct->is_unsigned) return t1->uval < t2->uval;
+    if (ty_is_unsigned(ct)) return t1->uval < t2->uval;
     return t1->ival < t2->ival;
 }
 static bool same_expr(Node *lhs, Node *rhs) {
@@ -2859,19 +2888,42 @@ static bool is_range_test(Node *lhs, Node *rhs) {
     return false;
 }
 
+static const char *make_address(char *dest, size_t size, Sym *s, unsigned offset, srcloc_t loc) {
+    switch (s->kind) {
+    case 0:          if (offset) snprintf(dest, size, "[rip + %s + %u]", atom_str(s->name), offset);
+                     else        snprintf(dest, size, "[rip + %s]", atom_str(s->name));
+                     return dest;
+    case K_AUTO:                 snprintf(dest, size, "[rbp - %u]", s->offset - offset); return dest;
+    case K_STATIC:   if (offset) snprintf(dest, size, "[rip + %s_%u + %u]", atom_str(s->name), s->loc, offset);
+                     else        snprintf(dest, size, "[rip + %s_%u]", atom_str(s->name), s->loc);
+                     return dest;
+    case K_REGISTER: return reg64[s->reg];
+    case K_TYPEDEF:
+    case K_ENUM:
+    default:         warning(loc, "not an lvalue"); return NULL;
+    }
+}
+
+static bool check_const(Sym *s, srcloc_t loc) {
+    if (s->sflags & HAS_CONST) { warning(loc, "assignment to a const object"); return false; }
+    return true;
+}
+
 // leave the ADDRESS of an lvalue node in rax, return the lvalue type
 static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     switch (n->kind) {
     case N_VAR: {
         Sym *s = resolve_name(n);
-        // XXX: use `make_address`
+        if (s->kind) emit_comment(atom_str(n->name));
+        char buf[64]; const char *src = make_address(buf, sizeof(buf), s, offset, n->loc);
         switch (s->kind) {
-        case 0:         emit("lea %s, [rip + %s + %u]", reg64[r], atom_str(n->name), offset); break;
-        case K_AUTO:    emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg64[r], s->offset - offset); break;
-        case K_ENUM:    error(n, "enum constants are not lvalues"); break;
-        case K_STATIC:  break;  // TBI
-        case K_TYPEDEF: break;  // error
-        default:        break;
+        case 0:         emit("lea %s, %s", reg64[r], src); break;
+        case K_AUTO:
+        case K_STATIC:  emit("lea %s, %s", reg64[r], src); break;
+        case K_REGISTER:
+        case K_TYPEDEF:
+        case K_ENUM:
+        default:        error(n, "not an lvalue"); break;
         }
         return s->type;
     }
@@ -2903,7 +2955,7 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
 static Type *static_typeof(Node *n, Type *def) {
     switch (n->kind) {
     case N_NUM:    return n->type ? n->type : def;
-    case N_STR:    return array_of(ty_char(), (int)(atom_len(n->str) + 1), NULL);
+    case N_STR:    return array_of(ty_char(), true, atom_len(n->str) + 1, NULL);
     case N_CAST:   return n->type;
     case N_VAR:    { Sym *s = lookup(n->name, NULL); return s ? s->type : def; }
     case N_MEMBER: {
@@ -3113,7 +3165,7 @@ static TokenKind get_rop(TokenKind op) {
     }
 }
 
-static const char *get_jcc(TokenKind op, bool is_unsigned) {
+static const char *get_jcc(TokenKind op, unsigned char is_unsigned) {
     switch (op) {
     case T_EQ: return "je";
     case T_NE: return "jne";
@@ -3159,13 +3211,13 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
         break;
     case T_STAR:    emit("imul rax, rcx"); break;
     case T_SLASH:
-        if (ct->is_unsigned) {
+        if (ty_is_unsigned(ct)) {
             emit("xor rdx,rdx"); emit("div rcx"); break;
         } else {
             emit("cqo"); emit("idiv rcx"); break;
         }
     case T_PERCENT:
-        if (ct->is_unsigned) {
+        if (ty_is_unsigned(ct)) {
             emit("xor rdx,rdx"); emit("div rcx");
         } else {
             emit("cqo"); emit("idiv rcx");
@@ -3175,10 +3227,10 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
     case T_BITOR:   emit("or rax, rcx");  break;
     case T_BITXOR:  emit("xor rax, rcx"); break;
     case T_SHL:     emit("shl rax, cl");  return lt;   // count in cl (low byte of rcx)
-    case T_SHR:     if (lt->is_unsigned) emit("shr rax, cl"); else emit("sar rax, cl"); return lt;
+    case T_SHR:     if (ty_is_unsigned(lt)) emit("shr rax, cl"); else emit("sar rax, cl"); return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE: {
         emit("cmp rax, rcx");
-        emit("set%s al", get_jcc(op, ct->is_unsigned) + 1);
+        emit("set%s al", get_jcc(op, ty_is_unsigned(ct)) + 1);
         emit("movzx rax, al");
         return ty_int();
     }
@@ -3200,21 +3252,21 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
         if (val) emit_reg_imm("sub", r, val); break;
     case T_STAR:    emit_imul_imm(r, val); break;
     case T_SLASH:
-        if (ct->is_unsigned) emit_div_imm(r, val, save_rax);
+        if (ty_is_unsigned(ct)) emit_div_imm(r, val, save_rax);
         else emit_idiv_imm(r, val, save_rax);
         break;
     case T_PERCENT:
-        if (ct->is_unsigned) emit_mod_imm(r, val, save_rax);
+        if (ty_is_unsigned(ct)) emit_mod_imm(r, val, save_rax);
         else emit_imod_imm(r, val, save_rax);
         break;
     case T_AMP:     if (val + 1) emit_reg_imm("and", r, val); break;
     case T_BITOR:   if (val) emit_reg_imm("or", r, val);      break;
     case T_BITXOR:  if (val) emit_reg_imm("xor", r, val);     break;
     case T_SHL:     if (val &= 63) emit_reg_imm("shl", r, val); return lt;
-    case T_SHR:     if (val &= 63) { if (lt->is_unsigned) emit_reg_imm("shr", r, val); else emit_reg_imm("sar", r, val); } return lt;
+    case T_SHR:     if (val &= 63) { if (ty_is_unsigned(lt)) emit_reg_imm("shr", r, val); else emit_reg_imm("sar", r, val); } return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE:
         emit_cmp_imm(r, val);
-        emit("set%s %s", get_jcc(op, ct->is_unsigned) + 1, reg8[r]);
+        emit("set%s %s", get_jcc(op, ty_is_unsigned(ct)) + 1, reg8[r]);
         emit("movzx %s, %s", reg64[r], reg8[r]);
         break;
     default: error(n, "bad binary operator '%s'", token_name[op]);
@@ -3226,84 +3278,73 @@ static Type *load_var(Node *n, Register r) {
     const char *reg = reg64[r];
     Sym *s = resolve_name(n);
     Type *t = s->type;
-    if (s->flags & CONST_VAL) { emit_comment(atom_str(n->name)); emit("mov %s, %ld", reg, s->ival); return t; }
+    if (s->kind) emit_comment(atom_str(n->name));
+    if (s->flags & CONST_VAL) { emit("mov %s, %ld", reg, s->ival); return t; }
+    char buf[64]; const char *src = make_address(buf, sizeof(buf), s, 0, n->loc);
     switch (t->kind) {
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
         switch (s->kind) {
-        case 0:        emit("lea %s, [rip + %s]", reg, atom_str(n->name)); break;
-        case K_AUTO:   emit_comment(atom_str(n->name)); emit("lea %s, [rbp - %u]", reg, s->offset); break;
-        case K_STATIC: break;  // TBI
-        case K_TYPEDEF: break;  // error
-        default:       break;
+        case 0:          emit("lea %s, %s", reg, src); break;
+        case K_AUTO:
+        case K_STATIC:   emit("lea %s, %s", reg, src); break;
+        case K_REGISTER:
+        case K_TYPEDEF:
+        case K_ENUM:
+        default:         break;  // error
         }
         break;
     default: {
-        const char *mov = t->is_unsigned ? "movzx" : "movsx";
+        const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
         switch (s->kind) {
         case 0:
-            switch (ty_size(t)) {
-            case 1: emit("%s %s, byte ptr [rip + %s]", mov, reg, atom_str(n->name)); break;
-            case 2: emit("%s %s, word ptr [rip + %s]", mov, reg, atom_str(n->name)); break;
-            case 4: if (t->is_unsigned) emit("mov %s, [rip + %s]", reg32[r], atom_str(n->name));
-                else emit("movsx %s, dword ptr [rip + %s]", reg, atom_str(n->name)); break;
-            default: emit("mov %s, [rip + %s]", reg, atom_str(n->name)); break;
-            }
-            break;
         case K_AUTO:
-            emit_comment(atom_str(n->name));
+        case K_STATIC:
             switch (ty_size(t)) {
-            case 1: emit("%s %s, byte ptr [rbp - %u]", mov, reg, s->offset); break;
-            case 2: emit("%s %s, word ptr [rbp - %u]", mov, reg, s->offset); break;
-            case 4: if (t->is_unsigned) emit("mov %s, [rbp - %u]", reg32[r], s->offset);
-                else emit("movsx %s, dword ptr [rbp - %u]", reg, s->offset); break;
-            default: emit("mov %s, [rbp - %u]", reg, s->offset); break;
+            case 1:  emit("%s %s, byte ptr %s", mov, reg, src); break;
+            case 2:  emit("%s %s, word ptr %s", mov, reg, src); break;
+            case 4:  if (ty_is_unsigned(t)) emit("mov %s, %s", reg32[r], src);
+                     else emit("%s %s, dword ptr %s", mov, reg, src); break;
+            default: emit("mov %s, %s", reg, src); break;
             }
             break;
-        case K_ENUM:   break;  // never should be resolved as a constant already
-        case K_STATIC: break;  // TBI
-        case K_TYPEDEF: break;  // error
-        default:       break;
+        case K_REGISTER:
+            switch (ty_size(t)) {
+            case 1:  emit("%s %s, %s", mov, reg, reg8[s->reg]); break;
+            case 2:  emit("%s %s, %s", mov, reg, reg16[s->reg]); break;
+            case 4:  if (ty_is_unsigned(t)) emit("mov %s, %s", reg32[r], reg32[s->reg]);
+                     else emit("%s %s, %s", mov, reg, reg32[s->reg]); break;
+            default: emit("mov %s, %s", reg, src); break;
+            }
+            break;
+        case K_TYPEDEF:  // error
+        case K_ENUM:     // never here, should be resolved as a constant already
+        default:     break;
         }
         break;
     }}
     return t;
 }
 
-static char *make_address(char *dest, size_t size, Sym *s, unsigned offset, srcloc_t loc) {
-    size_t len;
-    switch (s->kind) {
-    case 0:         len = (size_t)snprintf(dest, size, "rip + %s", atom_str(s->name)); break;
-    case K_AUTO:    snprintf(dest, size, "rbp - %u", s->offset - offset); return dest;
-    case K_STATIC:  len = (size_t)snprintf(dest, size, "rip + %s_%u", atom_str(s->name), s->loc); break;
-    case K_ENUM:
-    case K_TYPEDEF:
-    default:        warning(loc, "not an lvalue"); return NULL;
-    }
-    if (offset && len < size) snprintf(dest + len, size - len, " + %u", offset);
-    return dest;
-}
-
-static bool check_const(Sym *s, srcloc_t loc) {
-    if (s->sflags & HAS_CONST) { warning(loc, "assignment to a const object"); return false; }
-    return true;
-}
-
 static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register r) {
-    char dest[64];
-    if (!make_address(dest, sizeof(dest), s, offset, loc)) return t;
+    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    if (!dest) return t;
     if (!check_const(s, loc)) return t;
     switch (t->kind) {
-    case TY_ARRAY: case TY_STRUCT: case TY_UNION:
+    case TY_ARRAY:
+        warning(loc, "not an lvalue");
+        break;
+    case TY_STRUCT: case TY_UNION:
         warning(loc, "structure assignment not supported yet");
         break;
     default:
-        if (s->kind == K_AUTO) emit_comment(atom_str(s->name));
+        if (s->kind) emit_comment(atom_str(s->name));
         // XXX: assigning to structures with a different size should be supported
+        if (s->kind == K_REGISTER) { emit("mov %s, %s", dest, reg64[r]); break; }
         switch (ty_size(t)) {
-        case 1: emit("mov [%s], %s", dest, reg8[r]); break;
-        case 2: emit("mov [%s], %s", dest, reg16[r]); break;
-        case 4: emit("mov [%s], %s", dest, reg32[r]); break;
-        case 8: emit("mov [%s], %s", dest, reg64[r]); break;
+        case 1: emit("mov %s, %s", dest, reg8[r]);  break;
+        case 2: emit("mov %s, %s", dest, reg16[r]); break;
+        case 4: emit("mov %s, %s", dest, reg32[r]); break;
+        case 8: emit("mov %s, %s", dest, reg64[r]); break;
         default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
         }
         break;
@@ -3311,12 +3352,29 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
     return t;
 }
 
+static void store_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
+    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    switch (size) {
+    case 1:  emit("mov byte ptr %s, 0", dest); return;
+    case 2:  emit("mov word ptr %s, 0", dest); return;
+    case 4:  emit("mov dword ptr %s, 0", dest); return;
+    case 8:  emit("mov qword ptr %s, 0", dest); return;
+    case 16: emit("movups xmmword ptr %s, xmm0", dest); return;
+    default: return;
+    }
+}
+
 static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
-    char dest[64];
-    if (!make_address(dest, sizeof(dest), s, 0, loc)) return;
+    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    if (!dest) return;
     if (!check_const(s, loc)) return;
+    if (s->kind == K_REGISTER) {
+        // should deal with offset and size
+        emit_reg_reg("xor", s->reg, s->reg);
+        return;
+    }
     if (size > 256) {
-        emit("lea %s, [%s + %u]", reg64[ARGREG[0]], dest, offset);
+        emit("lea %s, %s", reg64[ARGREG[0]], dest);
         emit("sub %s, %s", reg64[ARGREG[1]], reg64[ARGREG[1]]);
         emit("mov %s, %u", reg64[ARGREG[2]], size);
         emit("call memset");
@@ -3327,37 +3385,41 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
     if (size >= 16) {
         emit("pxor xmm0, xmm0");
         while (size >= 16) {
-            emit("movups xmmword ptr [%s + %u], xmm0", dest, offset); offset += 16; size -= 16;
+            store_zero(s, loc, offset, 16); offset += 16; size -= 16;
         }
         tail = size;
     }
-    if (tail > 8)  { emit("movups xmmword ptr [%s + %u], xmm0", dest, offset + size - 16); return; }
-    if (size >= 8) { emit("mov qword ptr [%s + %u], 0", dest, offset); offset += 8; tail = size -= 8; }
-    if (tail > 4)  { emit("mov qword ptr [%s + %u], 0", dest, offset + size - 8); return; }
-    if (size >= 4) { emit("mov dword ptr [%s + %u], 0", dest, offset); offset += 4; tail = size -= 4; }
-    if (tail > 2)  { emit("mov dword ptr [%s + %u], 0", dest, offset + size - 4); return; }
-    if (size >= 2) { emit("mov word ptr [%s + %u], 0", dest, offset); offset += 2; size -= 2; }
-    if (size)      { emit("mov byte ptr [%s + %u], 0", dest, offset); return; }
+    if (tail > 8)  { store_zero(s, loc, offset + size - 16, 16); return; }
+    if (size >= 8) { store_zero(s, loc, offset, 8); offset += 8; tail = size -= 8; }
+    if (tail > 4)  { store_zero(s, loc, offset + size - 8, 8); return; }
+    if (size >= 4) { store_zero(s, loc, offset, 4); offset += 4; tail = size -= 4; }
+    if (tail > 2)  { store_zero(s, loc, offset + size - 4, 4); return; }
+    if (size >= 2) { store_zero(s, loc, offset, 2); offset += 2; size -= 2; }
+    if (size)      { store_zero(s, loc, offset, 1); return; }
 }
 
 static Type *store_var_val(Sym *s, srcloc_t loc, unsigned offset, Type *t, unsigned long uval) {
-    char dest[64];
-    if (!make_address(dest, sizeof(dest), s, offset, loc)) return t;
+    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    if (!dest) return t;
     if (!check_const(s, loc)) return t;
     long lval = (long)uval;
+    if (s->kind == K_REGISTER) {
+        // should deal with offset and size?
+        emit("mov %s, %ld", dest, lval);
+    }
     if (lval != (int)uval) {
         emit("mov rcx, %ld", lval);
         return store_var(s, loc, offset, t, RCX);
     }
     unsigned size = ty_size(t);
     if (!lval) { store_var_zero(s, loc, offset, size); return t; }
-    if (s->kind == K_AUTO) emit_comment(atom_str(s->name));
+    if (s->kind) emit_comment(atom_str(s->name));
     // XXX: storing to structures with a different size should be supported
     switch (size) {
-    case 8: emit("mov qword ptr [%s], %ld", dest, lval); break;
-    case 4: emit("mov dword ptr [%s], %ld", dest, lval); break;
-    case 2: emit("mov word ptr [%s], %ld", dest, lval); break;
-    case 1: emit("mov byte ptr [%s], %ld", dest, lval); break;
+    case 8:  emit("mov qword ptr %s, %ld", dest, lval); break;
+    case 4:  emit("mov dword ptr %s, %ld", dest, lval); break;
+    case 2:  emit("mov word ptr %s, %ld", dest, lval);  break;
+    case 1:  emit("mov byte ptr %s, %ld", dest, lval);  break;
     default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
     }
     return t;
@@ -3487,12 +3549,12 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_
         }
         Type *ct = common_type(promoted_type(lt), rt);
         if (lab_false) {
-            emit_jmp(n, get_jcc(get_rop(n->op), ct->is_unsigned), lab_false);
+            emit_jmp(n, get_jcc(get_rop(n->op), ty_is_unsigned(ct)), lab_false);
             if (!lab_true) return true;
             emit_jmp(n, "jmp", lab_true);
             return false;
         } else {
-            emit_jmp(n, get_jcc(n->op, ct->is_unsigned), lab_true);
+            emit_jmp(n, get_jcc(n->op, ty_is_unsigned(ct)), lab_true);
             return true;
         }
     }
@@ -3662,10 +3724,11 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             emit_reg_imm("sub", r, lhs->rhs->uval);
             emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
             emit("setbe %s", reg8[r]);
-            emit("movsx %s, %s", reg, reg8[r]);
+            emit("movzx %s, %s", reg, reg8[r]);
             return ty_int();
         }
         int lab = label_id++;
+        // should optimize a && b && c...
         gen_expr(lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jz", lab);
         gen_expr(rhs, r, save_rax); emit_reg_reg("test", r, r);
         emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
@@ -3673,6 +3736,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_LOGOR: {
         int lab = label_id++;
+        // should optimize a || b || c...
         gen_expr(n->lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jnz", lab);
         gen_expr(n->rhs, r, save_rax); emit_reg_reg("test", r, r);
         emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
@@ -3753,7 +3817,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             if (all_simple_load(n)) {
                 int i = 0;
                 for (Node *arg = n->rhs->next; arg; arg = arg->next, i++) {
-                    gen_expr(arg, ARGREG[i], false);
+                    gen_expr(arg, SYSREG[i], false);
                 }
                 gen_expr(n->rhs, RAX, false);
             } else {
@@ -3762,7 +3826,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                     gen_expr(arg, RAX, false); emit("push rax");
                 }
                 gen_expr(n->rhs, RAX, false);
-                while (i-- > 0) emit("pop %s", reg64[ARGREG[i]]);
+                while (i-- > 0) emit("pop %s", reg64[SYSREG[i]]);
             }
             emit("syscall");
             emit("test rax, rax");
@@ -3858,16 +3922,18 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
 
 static void gen_asm(Node *n) {
     // split decoded asm text on newlines and ';' — emit each instruction line
-    const char *p = atom_str(n->str), *q = p;
+    const char *p = atom_str(n->str);
+    emit(" ");
     for (;;) {
         char c;
         switch (c = *p++) {
         case '\n': case ';': case 0:
-            q += skip_blanks(q);  // trim leading spaces
-            int len = (int)(p - q - 1);
-            if (len) emit("%.*s", len, q);
-            q = p;
-            if (!c) break;
+            fputc('\n', fout);
+            if (c) continue;
+            return;
+        default:
+            fputc(c, fout);
+            break;
         }
     }
 }
@@ -3991,7 +4057,7 @@ static void gen_switch(Node *n) {
     if (!n->lhs) { warning(n->loc, "empty switch"); return; }
     int def, end, dest;
     bool sorted = check_cases(n->lhs, ct, &def, &end);
-    bool is_unsigned = ct->is_unsigned;
+    unsigned char is_unsigned = ty_is_unsigned(ct);
     unsigned long min_val = is_unsigned ? 0 : (unsigned long)LONG_MIN;
     for (Node *e = n->lhs; e; e = e->lhs) {
         if (e->kind == N_DEFAULT) continue;
@@ -4172,20 +4238,28 @@ static void gen_stmt(Node *n) {
 }
 
 static void gen_func(Func *fn) {
-    if (!fn->body) return;  // external function prototype
+    Node *body = fn->body;
+    if (!body) return;  // external function prototype
     this_fn = fn;
     for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->lab = label_id++; }
     if (fn->is_variadic) {
         // reserve extra space to save registers for variadic functions
-        // only save registers beyond the 'last' named parameter
+        // only save registers beyond the last named parameter
         fn->frame_size += (6 - fn->nparams) * 8;
     }
-    unsigned int frame_size = fn->frame_size;
-    fn->va_off = frame_size;
 
     emit_entry(fn->name, func_align, !(fn->decl_flags & HAS_STATIC), true);
+
+    if (body->rhs->kind == N_ASM && !body->rhs->next) {
+        // no frame for functions written in assembly
+        gen_stmt(body);
+        emit("ret");
+        return;
+    }
     emit("push rbp");
     emit("mov rbp, rsp");
+    unsigned int frame_size = fn->frame_size;
+    fn->va_off = frame_size;
     unsigned int fs = (frame_size + 15) & ~15U;
     if (fs) emit("sub rsp, %u", fs);
     unsigned int i = 0;
@@ -4195,22 +4269,19 @@ static void gen_func(Func *fn) {
     }
     if (fn->is_variadic) {
         // spill remaining arg registers so va_arg can walk them
-        // XXX: should only spill arg registers beyond the 'last' named parameter
         for (unsigned j = i; j < 6; j++) {
             emit("mov [rbp - %u], %s", fn->va_off - (j - i) * 8, reg64[ARGREG[j]]);
         }
     }
-    gen_stmt(fn->body);
-    if (has_flow(fn->body)) {
+    gen_stmt(body);
+    if (has_flow(body)) {
         if (fn->name == ID_MAIN) {
             emit("xor rax, rax");   // main returns 0 by default
         } else
         if (fn->rtype != ty_void()) {
-            // should flag non void functions with out flow
-            // disabled for now because loops and switches are not full analysed
             warning(fn->endloc, "function '%s': missing return statement", atom_str(fn->name));
         }
-        emit("leave"); emit("ret"); // safety epilogue
+        emit("leave"); emit("ret");
     }
 }
 
@@ -4292,7 +4363,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
                 Node *e = init->rhs;
                 unsigned n = check_zero_init(e);
                 unsigned off = 0;
-                for (int i = 0; i < t->arr_len; i++, off += elem_size(t)) {
+                for (unsigned i = 0; i < t->arr_len; i++, off += elem_size(t)) {
                     if (!n--) {
                         gen_init_zero(s, offset + off, ty_size(t) - off);
                         break;
@@ -4374,7 +4445,7 @@ static int output_token(FILE *fp, Token *t) {
             char *p = buf + 68; *--p = '\0';
             unsigned long val = t->uval;
             unsigned char base = t->base;
-            if (t->is_unsigned) *--p = 'U';
+            if (ty_is_unsigned(t)) *--p = 'U';
             if (t->is_long) *--p = 'L';
             do { *--p = "0123456789abcdef"[val % base]; } while (val /= base);
             switch (base) {
@@ -4500,7 +4571,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
 
     for (Sym *s = globals; s; s = s->next_decl) {
         Func *fn = s->fn;
-        if (fn && fn->used && fn->body) gen_func(fn);
+        if (fn && fn->used) gen_func(fn);
     }
 
     // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
