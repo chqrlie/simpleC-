@@ -1530,7 +1530,8 @@ struct Func {
     atom_t name;
 #define HAS_CALLS  1  // function calls other functions
 #define HAS_ADDR   2  // function uses addressof operator `&`
-    unsigned char nparams; bool is_variadic, used, flags;
+#define HAS_FRAME  4  // function has a standard frame
+    unsigned char nparams, flags; bool is_variadic, used;
     srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
     Sym *params; Node *body; Type *rtype; Label *labels;
     struct Func *next;
@@ -2804,8 +2805,9 @@ static const char * const reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", 
 static const char * const reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
 
 static int label_id = 10;  // labels 1-9 reserved as local labels
-static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };
-static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };
+static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };   // function arguments
+static Register const ARGREG1[6] = { RDI, RSI, R11, R10, R8, R9 };  // registers available for arguments and temporaries
+static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };   // syscall arguments
 
 static Type *gen_expr(Node *n, Register r, bool save_rax);
 static void gen_stmt(Node *n);
@@ -2917,13 +2919,13 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
         if (s->kind) emit_comment(atom_str(n->name));
         char buf[64]; const char *src = make_address(buf, sizeof(buf), s, offset, n->loc);
         switch (s->kind) {
-        case 0:         emit("lea %s, %s", reg64[r], src); break;
+        case 0:          emit("lea %s, %s", reg64[r], src); break;
         case K_AUTO:
-        case K_STATIC:  emit("lea %s, %s", reg64[r], src); break;
+        case K_STATIC:   emit("lea %s, %s", reg64[r], src); break;
         case K_REGISTER:
         case K_TYPEDEF:
         case K_ENUM:
-        default:        error(n, "not an lvalue"); break;
+        default:         error(n, "not an lvalue"); break;
         }
         return s->type;
     }
@@ -3287,7 +3289,7 @@ static Type *load_var(Node *n, Register r) {
         case 0:          emit("lea %s, %s", reg, src); break;
         case K_AUTO:
         case K_STATIC:   emit("lea %s, %s", reg, src); break;
-        case K_REGISTER:
+        case K_REGISTER: error(n, "invalid type for a register variable"); break;
         case K_TYPEDEF:
         case K_ENUM:
         default:         break;  // error
@@ -3575,6 +3577,26 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_
     }
 }
 
+static void gen_inc(Type *lt, TokenKind op, const char *dest) {
+    const char *prefix = "";
+    if (*dest == '[') {
+        switch (ty_size(lt)) {
+        case 1: prefix = "byte ptr "; break;
+        case 2: prefix = "word ptr "; break;
+        case 4: prefix = "dword ptr "; break;
+        case 8: prefix = "qword ptr "; break;
+        }
+    }
+    unsigned int step = is_ptrish(lt) ? elem_size(lt) : 1;
+    if (step == 1) {
+        const char *instr = op == T_INC ? "inc" : "dec";
+        emit("%s %s%s", instr, prefix, dest);
+    } else {
+        const char *instr = op == T_INC ? "add" : "sub";
+        emit("%s %s%s, %u", instr, prefix, dest, step);
+    }
+}
+
 static Type *gen_expr(Node *n, Register r, bool save_rax) {
     const char *reg = reg64[r];
     if (n->flags & CONST_VAL) goto has_num;
@@ -3637,11 +3659,11 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             lt = gen_addr(lhs, RCX, true, 0);
             store_ind(lt, RCX, RAX, 0);
         } else {
-            if (lhs->kind == N_VAR && r == RAX) {
+            if (save_rax) emit("push rax");
+            if (lhs->kind == N_VAR) {
                 lt = gen_expr(lhs, RAX, false);
             } else {
-                if (save_rax) emit("push rax");
-                lt = gen_addr(lhs, RAX, save_rax, 0);
+                lt = gen_addr(lhs, RAX, false, 0);
                 emit("push rax");
                 load_ind(lt, RAX, RAX, 0);
             }
@@ -3652,7 +3674,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 Type *rt = gen_expr(n->rhs, RCX, true);
                 gen_bin(n, op, lt, rt);
             }
-            if (lhs->kind == N_VAR && r == RAX) {
+            if (lhs->kind == N_VAR) {
                 store_var(lhs->decl, n->loc, 0, lt, RAX);
             } else {
                 emit("pop rcx");
@@ -3666,36 +3688,23 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_POST:                                   // x++ / x--  (returns old value)
     case N_PRE: {                                  // ++x / --x  (returns new value)
-        // XXX: should optimize if address is simple
-        if (save_rax) emit("push rax");
-        Type *lt = gen_addr(n->lhs, RCX, false, 0);
-        unsigned int step = is_ptrish(lt) ? elem_size(lt) : 1;
-        const char *add = n->op == T_INC ? "add" : "sub";
-        const char *inc = n->op == T_INC ? "inc" : "dec";
-        if (n->flags & DISCARD) {
-            const char *prefix = "";
-            switch (ty_size(lt)) {
-            case 1: prefix = "byte ptr "; break;
-            case 2: prefix = "word ptr "; break;
-            case 4: prefix = "dword ptr "; break;
-            case 8: prefix = "qword ptr "; break;
-            }
-            if (step == 1) emit("%s %s[rcx]", inc, prefix);
-            else emit("%s %s[rcx], %u", add, prefix, step);
-        } else
-        if (n->kind == N_PRE) {
-            load_ind(lt, RAX, RCX, 0);             // rax = old
-            if (step == 1) emit("%s rax", inc);
-            else emit("%s rax, %u", add, step);
-            store_ind(lt, RCX, RAX, 0);            // *&x = new (rax)
-        } else {
-            load_ind(lt, RAX, RCX, 0);             // rax = old
-            if (n->op == T_INC) emit("lea rdx, [rax + %u]", step);
-            else emit("lea rdx, [rax - %u]", step);
-            store_ind(lt, RCX, RDX, 0);
+        Node *lhs = n->lhs;
+        char buf[64]; const char *dest = "[rdx]";
+        if (lhs->kind == N_VAR) {
+            Sym *s = resolve_name(lhs);
+            Type *lt = s->type;
+            dest = make_address(buf, sizeof(buf), s, 0, n->loc);
+            if (!dest) return lt;
+            if (!check_const(s, n->loc)) return lt;
+            if (n->kind == N_PRE)  gen_inc(lt, n->op, dest);
+            if (!(n->flags & DISCARD)) load_var(lhs, r);
+            if (n->kind == N_POST) gen_inc(lt, n->op, dest);
+            return lt;
         }
-        if (r != RAX) emit("mov %s, rax", reg);
-        if (save_rax) emit("pop rax");
+        Type *lt = gen_addr(n->lhs, RDX, save_rax, 0);
+        if (n->kind == N_PRE)  gen_inc(lt, n->op, dest);
+        if (!(n->flags & DISCARD)) load_ind(lt, r, RDX, 0);
+        if (n->kind == N_POST) gen_inc(lt, n->op, dest);
         return lt;                                 // rax = new value
     }
     case N_TERNARY: {
@@ -4142,7 +4151,8 @@ static void gen_stmt(Node *n) {
     case N_EXPR:   n->lhs->flags |= DISCARD; gen_expr(n->lhs, RAX, false); break;
     case N_RETURN:
         if (n->lhs) gen_expr(n->lhs, RAX, false);
-        emit("leave"); emit("ret");
+        if (this_fn && (this_fn->flags & HAS_FRAME)) emit("leave");
+        emit("ret");
         break;
     case N_IF: {
         Node *cond = n->cond;
@@ -4247,25 +4257,50 @@ static void gen_func(Func *fn) {
         // only save registers beyond the last named parameter
         fn->frame_size += (6 - fn->nparams) * 8;
     }
+    fn->flags |= HAS_FRAME;
 
     emit_entry(fn->name, func_align, !(fn->decl_flags & HAS_STATIC), true);
 
     if (body->rhs->kind == N_ASM && !body->rhs->next) {
         // no frame for functions written in assembly
+        fn->flags &= ~HAS_FRAME;
         gen_stmt(body);
         emit("ret");
         return;
     }
-    emit("push rbp");
-    emit("mov rbp, rsp");
-    unsigned int frame_size = fn->frame_size;
-    fn->va_off = frame_size;
-    unsigned int fs = (frame_size + 15) & ~15U;
-    if (fs) emit("sub rsp, %u", fs);
+
+    if (!fn->is_variadic && !(fn->flags & (HAS_CALLS | HAS_ADDR))) {
+        // simple function: keep the arguments in appropriate registers
+        unsigned i = 0;
+        for (Sym *s = fn->params; s && i < 6; s = s->next_decl, i++) {
+            s->kind = K_REGISTER;
+            s->reg = ARGREG1[i];
+            s->offset = 0;
+        }
+        if (i == fn->nparams && fn->frame_size == i * 8) {
+            fn->flags &= ~HAS_FRAME;
+        }
+    }
+
+    if (fn->flags & HAS_FRAME) {
+        emit("push rbp");
+        emit("mov rbp, rsp");
+        unsigned int frame_size = fn->frame_size;
+        fn->va_off = frame_size;
+        unsigned int fs = (frame_size + 15) & ~15U;
+        if (fs) emit("sub rsp, %u", fs);
+    }
     unsigned int i = 0;
     for (Sym *s = fn->params; s && i < 6; s = s->next_decl, i++) {
-        emit_comment(atom_str(s->name));
-        emit("mov [rbp - %u], %s", s->offset, reg64[ARGREG[i]]);
+        if (s->kind == K_REGISTER) {
+            if (s->reg != ARGREG[i]) {
+                emit_comment(atom_str(s->name));
+                emit_reg_reg("mov", s->reg, ARGREG[i]);
+            }
+        } else {
+            emit_comment(atom_str(s->name));
+            emit("mov [rbp - %u], %s", s->offset, reg64[ARGREG[i]]);
+        }
     }
     if (fn->is_variadic) {
         // spill remaining arg registers so va_arg can walk them
@@ -4281,7 +4316,8 @@ static void gen_func(Func *fn) {
         if (fn->rtype != ty_void()) {
             warning(fn->endloc, "function '%s': missing return statement", atom_str(fn->name));
         }
-        emit("leave"); emit("ret");
+        if (fn->flags & HAS_FRAME) emit("leave");
+        emit("ret");
     }
 }
 
