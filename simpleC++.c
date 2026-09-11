@@ -1301,9 +1301,11 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
 typedef enum NodeKind enum_type(unsigned char) {
     N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP,
     N_COMMA, N_UNARY, N_POST, N_PRE, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
-    N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
-    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY,
-    N_MEMBER, N_SIZEOF, N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
+    N_MEMBER, N_SIZEOF, N_TERNARY,
+    N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
+    N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH,
+    N_CASE, N_DEFAULT, N_LABEL,
+    N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM,
 } NodeKind;
 
 struct Node {
@@ -2674,43 +2676,51 @@ static void check_used(Node *n) {
     if (!n) return;
     // should test if node is elided
     switch (n->kind) {
-    case N_DECL:  for (Sym *s = n->decl; s; s = s->next_decl) check_used(s->init); break;
-    case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
-    case N_IF: case N_TERNARY:
-        check_used(n->cond); check_used(n->lhs); check_used(n->rhs); break;
-    case N_WHILE: case N_DOWHILE:
-        check_used(n->cond); check_used(n->lhs); break;
-    case N_FOR:
-        check_used(n->finit); check_used(n->cond); check_used(n->rhs);
-        check_used(n->lhs); break;
+    case N_VAR: return; // XXX: should look up symbol and set used bit
     case N_UNARY: case N_POST: case N_PRE: case N_CAST:
-    case N_DEREF: case N_ADDR: case N_RETURN: case N_EXPR: case N_MEMBER:
-        check_used(n->lhs); break;
+    case N_DEREF: case N_ADDR: case N_EXPR: case N_MEMBER: case N_RETURN:
+        check_used(n->lhs); return;
+    case N_TERNARY:
+        check_used(n->cond); fallthrough;
     case N_ASSIGN: case N_BIN: case N_CMP: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
-        check_used(n->lhs); check_used(n->rhs); break;
+        check_used(n->lhs); check_used(n->rhs); return;
     case N_CALL:
-        if (check_rewrite(n)) { check_used(n); break; }
+        if (check_rewrite(n)) { check_used(n); return; }
         if (!IS_BUILTIN(n->name)) check_used_func(n->name);
-        for (Node *e = n->rhs; e; e = e->next) check_used(e); break;
-    case N_SWITCH: check_used(n->cond); check_used(n->rhs); break;
-    case N_VAR: break; // XXX: should look up symbol and set used bit
-    default: break;
+        fallthrough;
+    case N_BLOCK:
+        for (Node *e = n->rhs; e; e = e->next) check_used(e); return;
+    case N_DECL:
+        for (Sym *s = n->decl; s; s = s->next_decl) check_used(s->init); return;
+    case N_FOR:
+        check_used(n->finit); fallthrough;
+    case N_IF: case N_WHILE: case N_DOWHILE:
+        check_used(n->cond);
+        check_used(n->lhs);
+        check_used(n->rhs); return;
+    case N_SWITCH:
+        check_used(n->cond); check_used(n->rhs); return;
+    default: return;
     }
 }
 
 static bool has_flow(Node *n) {
     if (!n) return true;
     switch (n->kind) {
-    case N_GOTO:
-    case N_RETURN: return false;
-    case N_BLOCK:  return has_flow(node_last(n->rhs));
-    case N_IF:     return has_flow(n->lhs) || has_flow(n->rhs);
-    case N_FOR:    return n->cond || (n->flags & HAS_BREAK);
-    case N_SWITCH: if ((n->flags & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
-                   return has_flow(n->rhs);
-    //case N_WHILE: case N_DOWHILE: // XXX: check constant loop condition and break
-    //case N_CALL:    // XXX: check for _Noreturn attribute
-    default:       return true;
+    case N_BLOCK:   return has_flow(node_last(n->rhs));
+    case N_IF:      return has_flow(n->lhs) || has_flow(n->rhs);
+    case N_WHILE:
+    case N_FOR:
+    case N_DOWHILE: if (n->flags & HAS_BREAK) return true;
+                    return n->cond && !((n->cond->flags & CONST_VAL) && n->cond->uval);
+    case N_SWITCH:  if ((n->flags & (HAS_BREAK | HAS_DEFAULT)) != HAS_DEFAULT) return true;
+                    return has_flow(n->rhs);
+    case N_RETURN:
+    case N_BREAK:
+    case N_CONTINUE:
+    case N_GOTO:    return false;
+    //case N_EXPR:  // XXX: check for _Noreturn attribute if N_CALL
+    default:        return true;
     }
 }
 
@@ -2819,8 +2829,12 @@ static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };   // function 
 static Register const ARGREG1[6] = { RDI, RSI, R11, R10, R8, R9 };  // registers available for arguments and temporaries
 static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };   // syscall arguments
 
+typedef unsigned long Flow;
+#define FLOW_NONE  0
+#define FLOW_RUN   1
+
 static Type *gen_expr(Node *n, Register r, bool save_rax);
-static void gen_stmt(Node *n);
+static Flow gen_stmt(Node *n);
 static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsigned offset);
 
 static void emit_reg(const char *instr, Register r) {
@@ -3514,7 +3528,7 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab, bool truth) {
     //case N_ADDR:    // always true? except maybe for &*NULL
     istrue:
         if (lab) {
-            if (truth) emit_jmp(n, "jmp", lab); return false;
+            if (truth) { emit_jmp(n, "jmp", lab); return false; }
             return true;
         }
         emit_mov_reg_imm(r, truth);
@@ -3980,17 +3994,17 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
 }
 
-static bool gen_asm(Node *n) {
+static Flow gen_asm(Node *n) {
     // split decoded asm text on newlines and ';' — emit each instruction line
     emit(" ");
-    bool flow = true;
+    Flow flow = FLOW_RUN;
     for (const char *p = atom_str(n->str); *p; p++) {
         char c;
         if (isdigit(c = *p) && p[1] == ':') { emit_label(c - '0'); p += 2; }
         p += skip_blanks(p);
         const char *q = p;
         while ((c = *p) && c != '\n' && c != ';') p++;
-        flow = !strstart(q, "jmp", NULL) && !strstart(q, "ret", NULL);
+        flow = (strstart(q, "jmp", NULL) || strstart(q, "ret", NULL)) ? FLOW_NONE : FLOW_RUN;
         emit("%.*s", (int)(p - q), q);
         if (!c) break;
     }
@@ -4016,7 +4030,7 @@ static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
     // evaluate and check case expressions
     Node *last_expr = NULL;
     bool sorted = true;
-    for (Node *e = n; e; e = e->lhs) {
+    for (Node *e = n->lhs; e; e = e->lhs) {
         Node *en = e->next;  // next statement in switch block
         if (e->kind == N_DEFAULT) {
             for (;; en = en->next) {
@@ -4058,8 +4072,8 @@ static bool check_cases(Node *n, Type *ct, int *defp, int *endp) {
 
     // allocate labels
     int end = 0, def = 0;
-    for (Node *e = n; e; e = e->lhs) {
-        if (e->lab < 0) continue;
+    for (Node *e = n->lhs; e; e = e->lhs) {
+        if (e->lab < 0) continue; // DEST_NONE or DEST_BREAK
         e->lab = label_id++;
         if (e->kind == N_DEFAULT) def = e->lab;
     }
@@ -4091,8 +4105,9 @@ static void gen_case_comment(Node *n) {
     emit_comment(buf);
 }
 
-static void gen_switch(Node *n) {
+static Flow gen_switch(Node *n) {
     Type *ct = promoted_type(gen_expr(n->cond, RAX, false));
+    if (!n->lhs) { warning(n->loc, "empty switch"); return FLOW_RUN; }
 #ifdef OLD_SWITCH
     // Emit "if (switch_value == case_value) goto case_label" for every case.
     // XXX: should check for duplicates
@@ -4113,9 +4128,8 @@ static void gen_switch(Node *n) {
     if ((n->flags & HAS_BREAK) || !def) end = label_id++;
     emit_jmp(n, "jmp", def ? def : end);   // no match -> default or end
 #else
-    if (!n->lhs) { warning(n->loc, "empty switch"); return; }
     int def, end, dest;
-    bool sorted = check_cases(n->lhs, ct, &def, &end);
+    bool sorted = check_cases(n, ct, &def, &end);
     unsigned char is_unsigned = ty_is_unsigned(ct);
     unsigned long min_val = is_unsigned ? 0 : (unsigned long)LONG_MIN;
     for (Node *e = n->lhs; e; e = e->lhs) {
@@ -4171,12 +4185,13 @@ static void gen_switch(Node *n) {
 
     // break exits the switch; continue passes through to the enclosing loop
     loop_push(n, end, cont_lbl[loop_sp]);
-    gen_stmt(n->rhs);          // the body places the case labels inline
+    Flow flow = gen_stmt(n->rhs); // the body places the case labels inline
     loop_pop();
-    emit_label(end);
+    if (end) { flow = FLOW_RUN; emit_label(end); }
+    return flow;
 }
 
-static bool gen_return(Node *e) {
+static Flow gen_return(Node *e) {
     if (e) {
         for (;;) {
             if (e->flags & CONST_VAL) break;
@@ -4212,13 +4227,30 @@ static bool gen_return(Node *e) {
     }
     if (this_fn->flags & HAS_FRAME) emit("leave");
     emit("ret");
-    return false;
+    return FLOW_NONE;
 }
 
-static void gen_stmt(Node *n) {
+static bool is_label(Node *n) {
     switch (n->kind) {
-    case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) gen_stmt(e); break;
+    case N_CASE: case N_DEFAULT: case N_LABEL: return true;
+    default: return false;
+    }
+}
+static Flow gen_stmt(Node *n) {
+    Flow flow = FLOW_RUN;
+    switch (n->kind) {
     case N_EMPTY: break;
+    case N_BLOCK:
+        for (Node *e = n->rhs; e;) {
+            if (!flow && !is_label(e)) {
+                warning(e->loc, "statement never reached");
+                while ((e = e->next) && !is_label(e)) {}
+            } else {
+                flow = gen_stmt(e);
+                e = e->next;
+            }
+        }
+        break;
     case N_DECL:
         for (Sym *s = n->decl; s; s = s->next_decl) {
             Node *e;
@@ -4238,36 +4270,55 @@ static void gen_stmt(Node *n) {
         }
         break;
     case N_EXPR:   n->lhs->flags |= DISCARD; gen_expr(n->lhs, RAX, false); break;
-    case N_RETURN: gen_return(n->lhs); break;
     case N_IF: {
         Node *cond = n->cond;
         if (cond->flags & CONST_VAL) {
             n = cond->uval ? n->lhs : n->rhs;
-            if (n) gen_stmt(n);
+            if (n) return gen_stmt(n);
             break;
         }
         int els = label_id++;
         gen_test(cond, RAX, false, els, false);
-        gen_stmt(n->lhs);
+        Flow flow1 = gen_stmt(n->lhs);
         if (n->rhs) {
-            int end = label_id++; emit_jmp(n, "jmp", end); // should test flow
-            emit_label(els); gen_stmt(n->rhs); els = end;
+            int end = 0;
+            if (flow1) { end = label_id++; emit_jmp(n, "jmp", end); }
+            emit_label(els);
+            if (!gen_stmt(n->rhs) && !flow1) flow = FLOW_NONE;
+            els = end;
         }
         emit_label(els);
         break;
     }
-    case N_WHILE: {
-        int top = label_id++, end = label_id++;
+    case N_WHILE:
+    case N_FOR: {
+        if (n->finit) gen_stmt(n->finit);
+        int top = label_id++;
         emit_label(top);
+        int cont = top, end = 0;
+        if (n->rhs && (n->flags & HAS_CONTINUE)) cont = label_id++;
         Node *cond = n->cond;
-        if (cond->flags & CONST_VAL) {
-            if (!cond->uval) break;
-        } else {
-            gen_test(cond, RAX, false, end, false);
+        if (cond && (cond->flags & CONST_VAL)) {
+            if (!cond->uval) break; // no code to emit
+            cond = NULL;
         }
-        loop_push(n, end, top); gen_stmt(n->lhs); loop_pop();
+        if (cond) {
+            end = label_id++;
+            gen_test(cond, RAX, false, end, false);
+        } else {
+            if (n->flags & HAS_BREAK) end = label_id++;
+            else flow = FLOW_NONE;
+        }
+        loop_push(n, end, cont);
+        Flow flow1 = gen_stmt(n->lhs);
+        loop_pop();
+        if (n->rhs) {
+            if (cont != top) { emit_label(cont); flow1 = FLOW_RUN; }
+            if (flow1) { n->rhs->flags |= DISCARD; gen_expr(n->rhs, RAX, false); }
+            else warning(n->rhs->loc, "update clause never reached");
+        }
         // XXX: should duplicate test
-        emit_jmp(n, "jmp", top);
+        if (flow1) emit_jmp(n, "jmp", top);
         emit_label(end);
         break;
     }
@@ -4276,42 +4327,21 @@ static void gen_stmt(Node *n) {
         if (n->flags & HAS_CONTINUE) cont = label_id++;
         if (n->flags & HAS_BREAK) end = label_id++;
         emit_label(top);
-        loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
-        emit_label(cont);
-        gen_test(n->cond, RAX, false, top, true);
-        emit_label(end);
+        loop_push(n, end, cont);
+        flow = gen_stmt(n->lhs);
+        loop_pop();
+        if (cont) { flow = FLOW_RUN; emit_label(cont); }
+        if (!gen_test(n->cond, RAX, false, top, true)) flow = FLOW_NONE;
+        if (end) { flow = FLOW_RUN; emit_label(end); }
         break;
     }
-    case N_FOR: {
-        int top = label_id++, cont = top, end = 0;
-        if (n->rhs && (n->flags & HAS_CONTINUE)) cont = label_id++;
-        if (n->cond || (n->flags & HAS_BREAK)) end = label_id++;
-        if (n->finit) gen_stmt(n->finit);
-        emit_label(top);
-        Node *cond = n->cond;
-        if (cond) {
-            if (cond->flags & CONST_VAL) {
-                if (!cond->uval) break; // no code to emit
-            } else {
-                gen_test(cond, RAX, false, end, false);
-            }
-        }
-        loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
-        if (n->rhs) {
-            if (cont != top) emit_label(cont);
-            n->rhs->flags |= DISCARD; gen_expr(n->rhs, RAX, false);  // step
-        }
-        // XXX: should duplicate test
-        emit_jmp(n, "jmp", top);
-        emit_label(end);
-        break;
-    }
-    case N_BREAK:    emit_jmp(n, "jmp", brk_lbl[loop_sp]);  break;
-    case N_CONTINUE: emit_jmp(n, "jmp", cont_lbl[loop_sp]); break;
-    case N_SWITCH:   gen_switch(n); break;
+    case N_SWITCH:   return gen_switch(n);
     case N_CASE:     gen_case_comment(n); emit_label(n->lab); break;
     case N_DEFAULT:
     case N_LABEL:    emit_comment(atom_str(n->name)); emit_label(n->lab); break;
+    case N_RETURN:   return gen_return(n->lhs);
+    case N_BREAK:    emit_jmp(n, "jmp", brk_lbl[loop_sp]);  return FLOW_NONE;
+    case N_CONTINUE: emit_jmp(n, "jmp", cont_lbl[loop_sp]); return FLOW_NONE;
     case N_GOTO: {
         Label *lab = find_label(n->name);
         if (!lab) {
@@ -4320,11 +4350,12 @@ static void gen_stmt(Node *n) {
         }
         lab->used = true;
         emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", lab->n->lab);
-        break;
+        return FLOW_NONE;
     }
-    case N_ASM: gen_asm(n);  break;
+    case N_ASM: return gen_asm(n);
     default:    gen_expr(n, RAX, false); break;    // node is part of an expression
     }
+    return flow;
 }
 
 static void gen_func(Func *fn) {
@@ -4389,8 +4420,7 @@ static void gen_func(Func *fn) {
             emit("mov [rbp - %u], %s", fn->va_off - (j - i) * 8, reg64[ARGREG[j]]);
         }
     }
-    gen_stmt(body);
-    if (has_flow(body)) {
+    if (gen_stmt(body)) {
         if (fn->name == ID_MAIN) {
             emit("xor rax, rax");   // main returns 0 by default
         } else if (fn->rtype != ty_void()) {

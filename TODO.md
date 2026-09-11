@@ -1,14 +1,18 @@
 # TODO list
 
 * merge upstream
+* remove `Label` type: use linked list of `N_LABEL` nodes.
 * support function pointers
 * add analysis pass:
   - constant folding
   - type resolution
   - register allocation, stack usage
-  - discard information
-  - dead code elimination
-  - detect unreachable code
+  - set discard information
+  - [90%] detect unreachable code
+  - [90%] dead code elimination
+* add `N_MEMBER` variant for `pointer->member`
+* optimize `var->member` access
+* optimize `var[const_val]` address computations
 * optimize expressions with commutativity and associativity
 * optim `+=`, `*=`, `&=`, `|=`, `^=` with var lhs -> swap
 * optim `+`, `*`, `&`, `|`, `^` with const lhs -> swap
