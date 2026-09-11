@@ -8,9 +8,22 @@
   - register allocation, stack usage
   - discard information
   - dead code elimination
+  - detect unreachable code
+* optimize expressions with commutativity and associativity
+* optim `+=`, `*=`, `&=`, `|=`, `^=` with var lhs -> swap
+* optim `+`, `*`, `&`, `|`, `^` with const lhs -> swap
+* optim bin/compare operations with fullwidth sym rhs -> skip RCX load_var
+* optim comparisons with const lhs -> swap and transpose
+* [20%] optimize <expr> = <const> and <expr> = <sym>
+* share code between `emit_idiv_imm` and `emit_imod_imm`
+* use common type for `N_TERNARY`
+* [X] should refine `errno` test in `__syscall` builtin
+* [10%] optimize tests for constant conditions in `N_IF` and loop statements
+* direct load and store
+* improve inc / dec
 * `gen_stmt` should return flow state
 * `gen_expr` should return flow state and flags state
-* elide register reload
+* elide register reload:
 * use generic save mask
 * use spill area and stop `push`/`pop` method
 * use unpromoted ABI and promote if needed
@@ -18,7 +31,7 @@
 * [95%] optimize code gen for condition expressions
 * [50%] complete support for short/int/long semantics
 * [50%] complete support of unsigned semantics
-* `return cond ? a : b` ->  `if (cond) return a; else return b;`
+* [X] `return cond ? a : b` ->  `if (cond) return a; else return b;`
 * check and convert function arguments according to prototype
 * fix bogus 2D array handling
 * accept more than 6 function arguments
@@ -39,7 +52,6 @@
 * output column in error messages
 * pass integer offset to `gen_expr()`
 * pass integer rhs argument to `gen_expr()`
-* optimize expressions with commutativity and associativity
 * add `get_loc` to generate better load/store/update code
 * `stdin`, `stdout` and `stderr` should be defined as pointers
 * should support `__func__`, a pre-defined static local `char` array
@@ -53,13 +65,10 @@
 * support bit-field syntax
 * support bit-field semantics
 * support bit-field proper layout
-* detect unreachable code
 * `expect_id()`, `expect_string()`: check kind, increment `P`, return data
 * [50%] add timings and other stats using helper program
 * emit static data initializers for non constant elements (eg: `char a, *p = &a;`)
 * more optimizations
-* direct load and store
-* improve inc / dec
 * complete library
 * more intrinsics
 * add more tests

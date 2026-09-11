@@ -173,9 +173,9 @@ static size_t pstrcat(char *dest, size_t size, const char *src) {
 }
 // safe fixed block with truncation and detection (no null termination)
 static size_t pmemcpy(char *dest, size_t size, const char *src, size_t n) {
-    size_t i = 0;
-    for (i = 0; i < size && n; i++, n--) dest[i] = src[i];
-    return i;
+    if (n > size) n = size;
+    for (size_t i = 0; i < n; i++) dest[i] = src[i];
+    return n;
 }
 static bool strstart(const char *s, const char *p, size_t *pk) {
     for (size_t k = 0; s[k] == p[k]; k++) if (!p[k]) { if (pk) *pk = k; return true; }
@@ -304,17 +304,20 @@ typedef struct Atom {
 #define ATOM_STRING 4
     unsigned refs;
 #endif
+    unsigned id;  // make string numbers more stable
     unsigned char flags; char str[15];  // this improves gdb output
 } Atom;
 static Atom **atoms;
 static size_t natoms, atoms_cap;
-#define ATOM_HASH_LEN  1023
+#define ATOM_HASH_LEN   997
+#define ATOM_HASH_INC  1000
 static atom_t atom_hash[ATOM_HASH_LEN];
 
 static const char *atom_str(atom_t i) { return atoms[i]->str; }
 static size_t atom_len(atom_t i) { return atoms[i]->len; }
 #define atom_flags(i)  atoms[i]->flags
 #define atom_sym(i)    atoms[i]->sym
+#define atom_id(i)     atoms[i]->id
 static atom_t new_atom_len(const char *p, size_t len) {
     if (!len) { // special case the empty string, which must be created first
         if (atoms) {
@@ -329,6 +332,7 @@ static atom_t new_atom_len(const char *p, size_t len) {
     for (size_t i = 0; i < len; i++) hash = hash * 37 + str[i];
     hash = hash % ATOM_HASH_LEN;
     atom_t a = atom_hash[hash];
+    unsigned id = (unsigned)hash;
     while (a) {
         Atom *ap = atoms[a];
         if (ap->len == len && !memcmp(ap->str, str, len)) {
@@ -337,6 +341,7 @@ static atom_t new_atom_len(const char *p, size_t len) {
 #endif
             return a;
         }
+        id += ATOM_HASH_INC;
         a = ap->next;
     }
     if (natoms >= atoms_cap) { atoms = reallocate(atoms, &atoms_cap, sizeof(Atom*), 2048); }
@@ -347,6 +352,7 @@ static atom_t new_atom_len(const char *p, size_t len) {
 #ifdef ATOM_STATS
     ap->refs = 0;
 #endif
+    ap->id = id;
     ap->flags = 0;
     memcpy(ap->str, str, len);
     ap->str[len] = 0;
@@ -1231,7 +1237,7 @@ static bool same_type(Type *t1, Type *t2) {
 static Type *promoted_type(Type *t) {
     while (t) {
         switch (t->kind) {
-        case TY_INT: case TY_SCHAR: case TY_SHORT:
+        case TY_INT:   case TY_SCHAR:  case TY_SHORT:
         case TY_UCHAR: case TY_USHORT: case TY_CHAR:
             return ty_int();
         case TY_ENUM: t = t->enum_type; continue;
@@ -1294,9 +1300,9 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
 // =====================================================================
 typedef enum NodeKind enum_type(unsigned char) {
     N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP,
-    N_COMMA, N_UNARY, N_POST, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
+    N_COMMA, N_UNARY, N_POST, N_PRE, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_IF, N_WHILE, N_RETURN, N_BLOCK, N_EXPR, N_DECL, N_ASM, N_EMPTY,
-    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY, N_PRE,
+    N_FOR, N_DOWHILE, N_BREAK, N_CONTINUE, N_TERNARY,
     N_MEMBER, N_SIZEOF, N_SWITCH, N_CASE, N_DEFAULT, N_GOTO, N_LABEL,
 } NodeKind;
 
@@ -2340,10 +2346,10 @@ static bool eval_expr(Node *n, Value *vp) {
     case N_UNARY:
         if (!eval_expr(n->lhs, &v1)) return false;
         switch (n->op) {
-        case T_MINUS:  v1.uval = -v1.uval; break;
         case T_PLUS:   break;
+        case T_MINUS:  v1.uval = -v1.uval; break;
         case T_BITNOT: v1.uval = ~v1.uval; value_cast(&v1, v1.type); break;
-        case T_NOT:    v1.uval = !v1.uval; break;
+        case T_NOT:    v1.uval = !v1.uval; n->type = v1.type = ty_int(); goto done;
         default: return false;
         }
         break;
@@ -2409,6 +2415,7 @@ static bool eval_expr(Node *n, Value *vp) {
         }
     }
     value_cast(&v1, n->type);
+done:
     vp->type = v1.type;
     n->uval = vp->uval = v1.uval;
     n->flags |= CONST_VAL;
@@ -2676,8 +2683,8 @@ static void check_used(Node *n) {
     case N_FOR:
         check_used(n->finit); check_used(n->cond); check_used(n->rhs);
         check_used(n->lhs); break;
-    case N_RETURN: case N_EXPR: case N_UNARY: case N_DEREF: case N_ADDR:
-    case N_CAST: case N_POST: case N_PRE: case N_MEMBER:
+    case N_UNARY: case N_POST: case N_PRE: case N_CAST:
+    case N_DEREF: case N_ADDR: case N_RETURN: case N_EXPR: case N_MEMBER:
         check_used(n->lhs); break;
     case N_ASSIGN: case N_BIN: case N_CMP: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
         check_used(n->lhs); check_used(n->rhs); break;
@@ -2753,10 +2760,10 @@ static void emit(const char *fmt, ...) {
         va_list a; va_start(a, fmt); col += vfprintf(fout, fmt, a); va_end(a);
     }
     if (*next_comment) {
-        emit_indent(col, 32);
-        fprintf(fout, "# %s", next_comment); *next_comment = '\0';
+        col = emit_indent(col, 32);
+        col += fprintf(fout, "# %s", next_comment); *next_comment = '\0';
     }
-    putc('\n', fout);
+    if (col) putc('\n', fout);
 }
 static void emit_label(int lab) { if (lab <= 0) return; if (next_label) emit(" "); next_label = lab; }
 //#define hide_comment()  (*next_comment = '\0')
@@ -2793,6 +2800,9 @@ static void emit_jmp(Node *n, const char *jmp, int lab) {
     else emit("%s %d%c", jmp, lab, 'f');
 }
 
+//#define gen_jmp(n, lab) (emit_jmp(n, "jmp", lab), false)
+//#define gen_jcc(n, cc, is_unsigned, lab) (emit_jmp(n, get_jcc(cc, is_unsigned), lab), true)
+
 // =====================================================================
 // 7.1 CODE GENERATION
 // =====================================================================
@@ -2812,6 +2822,25 @@ static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };   // syscall a
 static Type *gen_expr(Node *n, Register r, bool save_rax);
 static void gen_stmt(Node *n);
 static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsigned offset);
+
+static void emit_reg(const char *instr, Register r) {
+    emit("%s %s", instr, reg64[r]);
+}
+static void emit_reg_reg(const char *instr, Register r1, Register r2) {
+    emit("%s %s, %s", instr, reg64[r1], reg64[r2]);
+}
+static void emit_mov_reg_imm(Register r, long val) {
+    if (!val) emit_reg_reg("xor", r, r);
+    else emit("mov %s, %ld", (val >> 32) ? reg64[r] : reg32[r], val);
+}
+static void emit_reg_imm(const char *instr, Register r, long val) {
+    if ((int)val == val) {
+        emit("%s %s, %d", instr, reg64[r], (int)val);
+    } else {
+        emit_mov_reg_imm(RDX, val);
+        emit_reg_reg(instr, r, RDX);
+    }
+}
 
 static Type *promote_reg(Type *t, Register r) {
     const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
@@ -2840,30 +2869,39 @@ static Type *load_ind(Type *t, Register r1, Register r2, unsigned offset) {   //
     }
     return t;
 }
-static void store_ind(Type *t, Register r1, Register r2, unsigned offset) {    // [r1+offset] = r2 (size and type aware)
-    char dest[32]; make_reg_address(dest, sizeof(dest), r1, offset);
+static Type *store_mem_reg(Type *t, const char *dest, Register r) {    // mem = r (size and type aware)
     switch (ty_size(t)) {
-    case 1:  emit("mov %s, %s", dest, reg8[r2]);  return;
-    case 2:  emit("mov %s, %s", dest, reg16[r2]); return;
-    case 4:  emit("mov %s, %s", dest, reg32[r2]); return;
-    default: emit("mov %s, %s", dest, reg64[r2]); return;
+    case 1:  emit("mov %s, %s", dest, reg8[r]);  break;
+    case 2:  emit("mov %s, %s", dest, reg16[r]); break;
+    case 4:  emit("mov %s, %s", dest, reg32[r]); break;
+    default: emit("mov %s, %s", dest, reg64[r]); break;
     }
+    return t;
 }
-static void emit_reg(const char *instr, Register r) {
-    emit("%s %s", instr, reg64[r]);
+static Type *store_mem_imm(Type *t, const char *dest, long val) {
+    switch (ty_size(t)) {
+    case 1:  emit("mov byte ptr %s, %ld", dest, val);  break;
+    case 2:  emit("mov word ptr %s, %ld", dest, val);  break;
+    case 4:  emit("mov dword ptr %s, %ld", dest, val); break;
+    default: emit("mov qword ptr %s, %ld", dest, val); break;
+    }
+    return t;
 }
-static void emit_reg_reg(const char *instr, Register r1, Register r2) {
-    emit("%s %s, %s", instr, reg64[r1], reg64[r2]);
+static Type *store_ind(Type *t, Register r1, Register r2, unsigned offset) {    // [r1+offset] = r2 (size and type aware)
+    char dest[32]; make_reg_address(dest, sizeof(dest), r1, offset);
+    return store_mem_reg(t, dest, r2);
 }
-static void emit_reg_imm(const char *instr, Register r, unsigned long val) {
-    if ((int)val == (long)val) {
-        emit("%s %s, %d", instr, reg64[r], (int)val);
+static Type *store_ind_imm(Type *t, Register r, long val, unsigned offset) {    // [r1+offset] = val (size and type aware)
+    char dest[32]; make_reg_address(dest, sizeof(dest), r, offset);
+    if ((int)val != val) {
+        emit_mov_reg_imm(RDX, val);
+        return store_mem_reg(t, dest, RDX);
     } else {
-        emit("mov rdx, %ld", (long)val);
-        emit("%s %s, rdx", instr, reg64[r]);
+        return store_mem_imm(t, dest, val);
     }
 }
-static void emit_cmp_imm(Register r, unsigned long val) {
+
+static void emit_cmp_imm(Register r, long val) {
     if (val) emit_reg_imm("cmp", r, val);
     else emit_reg_reg("test", r, r);
 }
@@ -2971,56 +3009,53 @@ static Type *static_typeof(Node *n, Type *def) {
     }
 }
 
-static void gen_string_def(atom_t id) {
+static void gen_string_def(atom_t a) {
     char buf[8192];
-    encode_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
-    int col = fprintf(fout, ".LC%u:", id);
+    encode_string(buf, sizeof(buf), atom_str(a), atom_len(a), '"');
+    int col = fprintf(fout, ".LC%u:", atom_id(a));
     emit_indent(col, 8);
     fprintf(fout, ".string %s\n", buf);
 }
 
 static Type *load_string(Node *n, Register r) {
-    atom_t id = n->str;
+    atom_t a = n->str;
     if (out_comments) {
         char buf[37];
-        size_t len = encode_string(buf, sizeof(buf), atom_str(id), atom_len(id), '"');
+        size_t len = encode_string(buf, sizeof(buf), atom_str(a), atom_len(a), '"');
         if (len > 32) pstrcpy(buf + 32, sizeof(buf) - 32, "...\"");
         emit_comment(buf);
     }
-    emit("lea %s, [rip + .LC%u]", reg64[r], id);
-    atom_flags(id) |= ATOM_USED;
+    emit("lea %s, [rip + .LC%u]", reg64[r], atom_id(a));
+    atom_flags(a) |= ATOM_USED;
     return n->type;
 }
 
-static void emit_imul_imm(Register r, unsigned long val) {
+static void emit_imul_imm(Register r, long val) {
     const char *reg = reg64[r];
-    if (!val) {
-        emit("sub %s, %s", reg, reg);
-    } else
-    if (val == 1) {
-        // nothing
-    } else
-    if ((long)val == -1) {
-        emit_reg("neg", r);
-    } else
-    if ((val & (val - 1)) == 0) { // power of 2
-        emit("shl %s, %d", reg, __builtin_ctzl(val));
-    } else
-    if (val <= INT_MAX) {
-        emit("imul %s, %lu", reg, val);
-    } else {
-        emit("mov rdx, %lu", val);
-        emit("imul %s, rdx", reg);
+    switch (val) {
+    case -1: emit_reg("neg", r); return;
+    case 0:  emit_reg_reg("xor", r, r); return;
+    case 1:  return; // nothing
+    case 3:  emit("lea %s, [%s+2*%s]", reg, reg, reg); return;
+    case 5:  emit("lea %s, [%s+4*%s]", reg, reg, reg); return;
+    default:
+        if ((val & (val - 1)) == 0) { // power of 2
+            emit("shl %s, %d", reg, __builtin_ctzl((unsigned long)val));
+            return;
+        } else {
+            emit_reg_imm("imul", r, val);
+            return;
+        }
     }
 }
 
-static void emit_idiv_imm(Register r, unsigned long val, bool save_rax) {
+static void emit_idiv_imm(Register r, long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("mov rcx, 7378697629483820647");
+        emit_mov_reg_imm(RCX, 7378697629483820647);
         emit("imul rcx");
         emit("mov %s, rdx", reg);
         emit("shr %s, 63", reg);
@@ -3032,33 +3067,33 @@ static void emit_idiv_imm(Register r, unsigned long val, bool save_rax) {
         // no code
     } else
     if ((val & (val - 1)) == 0) { // power of 2
-        unsigned long adj = val - 1;
-        if (adj <= INT_MAX) {
-            emit("lea edx, [%s + %lu]", reg, adj);
+        long adj = val - 1;
+        if ((unsigned long)adj <= INT_MAX) {
+            emit("lea rdx, [%s + %ld]", reg, adj);
         } else {
-            emit("mov edx, %lu", adj);
-            emit("add edx, %s", reg);
+            emit_mov_reg_imm(RDX, adj);
+            emit("add rdx, %s", reg);
         }
         emit("test %s, %s", reg, reg);
-        emit("cmovs %s, edx", reg);
-        emit("sar %s, %d", reg, __builtin_ctzl(val));
+        emit("cmovns %s, rdx", reg);
+        emit("sar %s, %d", reg, __builtin_ctzl((unsigned long)val));
     } else {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("mov rcx, %ld", (long)val);
+        emit_mov_reg_imm(RCX, val);
         emit("cqo"); emit("idiv rcx");
         if (r != RAX) emit("mov %s, rax", reg);
         if (save_rax) emit("pop rax");
     }
 }
 
-static void emit_div_imm(Register r, unsigned long val, bool save_rax) {
+static void emit_div_imm(Register r, long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("mov rcx, -3689348814741910323");
+        emit_mov_reg_imm(RCX, -3689348814741910323);
         emit("mul rcx");
         emit("mov %s, rdx", reg);
         emit("shr %s, 3", reg);
@@ -3068,25 +3103,25 @@ static void emit_div_imm(Register r, unsigned long val, bool save_rax) {
         // nothing
     } else
     if ((val & (val - 1)) == 0) { // power of 2
-        emit("shr %s, %d", reg, __builtin_ctzl(val));
+        emit("shr %s, %d", reg, __builtin_ctzl((unsigned long)val));
     } else {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
         // could optimize furter using 32-bit division
-        emit("mov rcx, %ld", (long)val);
+        emit_mov_reg_imm(RCX, val);
         emit("sub rdx, rdx"); emit("div rcx");
         if (r != RAX) emit("mov %s, rax", reg);
         if (save_rax) emit("pop rax");
     }
 }
 
-static void emit_imod_imm(Register r, unsigned long val, bool save_rax) {
+static void emit_imod_imm(Register r, long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("movabs rdx, 7378697629483820647");
+        emit_mov_reg_imm(RDX, 7378697629483820647);
         emit("mov rcx, rax");
         emit("imul rdx");
         emit("mov rax, rdx");
@@ -3103,12 +3138,12 @@ static void emit_imod_imm(Register r, unsigned long val, bool save_rax) {
         emit("sub %s, %s", reg, reg);
     } else
     if ((val & (val - 1)) == 0) { // power of 2
-        unsigned long adj = val - 1;
-        if (adj <= INT_MAX) {
-            emit("lea ecx, [%s + %lu]", reg, adj);
+        long adj = val - 1;
+        if ((unsigned long)adj <= INT_MAX) {
+            emit("lea rcx, [%s + %ld]", reg, adj);
         } else {
-            emit("mov ecx, %lu", adj);
-            emit("add ecx, %s", reg);
+            emit_mov_reg_imm(RCX, adj);
+            emit("add rcx, %s", reg);
         }
         emit("test %s, %s", reg, reg);
         emit("cmovns rcx, %s", reg);
@@ -3117,21 +3152,21 @@ static void emit_imod_imm(Register r, unsigned long val, bool save_rax) {
     } else {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("mov rcx, %ld", (long)val);
+        emit_mov_reg_imm(RCX, val);
         emit("cqo"); emit("idiv rcx");
         emit("mov %s, rdx", reg);
         if (save_rax) emit("pop rax");
     }
 }
 
-static void emit_mod_imm(Register r, unsigned long val, bool save_rax) {
+static void emit_mod_imm(Register r, long val, bool save_rax) {
     const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
         emit("mov rcx, rax");
-        emit("movabs rdx, -3689348814741910323");
+        emit_mov_reg_imm(RDX, -3689348814741910323);
         emit("mul rdx");
         emit("shr rdx, 2");
         emit("and rdx, -2");
@@ -3148,7 +3183,7 @@ static void emit_mod_imm(Register r, unsigned long val, bool save_rax) {
     } else {
         if (save_rax) emit("push rax");
         if (r != RAX) emit("mov rax, %s", reg);
-        emit("mov rcx, %ld", (long)val);
+        emit_mov_reg_imm(RCX, val);
         emit("sub rdx, rdx"); emit("div rcx");
         emit("mov %s, rdx", reg);
         if (save_rax) emit("pop rax");
@@ -3199,13 +3234,13 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
         break;
     case T_MINUS:
         if (is_ptrish(lt)) {
-            unsigned s = elem_size(lt);
+            unsigned sz = elem_size(lt);
             if (is_ptrish(rt)) {
                 emit("sub rax, rcx");
-                emit_idiv_imm(RAX, s, false);
+                emit_idiv_imm(RAX, sz, false);
                 break;
             }
-            emit_imul_imm(RCX, s);
+            emit_imul_imm(RCX, sz);
             emit("sub rax, rcx");
             return lt;
         }
@@ -3244,7 +3279,7 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt) {
 static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_rax) {
     // r = left and result, val = right
     Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
-    unsigned long val = n->rhs->uval;
+    long val = n->rhs->ival;
     switch (op) {
     case T_PLUS:
         if (is_ptrish(lt)) val *= elem_size(lt);
@@ -3281,7 +3316,7 @@ static Type *load_var(Node *n, Register r) {
     Sym *s = resolve_name(n);
     Type *t = s->type;
     if (s->kind) emit_comment(atom_str(n->name));
-    if (s->flags & CONST_VAL) { emit("mov %s, %ld", reg, s->ival); return t; }
+    if (s->flags & CONST_VAL) { emit_mov_reg_imm(r, s->ival); return t; }
     char buf[64]; const char *src = make_address(buf, sizeof(buf), s, 0, n->loc);
     switch (t->kind) {
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
@@ -3340,16 +3375,8 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
         break;
     default:
         if (s->kind) emit_comment(atom_str(s->name));
-        // XXX: assigning to structures with a different size should be supported
         if (s->kind == K_REGISTER) { emit("mov %s, %s", dest, reg64[r]); break; }
-        switch (ty_size(t)) {
-        case 1: emit("mov %s, %s", dest, reg8[r]);  break;
-        case 2: emit("mov %s, %s", dest, reg16[r]); break;
-        case 4: emit("mov %s, %s", dest, reg32[r]); break;
-        case 8: emit("mov %s, %s", dest, reg64[r]); break;
-        default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
-        }
-        break;
+        return store_mem_reg(t, dest, r);
     }
     return t;
 }
@@ -3377,8 +3404,8 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
     }
     if (size > 256) {
         emit("lea %s, %s", reg64[ARGREG[0]], dest);
-        emit("sub %s, %s", reg64[ARGREG[1]], reg64[ARGREG[1]]);
-        emit("mov %s, %u", reg64[ARGREG[2]], size);
+        emit("xor %s, %s", reg64[ARGREG[1]], reg64[ARGREG[1]]);
+        emit_mov_reg_imm(ARGREG[2], size);
         emit("call memset");
         check_used_func(ID_MEMSET);
         return;
@@ -3400,42 +3427,34 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
     if (size)      { store_zero(s, loc, offset, 1); return; }
 }
 
-static Type *store_var_val(Sym *s, srcloc_t loc, unsigned offset, Type *t, unsigned long uval) {
+static Type *store_var_imm(Sym *s, srcloc_t loc, unsigned offset, Type *t, long val) {
     char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
     if (!dest) return t;
     if (!check_const(s, loc)) return t;
-    long lval = (long)uval;
+    if (s->kind) emit_comment(atom_str(s->name));
     if (s->kind == K_REGISTER) {
         // should deal with offset and size?
-        emit("mov %s, %ld", dest, lval);
+        emit_mov_reg_imm(s->reg, val);
+        return t;
     }
-    if (lval != (int)uval) {
-        emit("mov rcx, %ld", lval);
-        return store_var(s, loc, offset, t, RCX);
+    // XXX: storing to structures with a non standard size should be supported
+    if ((int)val != val) {
+        emit_mov_reg_imm(RDX, val);
+        return store_mem_reg(t, dest, RDX);
     }
-    unsigned size = ty_size(t);
-    if (!lval) { store_var_zero(s, loc, offset, size); return t; }
-    if (s->kind) emit_comment(atom_str(s->name));
-    // XXX: storing to structures with a different size should be supported
-    switch (size) {
-    case 8:  emit("mov qword ptr %s, %ld", dest, lval); break;
-    case 4:  emit("mov dword ptr %s, %ld", dest, lval); break;
-    case 2:  emit("mov word ptr %s, %ld", dest, lval);  break;
-    case 1:  emit("mov byte ptr %s, %ld", dest, lval);  break;
-    default: warning(loc, "invalid size %u in store_var", ty_size(t)); break;
-    }
-    return t;
+    return store_mem_imm(t, dest, val);
 }
 
 static bool is_simple_load(Node *n) {
     // A node qualifies if it only modifies the destination register
     // Neither rcx, nor rdx can be modified as they are used to pass arguments
     // rax could be modified but none of the qualifying nodes do
+    if (n->flags & CONST_VAL) return true;
     switch (n->kind) {
-    case N_NUM: case N_STR: case N_VAR: case N_SIZEOF:
-    case N_DEREF: case N_CAST: case N_ADDR: case N_UNARY:
+    case N_NUM: case N_STR: case N_VAR:
         return true;
     case N_BUILTIN: // va_start, va_arg, va_end
+    case N_UNARY: case N_CAST: case N_DEREF: case N_ADDR:
     case N_MEMBER:
         return !n->lhs || is_simple_load(n->lhs);
     case N_CALL:
@@ -3444,14 +3463,23 @@ static bool is_simple_load(Node *n) {
         //case ID__RDTSC: case ID__RDTSCP: modify rdx
         //}
         return false;
-#if 0
     case N_BIN:
     case N_CMP:
-        // would qualify if one of the operands is a N_NUM and the other is simple
-        // and the op is not a shift or rotate operation
+        // qualify if one of the operands is a N_NUM and the other is simple
+        // and the op is not a division or modulo
+        // should take a mask of registers to preserve, esp RCX and RDX
+        switch (n->op) {
+        case T_SLASH: case T_PERCENT: return false;
+        default: {
+            if (!(n->rhs->flags & CONST_VAL)) return false;
+            long lval = n->rhs->ival;
+            return lval == (int)lval && is_simple_load(n->lhs);
+        }}
+    case N_PRE: case N_POST:
+        return n->lhs->kind == N_VAR;
+#if 0
     case N_COMMA:
         // would qualify if both are simple
-    case N_PRE / N_POST: // would qualify if lhs is simple
     case N_ASSIGN: // would qualify if lhs is simple and op is neither generic mul, div or rem
         break;
 #endif
@@ -3471,110 +3499,126 @@ static void gen_arg(Node *n, Register r, bool save_rax) {
     if (check_num_args(n, 1)) gen_expr(n->rhs, r, save_rax);
 }
 
-static bool gen_test(Node *n, Register r, bool save_rax, int lab_false, int lab_true) {
+// generate a test and jump to the lab according to truth
+// if lab is null, converts `r` to bool according to truth
+static bool gen_test(Node *n, Register r, bool save_rax, int lab, bool truth) {
+    if (n->flags & CONST_VAL) {
+        if (!n->uval) truth = !truth;
+        goto istrue;
+    }
     Node *lhs = n->lhs, *rhs = n->rhs;
+    bool hasflags = false;
+    const char *jcc;
     switch (n->kind) {
     case N_STR:     // always true
-    case N_ADDR:    // always true (should report during analysis and set CONST_VAL?)
-        if (lab_true) { emit_jmp(n, "jmp", lab_true); return false; }
-        return false;
+    //case N_ADDR:    // always true? except maybe for &*NULL
+    istrue:
+        if (lab) {
+            if (truth) emit_jmp(n, "jmp", lab); return false;
+            return true;
+        }
+        emit_mov_reg_imm(r, truth);
+        return true;
     case N_BIN:
+        // binary expressions set the flags unless the rhs is the neutral element
+        // these tests should be performed at analysis time and N_BIN node should
+        // be mutated as N_COMMA for side effects or elided.
         switch (n->op) {
         case T_AMP:
-            if ((n->rhs->flags & CONST_VAL) && !(n->rhs->uval + 1)) goto regular;
-            goto optim;
+            if (!(rhs->flags & CONST_VAL) || (rhs->uval + 1)) hasflags = true;
+            goto regular;
         case T_PLUS:
         case T_MINUS:
         case T_BITOR:
         case T_BITXOR:
-            if ((n->rhs->flags & CONST_VAL) && !n->rhs->uval) goto regular;
-        optim:
-            gen_expr(n, r, save_rax); goto notest;
+            if (!(rhs->flags & CONST_VAL) || rhs->uval) hasflags = true;
+            goto regular;
         default:
             goto regular;
         }
     case N_UNARY:
         switch (n->op) {
+        case T_NOT:
+        lognot:
+                        truth = !truth; fallthrough;
         case T_PLUS:
-        case T_MINUS:   return gen_test(lhs, r, save_rax, lab_false, lab_true);
-        case T_BITNOT:  gen_expr(n, r, save_rax); emit("not %s", reg64[r]); goto notest;
-        case T_NOT:     return gen_test(lhs, r, save_rax, lab_true, lab_false);
+        case T_MINUS:
+        genlhs:
+                        return gen_test(lhs, r, save_rax, lab, truth);
+        case T_BITNOT:  hasflags = true; goto regular;
         default:        return false; // error
         }
     case N_LOGAND:
+        // should accept half open ranges too
         if (is_range_test(lhs, rhs)) {
             gen_expr(lhs->lhs, r, save_rax);
-            emit_reg_imm("sub", r, lhs->rhs->uval);
-            emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
-            if (lab_false) {
-                emit_jmp(n, get_jcc(T_GT, true), lab_false);
-                if (!lab_true) return true;
-                emit_jmp(n, "jmp", lab_true);
-                return false;
+            emit_reg_imm("sub", r, lhs->rhs->ival);
+            emit_reg_imm("cmp", r, (long)(rhs->rhs->uval - lhs->rhs->uval));
+            jcc = truth ? "jbe" : "ja";
+            break;
+        }
+        fallthrough;
+    case N_LOGOR: {
+        bool is_or = n->kind == N_LOGOR;
+        if (lab) {
+            if (truth == is_or) {
+                return gen_test(lhs, r, save_rax, lab, truth)
+                &&     gen_test(rhs, r, save_rax, lab, truth);
             } else {
-                emit_jmp(n, get_jcc(T_LE, true), lab_true);
+                int els = label_id++;
+                if (gen_test(lhs, r, save_rax, els, is_or)) {
+                    gen_test(rhs, r, save_rax, lab, truth);
+                }
+                emit_label(els);
                 return true;
             }
-        }
-        if (lab_false) {
-            return gen_test(lhs, r, save_rax, lab_false, 0)
-            &&     gen_test(rhs, r, save_rax, lab_false, lab_true);
         } else {
-            int lab = label_id++;
-            if (gen_test(lhs, r, save_rax, lab, 0)) {
-                gen_test(rhs, r, save_rax, 0, lab_true);
+            int els = label_id++, end = label_id++;
+            if (gen_test(lhs, r, save_rax, els, is_or)) {
+                gen_test(rhs, r, save_rax, 0, truth);
+                emit_jmp(n, "jmp", end);
             }
-            emit_label(lab);
+            emit_label(els); emit_mov_reg_imm(r, truth);
+            emit_label(end);
             return true;
         }
-    case N_LOGOR:
-        if (lab_true) {
-            return gen_test(lhs, r, save_rax, 0, lab_true)
-            &&     gen_test(rhs, r, save_rax, lab_false, lab_true);
-        } else {
-            int lab = label_id++;
-            if (gen_test(lhs, r, save_rax, 0, lab)) {
-                gen_test(rhs, r, save_rax, lab_false, 0);
-            }
-            emit_label(lab);
-            return true;
-        }
+    }
     case N_CMP: {
+        if ((rhs->flags & CONST_VAL) && !rhs->uval) {
+            switch (n->op) {
+            case T_EQ: goto lognot;
+            case T_NE: goto genlhs;
+            default:   break;
+            }
+        }
         if (r != RAX) goto regular;
         Type *lt = gen_expr(lhs, RAX, false);
         Type *rt = rhs->type;
         if (rhs->flags & CONST_VAL) {
-            emit_cmp_imm(RAX, rhs->uval);
+            emit_cmp_imm(RAX, rhs->ival);
         } else {
             rt = gen_expr(rhs, RCX, true);
             emit("cmp rax, rcx");
         }
         Type *ct = common_type(promoted_type(lt), rt);
-        if (lab_false) {
-            emit_jmp(n, get_jcc(get_rop(n->op), ty_is_unsigned(ct)), lab_false);
-            if (!lab_true) return true;
-            emit_jmp(n, "jmp", lab_true);
-            return false;
-        } else {
-            emit_jmp(n, get_jcc(n->op, ty_is_unsigned(ct)), lab_true);
-            return true;
-        }
+        TokenKind op = truth ? n->op : get_rop(n->op);
+        jcc = get_jcc(op, ty_is_unsigned(ct));
+        break;
     }
     default:
     regular:
         gen_expr(n, r, save_rax);
-        emit_reg_reg("test", r, r);
-    notest:
-        if (lab_false) {
-            emit_jmp(n, "jz", lab_false);
-            if (!lab_true) return true;
-            emit_jmp(n, "jmp", lab_true);
-            return false;
-        } else {
-            emit_jmp(n, "jnz", lab_true);
-            return true;
-        }
+        if (!hasflags) emit_reg_reg("test", r, r);
+        jcc = truth ? "jnz" : "jz";
+        break;
     }
+    if (lab) {
+        emit_jmp(n, jcc, lab);
+        return true;
+    }
+    emit("set%s %s", jcc + 1, reg8[r]);
+    emit("movzx %s, %s", reg64[r], reg8[r]);
+    return true;
 }
 
 static void gen_inc(Type *lt, TokenKind op, const char *dest) {
@@ -3602,7 +3646,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     if (n->flags & CONST_VAL) goto has_num;
     switch (n->kind) {
     has_num:
-    case N_NUM:  emit("mov %s, %ld", reg, n->ival); return n->type ? n->type : ty_long();
+    case N_NUM:  emit_mov_reg_imm(r, n->ival); return n->type ? n->type : ty_long();
     case N_STR:  return load_string(n, r);
     case N_VAR:  return load_var(n, r);
     case N_MEMBER: {
@@ -3623,7 +3667,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_SIZEOF: {
         Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
-        emit("mov %s, %u", reg, ty_size(t));
+        emit_mov_reg_imm(r, ty_size(t));
         return ty_size_t();
     }
     case N_CAST:
@@ -3645,7 +3689,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 Sym *s = resolve_name(lhs);
                 lt = s->type;
                 if ((n->flags & DISCARD) && (n->rhs->flags & CONST_VAL)) {
-                    store_var_val(s, n->loc, 0, lt, n->rhs->uval);
+                    store_var_imm(s, n->loc, 0, lt, n->rhs->ival);
                     return lt;
                 }
                 gen_expr(n->rhs, r, save_rax);
@@ -3653,7 +3697,13 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 if (!(n->flags & DISCARD)) promote_reg(lt, r);
                 return lt;
             }
-            // XXX optimize <expr> = <const> and <expr> = <sym>
+            if ((n->flags & DISCARD) && (n->rhs->flags & CONST_VAL)) { // optimize <expr> = <const>
+                long val = n->rhs->ival;
+                lt = gen_addr(lhs, r, save_rax, 0);
+                store_ind_imm(lt, r, val, 0);
+                return lt;
+            }
+            // XXX should optimize <expr> = <sym>
             if (save_rax) emit("push rax");
             gen_expr(n->rhs, RAX, false);
             lt = gen_addr(lhs, RCX, true, 0);
@@ -3709,19 +3759,19 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
     case N_TERNARY: {
         int els = label_id++, end = label_id++;
-        gen_test(n->cond, r, save_rax, els, 0);
+        gen_test(n->cond, r, save_rax, els, false);
         gen_expr(n->lhs, r, save_rax); emit_jmp(n, "jmp", end);
         emit_label(els); gen_expr(n->rhs, r, save_rax);
         emit_label(end);
         return ty_long();
     }
     case N_UNARY: {
+        if (n->op == T_NOT) { gen_test(n->lhs, r, save_rax, 0, false); return ty_int(); }
         Type *t = gen_expr(n->lhs, r, save_rax);
         switch (n->op) {
         case T_PLUS:    break;
         case T_MINUS:   emit_reg("neg", r); break;
         case T_BITNOT:  emit_reg("not", r); break;
-        case T_NOT:     emit_reg_reg("test", r, r); emit("sete %s", reg8[r]); emit("movzx %s, %s", reg, reg8[r]); return ty_int();
         default:        break;
         }
         return promoted_type(t);
@@ -3730,8 +3780,8 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         Node *lhs = n->lhs, *rhs = n->rhs;
         if (is_range_test(lhs, rhs)) {
             gen_expr(lhs->lhs, r, save_rax);
-            emit_reg_imm("sub", r, lhs->rhs->uval);
-            emit_reg_imm("cmp", r, rhs->rhs->uval - lhs->rhs->uval);
+            emit_reg_imm("sub", r, lhs->rhs->ival);
+            emit_reg_imm("cmp", r, (long)(rhs->rhs->ival - lhs->rhs->ival));
             emit("setbe %s", reg8[r]);
             emit("movzx %s, %s", reg, reg8[r]);
             return ty_int();
@@ -3740,7 +3790,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         // should optimize a && b && c...
         gen_expr(lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jz", lab);
         gen_expr(rhs, r, save_rax); emit_reg_reg("test", r, r);
-        emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg); emit_label(lab);
+        emit_mov_reg_imm(RDX, 1); emit("cmovnz %s, rdx", reg); emit_label(lab);
         return ty_int();
     }
     case N_LOGOR: {
@@ -3748,7 +3798,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         // should optimize a || b || c...
         gen_expr(n->lhs, r, save_rax); emit_reg_reg("test", r, r); emit_jmp(n, "jnz", lab);
         gen_expr(n->rhs, r, save_rax); emit_reg_reg("test", r, r);
-        emit_label(lab); emit("mov rdx, 1"); emit("cmovnz %s, rdx", reg);
+        emit_label(lab); emit_mov_reg_imm(RDX, 1); emit("cmovnz %s, rdx", reg);
         return ty_int();
     }
     case N_BUILTIN: {
@@ -3838,11 +3888,12 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
                 while (i-- > 0) emit("pop %s", reg64[SYSREG[i]]);
             }
             emit("syscall");
-            emit("test rax, rax");
-            emit_jmp(n, "jge", 1);
+            emit_reg_imm("cmp", RAX, -4095);  // test for range [-4K+1 ... -1]
+            emit_jmp(n, "jb", 1);
             emit("neg rax");
-            emit("mov [rip + errno], rax");
-            emit("mov rax, -1");
+            emit("mov [rip + errno], eax");
+            emit("xor rax, rax");
+            emit("dec rax");    // return -1 on error
             emit_label(1);
             goto done_pop_rax;
         case ID_ABS:
@@ -3929,22 +3980,21 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     }
 }
 
-static void gen_asm(Node *n) {
+static bool gen_asm(Node *n) {
     // split decoded asm text on newlines and ';' — emit each instruction line
-    const char *p = atom_str(n->str);
     emit(" ");
-    for (;;) {
+    bool flow = true;
+    for (const char *p = atom_str(n->str); *p; p++) {
         char c;
-        switch (c = *p++) {
-        case '\n': case ';': case 0:
-            fputc('\n', fout);
-            if (c) continue;
-            return;
-        default:
-            fputc(c, fout);
-            break;
-        }
+        if (isdigit(c = *p) && p[1] == ':') { emit_label(c - '0'); p += 2; }
+        p += skip_blanks(p);
+        const char *q = p;
+        while ((c = *p) && c != '\n' && c != ';') p++;
+        flow = !strstart(q, "jmp", NULL) && !strstart(q, "ret", NULL);
+        emit("%.*s", (int)(p - q), q);
+        if (!c) break;
     }
+    return flow;
 }
 
 // break/continue target stack
@@ -4054,7 +4104,7 @@ static void gen_switch(Node *n) {
             eval_const_expr(e->cond, &v, "'case' expression");
             gen_case_comment(e);
             // XXX: handle case ranges
-            emit_cmp_imm(RAX, v.uval);
+            emit_cmp_imm(RAX, v.ival);
             emit_jmp(n, "jz", e->lab);
         } else {
             def = e->lab;
@@ -4088,7 +4138,7 @@ static void gen_switch(Node *n) {
             gen_case_comment(e);
         }
         if (val == val2) {  // range of 2: use individual tests
-            emit_cmp_imm(RAX, val);
+            emit_cmp_imm(RAX, (long)val);
             emit_jmp(e, "jz", dest);
         } else {
             int lab = 0, emit_lab = 0;
@@ -4097,19 +4147,19 @@ static void gen_switch(Node *n) {
                 if (adj == (int)adj) {  // branchless version
                     if (adj) {
                         emit("lea rcx, [rax %+ld]", adj);
-                        emit_cmp_imm(RCX, val2 - val);
+                        emit_cmp_imm(RCX, (long)(val2 - val));
                     } else {
-                        emit_cmp_imm(RAX, val2);
+                        emit_cmp_imm(RAX, (long)val2);
                     }
                     emit_jmp(e, "jbe", dest);
                     if (sorted) min_val = val2;
                     continue;
                 }
                 lab = sorted ? def : (emit_lab = 1);
-                emit_cmp_imm(RAX, val);
+                emit_cmp_imm(RAX, (long)val);
                 emit_jmp(e, is_unsigned ? "jb" : "jl", lab);
             }
-            emit_cmp_imm(RAX, val2);
+            emit_cmp_imm(RAX, (long)val2);
             emit_jmp(e, is_unsigned ? "jbe" : "jle", dest);
             emit_label(emit_lab);
         }
@@ -4126,6 +4176,45 @@ static void gen_switch(Node *n) {
     emit_label(end);
 }
 
+static bool gen_return(Node *e) {
+    if (e) {
+        for (;;) {
+            if (e->flags & CONST_VAL) break;
+            switch (e->kind) {
+            case N_TERNARY: {
+                int els = label_id++;
+                gen_test(e->cond, RAX, false, els, false); gen_return(e->lhs);
+                emit_label(els); e = e->rhs;
+                continue;
+            }
+            case N_LOGAND: {
+                int lab = label_id++;
+                gen_test(e->lhs, RAX, false, lab, false);
+                gen_test(e->rhs, RAX, false, 0, true);
+                gen_return(NULL);
+                emit_label(lab); emit("xor rax, rax");
+                return gen_return(NULL);
+            }
+            case N_LOGOR: {
+                int lab = label_id++;
+                gen_test(e->lhs, RAX, false, lab, true);
+                gen_test(e->rhs, RAX, false, 0, true);
+                gen_return(NULL);
+                emit_label(lab); emit_mov_reg_imm(RAX, 1);
+                return gen_return(NULL);
+            }
+            default: break;
+            }
+            break;
+        }
+        gen_expr(e, RAX, false);
+        // may need to convert return type if narrowing is necessary
+    }
+    if (this_fn->flags & HAS_FRAME) emit("leave");
+    emit("ret");
+    return false;
+}
+
 static void gen_stmt(Node *n) {
     switch (n->kind) {
     case N_BLOCK: for (Node *e = n->rhs; e; e = e->next) gen_stmt(e); break;
@@ -4139,7 +4228,7 @@ static void gen_stmt(Node *n) {
                 } else {
                     // XXX: should optimize if value is constant
                     if (e->flags & CONST_VAL) {
-                        store_var_val(s, s->loc, 0, s->type, e->uval);
+                        store_var_imm(s, s->loc, 0, s->type, e->ival);
                     } else {
                         gen_expr(e, RAX, false);
                         store_var(s, s->loc, 0, s->type, RAX);
@@ -4149,11 +4238,7 @@ static void gen_stmt(Node *n) {
         }
         break;
     case N_EXPR:   n->lhs->flags |= DISCARD; gen_expr(n->lhs, RAX, false); break;
-    case N_RETURN:
-        if (n->lhs) gen_expr(n->lhs, RAX, false);
-        if (this_fn && (this_fn->flags & HAS_FRAME)) emit("leave");
-        emit("ret");
-        break;
+    case N_RETURN: gen_return(n->lhs); break;
     case N_IF: {
         Node *cond = n->cond;
         if (cond->flags & CONST_VAL) {
@@ -4162,10 +4247,10 @@ static void gen_stmt(Node *n) {
             break;
         }
         int els = label_id++;
-        gen_test(cond, RAX, false, els, 0);
+        gen_test(cond, RAX, false, els, false);
         gen_stmt(n->lhs);
         if (n->rhs) {
-            int end = label_id++; emit_jmp(n, "jmp", end);
+            int end = label_id++; emit_jmp(n, "jmp", end); // should test flow
             emit_label(els); gen_stmt(n->rhs); els = end;
         }
         emit_label(els);
@@ -4178,7 +4263,7 @@ static void gen_stmt(Node *n) {
         if (cond->flags & CONST_VAL) {
             if (!cond->uval) break;
         } else {
-            gen_test(cond, RAX, false, end, 0);
+            gen_test(cond, RAX, false, end, false);
         }
         loop_push(n, end, top); gen_stmt(n->lhs); loop_pop();
         // XXX: should duplicate test
@@ -4193,12 +4278,7 @@ static void gen_stmt(Node *n) {
         emit_label(top);
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
         emit_label(cont);
-        Node *cond = n->cond;
-        if (cond->flags & CONST_VAL) {
-            if (cond->uval) emit_jmp(n, "jmp", top);
-        } else {
-            gen_test(cond, RAX, false, 0, top);
-        }
+        gen_test(n->cond, RAX, false, top, true);
         emit_label(end);
         break;
     }
@@ -4213,7 +4293,7 @@ static void gen_stmt(Node *n) {
             if (cond->flags & CONST_VAL) {
                 if (!cond->uval) break; // no code to emit
             } else {
-                gen_test(cond, RAX, false, end, 0);
+                gen_test(cond, RAX, false, end, false);
             }
         }
         loop_push(n, end, cont); gen_stmt(n->lhs); loop_pop();
@@ -4250,6 +4330,8 @@ static void gen_stmt(Node *n) {
 static void gen_func(Func *fn) {
     Node *body = fn->body;
     if (!body) return;  // external function prototype
+    // space out functions so small modifications do not change all labels
+    label_id = ((label_id / 10) + 1) * 10;
     this_fn = fn;
     for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->lab = label_id++; }
     if (fn->is_variadic) {
@@ -4264,8 +4346,7 @@ static void gen_func(Func *fn) {
     if (body->rhs->kind == N_ASM && !body->rhs->next) {
         // no frame for functions written in assembly
         fn->flags &= ~HAS_FRAME;
-        gen_stmt(body);
-        emit("ret");
+        if (gen_asm(body->rhs)) gen_return(NULL);
         return;
     }
 
@@ -4312,12 +4393,10 @@ static void gen_func(Func *fn) {
     if (has_flow(body)) {
         if (fn->name == ID_MAIN) {
             emit("xor rax, rax");   // main returns 0 by default
-        } else
-        if (fn->rtype != ty_void()) {
+        } else if (fn->rtype != ty_void()) {
             warning(fn->endloc, "function '%s': missing return statement", atom_str(fn->name));
         }
-        if (fn->flags & HAS_FRAME) emit("leave");
-        emit("ret");
+        gen_return(NULL);
     }
 }
 
@@ -4353,7 +4432,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
             if (s) {
                 // accept braced initializers for scalars
                 if (init->kind == N_BLOCK) init = init->rhs;
-                if (init->flags & CONST_VAL) { store_var_val(s, init->loc, offset, t, init->uval); return; }
+                if (init->flags & CONST_VAL) { store_var_imm(s, init->loc, offset, t, init->ival); return; }
                 gen_expr(init, RAX, false); store_var(s, init->loc, offset, t, RAX); return;
             }
             if (eval_const_expr(init, &v, "initializer")) {
@@ -4375,13 +4454,13 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
                         store_var(s, init->loc, offset, t, RAX);
                         return;
                     }
-                    emit(".quad .LC%u", init->str);
+                    emit(".quad .LC%u", atom_id(init->str));
                     return;
                 }
             }
             if (s) {
                 if (init->flags & CONST_VAL) { // optimize: void *p = NULL;
-                    store_var_val(s, init->loc, offset, t, init->uval);
+                    store_var_imm(s, init->loc, offset, t, init->ival);
                     return;
                 }
                 gen_expr(init, RAX, false);

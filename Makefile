@@ -53,10 +53,18 @@ build:
 	@mkdir -p $(TMP)
 
 extra: $(BIN) build
-	$(CC) $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano_gcc_O2.s
-	$(CC) $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano_gcc_O0.s
-	$(CC) $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano_gcc_O2_g.s
-	$(CC) $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano_gcc_O0_g.s
+ifneq (,$(shell which gcc))
+	gcc $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano_gcc_O2.s
+	gcc $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano_gcc_O0.s
+	gcc $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano_gcc_O2_g.s
+	gcc $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano_gcc_O0_g.s
+endif
+ifneq (,$(shell which clang))
+	clang $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano_clang_O2.s
+	clang $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano_clang_O0.s
+	clang $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano_clang_O2_g.s
+	clang $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano_clang_O0_g.s
+endif
 
 # Full end-to-end demo: nano_cc compiles the C source, GNU as assembles it,
 # the linker produces a freestanding binary, and we run it.
