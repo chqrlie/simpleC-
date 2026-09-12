@@ -68,7 +68,6 @@ typedef struct Type Type;
 typedef struct Sym Sym;
 typedef struct Member Member;
 typedef struct Func Func;
-typedef struct Label Label;
 
 // ---------------------------------------------------------------------
 // Errors / allocation
@@ -1130,12 +1129,18 @@ static const char * const type_name[] = {
 };
 
 struct Type {
-    // should have flags for unsigned, ptrish, const, volatile, has_len
     TypeKind kind;
-#define IS_PTRISH    1
-//#define IS_UNSIGNED  2
-#define HAS_LEN      4
-    unsigned char align, flags; bool is_unsigned;
+    unsigned char align;
+#define IS_UNSIGNED     1U
+#define IS_PTRISH       2U
+#define IS_FUN_ARG      4U
+#define HAS_STATIC_LEN  8U
+#define HAS_LEN        16U
+#define HAS_STAR       32U
+    unsigned char pflags; // other flags
+#define HAS_CONST     1U  // must be consistent with K_CONST
+#define HAS_VOLATILE  2U  // must be consistent with K_VOLATILE
+    unsigned char qflags; // type qualifiers
     srcloc_t loc;
     union {
         struct {                // TY_INT ... TY_ULONG
@@ -1149,10 +1154,10 @@ struct Type {
             Sym *enum_syms;
         };
         struct {                // TY_ARRAY / TY_PTR
-            unsigned arr_size;  // TY_ARRAY
-            unsigned arr_len;   // TY_ARRAY
-            Type *ptr;          // TY_ARRAY / TY_PTR
-            Node *arr_len_expr; // TY_ARRAY
+            unsigned arr_size;
+            unsigned arr_len;
+            Type *base;
+            Node *arr_len_expr;
         };
         struct {                // TY_STRUCT / TY_UNION
             unsigned struct_size;
@@ -1161,22 +1166,25 @@ struct Type {
         };
         unsigned size;          // all types
     };
+    Type *qtypes; // circular list of qualified types
+    Type *cache;  // list of related types (pointers and arrays)
+    Type *next;
 };
 struct Member {
     atom_t name; unsigned char align; unsigned offset, pad;
     Type *type; Node *init; Member *next;
 };
 
-static Type ty_char_s   = { TY_CHAR,   1, 0, false, 0, {{ 1, 127 }}}; // should be unsigned
-static Type ty_schar_s  = { TY_SCHAR,  1, 0, false, 0, {{ 1, 127 }}};
-static Type ty_short_s  = { TY_SHORT,  2, 0, false, 0, {{ 2, 32768 }}};
-static Type ty_int_s    = { TY_INT,    4, 0, false, 0, {{ 4, INT_MAX }}};
-static Type ty_long_s   = { TY_LONG,   8, 0, false, 0, {{ 8, LONG_MAX }}};
-static Type ty_uchar_s  = { TY_UCHAR,  1, 0, true,  0, {{ 1, 255 }}};
-static Type ty_ushort_s = { TY_USHORT, 2, 0, true,  0, {{ 2, 65535 }}};
-static Type ty_uint_s   = { TY_UINT,   4, 0, true,  0, {{ 4, UINT_MAX }}};
-static Type ty_ulong_s  = { TY_ULONG,  8, 0, true,  0, {{ 8, ULONG_MAX }}};
-static Type ty_void_s   = { TY_VOID,   1, 0, false, 0, {{ 0, 0 }}};
+static Type ty_char_s   = { TY_CHAR,   1, 0,           0, 0, {{ 1, 127 }},       NULL, NULL, NULL }; // should be unsigned
+static Type ty_schar_s  = { TY_SCHAR,  1, 0,           0, 0, {{ 1, 127 }},       NULL, NULL, NULL };
+static Type ty_short_s  = { TY_SHORT,  2, 0,           0, 0, {{ 2, 32768 }},     NULL, NULL, NULL };
+static Type ty_int_s    = { TY_INT,    4, 0,           0, 0, {{ 4, INT_MAX }},   NULL, NULL, NULL };
+static Type ty_long_s   = { TY_LONG,   8, 0,           0, 0, {{ 8, LONG_MAX }},  NULL, NULL, NULL };
+static Type ty_uchar_s  = { TY_UCHAR,  1, IS_UNSIGNED, 0, 0, {{ 1, 255 }},       NULL, NULL, NULL };
+static Type ty_ushort_s = { TY_USHORT, 2, IS_UNSIGNED, 0, 0, {{ 2, 65535 }},     NULL, NULL, NULL };
+static Type ty_uint_s   = { TY_UINT,   4, IS_UNSIGNED, 0, 0, {{ 4, UINT_MAX }},  NULL, NULL, NULL };
+static Type ty_ulong_s  = { TY_ULONG,  8, IS_UNSIGNED, 0, 0, {{ 8, ULONG_MAX }}, NULL, NULL, NULL };
+static Type ty_void_s   = { TY_VOID,   1, 0,           0, 0, {{ 0, 0 }},         NULL, NULL, NULL };
 
 #define ty_char()    &ty_char_s
 #define ty_schar()   &ty_schar_s
@@ -1190,8 +1198,8 @@ static Type ty_void_s   = { TY_VOID,   1, 0, false, 0, {{ 0, 0 }}};
 #define ty_void()    &ty_void_s
 #define ty_size_t()  &ty_ulong_s
 
-#define is_ptrish(t)  ((t)->flags & IS_PTRISH)
-#define ty_is_unsigned(t)  ((t)->is_unsigned)
+#define ty_is_unsigned(t)  ((t)->pflags & IS_UNSIGNED)
+#define is_ptrish(t)       ((t)->pflags & IS_PTRISH)
 
 static const char *type_str(const Type *t) {
     if (!t) return "<null>";
@@ -1199,14 +1207,9 @@ static const char *type_str(const Type *t) {
     return type_name[t->kind];
 }
 
-static Type *ptr_to(Type *base) {
-    Type *t = allocz(1, sizeof(Type));
-    t->kind = TY_PTR; t->size = 8; t->align = 8; t->flags |= IS_PTRISH;
-    t->ptr = base; return t;
-}
 static unsigned int ty_size(Type *t) {
     switch (t->kind) {
-    case TY_ARRAY:  return ty_size(t->ptr) * t->arr_len;
+    case TY_ARRAY:  return ty_size(t->base) * t->arr_len;
     case TY_VOID:   return 0;
     case TY_STRUCT: case TY_UNION: return t->struct_size;
     default:        return t->align;
@@ -1214,17 +1217,58 @@ static unsigned int ty_size(Type *t) {
 }
 // element size for pointer/array arithmetic (bytes per step); 0 if not a pointer
 static unsigned int elem_size(Type *t) {
-    if (t->kind == TY_ARRAY) return ty_size(t->ptr);
-    if (t->kind == TY_PTR) { unsigned int s = ty_size(t->ptr); return s ? s : 1; }
-    return 0;
+    switch (t->kind) {
+    case TY_ARRAY: return ty_size(t->base);
+    case TY_PTR:   { unsigned int s = ty_size(t->base); return s ? s : 1; }
+    default:       return 0;
+    }
+}
+
+static Type *qualified_type(Type *base, unsigned char qflags) {
+    if (base->qflags == qflags) return base;
+    if (!base->qtypes) base->qtypes = base;
+    for (Type *t = base->qtypes; t != base; t = t->qtypes) {
+        if (t->qflags == qflags) return t;
+    }
+    Type *t = allocz(1, sizeof(Type));
+    memcpy(t, base, sizeof(Type));
+    t->qflags = qflags;
+    t->cache = NULL;
+    t->qtypes = base;
+    return base->qtypes = t;
+}
+
+static Type *ptrish_type(Type *base, TypeKind kind, size_t len, Node *len_expr, unsigned char qflags, unsigned char pflags) {
+    Type *t, **tp = NULL;
+    pflags |= IS_PTRISH;
+    if (!len_expr) {
+        for (tp = &base->cache; (t = *tp); tp = &t->next) {
+            if (t->kind == kind && t->qflags == qflags
+            &&  t->pflags == pflags && t->arr_len == len) {
+                return t;
+            }
+        }
+    }
+    t = allocz(1, sizeof(Type));
+    t->kind = kind; t->align = base->align; t->qflags = qflags; t->pflags = pflags;
+    t->arr_len = (unsigned)len; t->arr_size = ty_size(base) * (unsigned)len; // XXX: problem if base is incomplete
+    t->base = base; t->arr_len_expr = len_expr;
+    if (kind == TY_PTR) { t->align = 8; t->size = 8; }
+    else { t->qflags |= base->qflags; }
+    if (tp) return *tp = t;
+    return t;
+}
+static Type *ptr_to(Type *base, unsigned char qflags) {
+    return ptrish_type(base, TY_PTR, 0, NULL, qflags, 0);
 }
 static bool same_type(Type *t1, Type *t2) {
+    // XXX: handle qualifiers and take `compatible` flag
     if (t1 && t2) {
         if (t1 == t2) return true;
         if (t1->kind != t2->kind) return false;
         switch (t1->kind) {
-        case TY_ARRAY: return t1->flags == t2->flags && t1->arr_len == t2->arr_len && same_type(t1->ptr, t2->ptr);
-        case TY_PTR:   return same_type(t1->ptr, t2->ptr);
+        case TY_ARRAY: return t1->pflags == t2->pflags && t1->arr_len == t2->arr_len && same_type(t1->base, t2->base);
+        case TY_PTR:   return same_type(t1->base, t2->base);
         case TY_STRUCT: case TY_UNION: case TY_ENUM:
             // XXX: this is not strictly sufficient because of possible shadowing
             // XXX: also this is incorrect if tag is 0
@@ -1282,8 +1326,8 @@ enum TypeFlags enum_type(unsigned) {  // tflags
     HAS_TYPE     = 1 << (K_ENUM     - K_INT),  // typename, enum, struct, union
 };
 enum QualifierFlags enum_type(unsigned) {  // sflags
-    HAS_CONST    = 1 << (K_CONST    - K_CONST),
-    HAS_VOLATILE = 1 << (K_VOLATILE - K_CONST),
+    //HAS_CONST    = 1 << (K_CONST    - K_CONST),   // must be 1
+    //HAS_VOLATILE = 1 << (K_VOLATILE - K_CONST),   // must be 2
     //HAS_AUTO     = 1 << (K_AUTO     - K_CONST),
     HAS_STATIC   = 1 << (K_STATIC   - K_CONST),
     HAS_REGISTER = 1 << (K_REGISTER - K_CONST),
@@ -1317,6 +1361,7 @@ struct Node {
 #define HAS_CONTINUE  8     // N_FOR, N_DO, N_WHILE
 #define HAS_DEFAULT   16    // N_SWITCH
 #define HAS_PAREN     32    // all E-nodes
+#define LAB_USED      64    // N_LABEL
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
@@ -1340,7 +1385,7 @@ struct Node {
         Node *finit;        // N_FOR
     };
     Node *lhs;              // all nodes except N_NUM, N_STR, N_VAR, N_DEFAULT, N_GOTO, N_LABEL
-    Node *rhs;              // binary E-nodes, N_IF, N_WHILE, N_FOR, N_DOWHILE
+    Node *rhs;              // binary E-nodes, N_IF, N_WHILE, N_FOR, N_DOWHILE, N_LABEL list
     union {
         Node *cond;         // ternary E-nodes, N_IF, N_FOR, N_DOWHILE, N_SWITCH, N_CASE
         Type *type_arg;     // N_SIZEOF, N_BUILTIN (va_arg)
@@ -1367,16 +1412,14 @@ static void error(Node *n, const char *fmt, ...) {
     va_list a; va_start(a, fmt); err_message(loc, "error", fmt, a); va_end(a);
     if (1) exit(1);
 }
-static Type *array_of(Type *base, bool has_len, size_t len, Node *len_expr) {
-    Type *arr = allocz(1, sizeof(Type));
-    arr->kind = TY_ARRAY; arr->align = base->align; arr->flags |= IS_PTRISH;
-    arr->ptr = base; arr->arr_len = (unsigned)len; arr->arr_len_expr = len_expr;
-    if (has_len) arr->flags |= HAS_LEN;
-    if (len_expr && (len_expr->flags & CONST_VAL)) {
-        arr->arr_len = (unsigned)len_expr->uval;
-        arr->arr_size = ty_size(base) * arr->arr_len;  // XXX: problem if base is incomplete
+static Type *array_of(Type *base, size_t len, Node *len_expr, unsigned char qflags, unsigned char pflags) {
+    if (len_expr) {
+        if (len_expr->flags & CONST_VAL) len = len_expr->uval;
+        if (len_expr->kind == N_NUM) len_expr = NULL;
+        pflags |= HAS_LEN;
     }
-    return arr;
+    TypeKind kind = (pflags & IS_FUN_ARG) ? TY_PTR : TY_ARRAY;
+    return ptrish_type(base, kind, len, len_expr, qflags, pflags);
 }
 
 // ---- symbols ----
@@ -1408,13 +1451,20 @@ static unsigned char scope_depth;
 static Sym *sym_link(atom_t name, Sym *s) {
     Sym *prev = atom_sym(name);
     Sym *shadow = prev;
-   // XXX: should check consistency with forward definition
+    // XXX: this test should be moved to the callers, should merge tags first
     while (shadow) {
-        if ((shadow->sflags & HAS_EXTERN) || shadow->fn) shadow = shadow->next_sym;
-        else {
+        if (shadow->scope_depth == scope_depth) {
+            if ((shadow->sflags & HAS_EXTERN) || shadow->fn) {
+                // XXX: should check consistency with forward declaration
+                shadow = shadow->next_sym;
+                continue;
+            }
+            warning(s->loc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
+        } else {
             warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
-            note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
         }
+        note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
+        break;
     }
     s->next_sym = prev;
     return atom_sym(name) = s;
@@ -1541,7 +1591,7 @@ struct Func {
 #define HAS_FRAME  4  // function has a standard frame
     unsigned char nparams, flags; bool is_variadic, used;
     srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
-    Sym *params; Node *body; Type *rtype; Label *labels;
+    Sym *params; Node *body; Type *rtype; Node *labels;
     struct Func *next;
 };
 
@@ -1597,8 +1647,8 @@ static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(unsigned int *flags);
 static Node *parse_decl_stmt(void);
-static Label *add_label(Node *n);
-static Label *find_label(atom_t name);
+static void add_label(Node *n);
+static Node *find_label(atom_t name);
 static Node *parse_const_expr(void);
 static Node *parse_init(void);
 static bool eval_expr(Node *n, Value *vp);
@@ -1607,25 +1657,34 @@ static Type *static_typeof(Node *n, Type *def);
 
 static Type *parse_ptrs(Type *base, unsigned *flagsp) {
     while (eat(T_STAR)) {
-        base = ptr_to(base);
-        unsigned flags = *flagsp & ~(HAS_CONST | HAS_VOLATILE);
+        unsigned char qflags = 0;
         for (;;) {
-            if (eat(K_CONST) && !(flags & HAS_CONST)) { flags |= HAS_CONST; continue; }
-            if (eat(K_VOLATILE) && !(flags & HAS_VOLATILE)) { flags |= HAS_VOLATILE; continue; }
+            if (eat(K_CONST) && !(qflags & HAS_CONST))       { qflags |= HAS_CONST;    continue; }
+            if (eat(K_VOLATILE) && !(qflags & HAS_VOLATILE)) { qflags |= HAS_VOLATILE; continue; }
             break;
         }
-        *flagsp = flags;
+        base = ptr_to(base, qflags);
+        *flagsp = (*flagsp & ~(HAS_CONST | HAS_VOLATILE)) | qflags;
     }
     return base;
 }
 
-static Type *parse_array(Type *t) {
-    bool has_len = false;
+static Type *parse_array(Type *base, unsigned char pflags) {
     Node *len_expr = NULL;
-    if (!at(T_RBRK)) { has_len = true; len_expr = parse_const_expr(); }
+    unsigned char qflags = 0;
+    for (;;) {
+        if (pflags & IS_FUN_ARG) {
+            if (eat(K_CONST)    && !(qflags & HAS_CONST))      { qflags |= HAS_CONST;    continue; }
+            if (eat(K_VOLATILE) && !(qflags & HAS_VOLATILE))   { qflags |= HAS_VOLATILE; continue; }
+            if (eat(K_STATIC)   && !(pflags & HAS_STATIC_LEN)) { pflags |= HAS_STATIC_LEN;   continue; }
+            if (eat(T_STAR))                                   { pflags |= HAS_STAR;     break; }
+        }
+        if ((pflags & HAS_STATIC_LEN) || !at(T_RBRK)) len_expr = parse_const_expr();
+        break;
+    }
     expect(T_RBRK);
-    if (eat(T_LBRK)) t = parse_array(t);
-    return array_of(t, has_len, 0, len_expr);
+    if (eat(T_LBRK)) base = parse_array(base, 0);
+    return array_of(base, 0, len_expr, qflags, pflags);
 }
 
 static void shift_members(Member *m) {
@@ -1656,7 +1715,7 @@ static Type *parse_struct(int kind) {
                 atom_t name = 0;
                 if (at(T_ID)) {
                     name = getid();
-                    if (eat(T_LBRK)) mt = parse_array(mt);
+                    if (eat(T_LBRK)) mt = parse_array(mt, 0);
                 } else {
                     // accept unnamed members, must be untagged aggregate types (except bit-fields)
                     if (!(mt->kind == TY_STRUCT || mt->kind == TY_UNION) && !mt->struct_tag)
@@ -1779,7 +1838,6 @@ static Node *parse_string(void) {
     if (!at(T_STR)) expect(T_STR);
     atom_t str = cur()->str;
     Node *n = new_node(N_STR); n->str = str; P++;
-    n->type = ptr_to(ty_char());
     if (at(T_STR)) {    // concatenate juxtaposed strings
         char buf[8192]; size_t len = 0;
         for (;;) {
@@ -1790,10 +1848,12 @@ static Node *parse_string(void) {
         }
         if (len == sizeof buf) error(n, "string too long");
         n->str = new_atom_len(buf, len);
-#ifdef ATOM_STATS
-        atom_flags(n->str) |= ATOM_STRING;
-#endif
     }
+#ifdef ATOM_STATS
+    atom_flags(n->str) |= ATOM_STRING;
+#endif
+    //n->type = array_of(qualified_type(ty_char(), HAS_CONST), atom_len(n->str) + 1, NULL, 0, 0);
+    n->type = ptr_to(ty_char(), HAS_CONST); // incorrect type!
     return n;
 }
 
@@ -2097,7 +2157,7 @@ static Type *parse_type_base_only(unsigned int *pflags) {
         case K_STRUCT:    if (t) goto invalid; t = parse_struct(TY_STRUCT); tflags |= HAS_TYPE; break;
         case K_UNION:     if (t) goto invalid; t = parse_struct(TY_UNION);  tflags |= HAS_TYPE; break;
         default:
-            if (t) return t;
+            if (t) return qualified_type(t, sflags & (HAS_CONST | HAS_VOLATILE));
             if (k == T_ID && (t = find_typedef(toks[P].name))) { tflags |= HAS_TYPE; P++; break; }
             error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
         }
@@ -2433,17 +2493,13 @@ static bool eval_const_expr(Node *n, Value *vp, const char *context) {
 }
 
 // ---- top level ----
-struct Label { atom_t name; bool used; Node *n; Label *next; };
-static Label *add_label(Node *n) {
-    Label *lab = allocz(1, sizeof(Label));
-    lab->name = n->name;
-    lab->n = n;
-    lab->next = this_fn->labels;
-    return this_fn->labels = lab;
+static void add_label(Node *n) {
+    n->rhs = this_fn->labels;
+    this_fn->labels = n;
 }
-static Label *find_label(atom_t name) {
-    for (Label *lab = this_fn->labels; lab; lab = lab->next) {
-        if (lab->name == name) return lab;
+static Node *find_label(atom_t name) {
+    for (Node *n = this_fn->labels; n; n = n->rhs) {
+        if (n->name == name) return n;
     }
     return NULL;
 }
@@ -2487,11 +2543,7 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
         Type *pt = parse_ptrs(parse_type_base_only(&pflags), &pflags);
         atom_t pname = 0;
         if (at(T_ID)) pname = getid();   // argument name is optional
-        if (eat(T_LBRK)) {
-            pt = parse_array(pt);   // pseudo array function parameter
-            pt->kind = TY_PTR;
-            pt->align = 8;
-        }
+        if (eat(T_LBRK)) pt = parse_array(pt, IS_FUN_ARG);
         // XXX should not recreate arglist if has_prototype
         if (has_prototype && *pp && !same_type((*pp)->type, pt)) {
             warning(ploc, "type mismatch with prototype on argument %d", np + 1);
@@ -2555,14 +2607,13 @@ static Node *parse_decl_stmt(void) {
             }
         } else {
             if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
-            if (eat(T_LBRK)) t = parse_array(t);
+            if (eat(T_LBRK)) t = parse_array(t, 0);
             s = add_sym(name, nloc, t, flags);
             if (eat(T_ASSIGN)) {
                 Node *init = s->init = parse_init();
-                if (t->kind == TY_ARRAY && !(t->flags & HAS_LEN) && init->kind == N_BLOCK) {
-                    t->flags |= HAS_LEN;
-                    t->arr_len = node_length(init->rhs);
-                    t->arr_size = ty_size(base) * t->arr_len;
+                if (init->kind == N_BLOCK && t->kind == TY_ARRAY && !(t->pflags & HAS_LEN)) {
+                    s->type = array_of(t->base, node_length(init->rhs), NULL, t->qflags, HAS_LEN);
+                    if (s->kind == K_AUTO) set_local_offset(s);
                 }
             }
         }
@@ -2599,16 +2650,14 @@ static void parse_toplevel(void) {
     if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
     // global variable(s):  type name [= ...] (, ...) ;
     for (;;) {
-        if (eat(T_LBRK)) t = parse_array(t);
-        Sym *sym = add_sym(name, nloc, t, flags);
-        sym->sflags = (unsigned char)flags;
-        if (flags & HAS_TYPEDEF) sym->kind = K_TYPEDEF;
+        if (eat(T_LBRK)) t = parse_array(t, 0);
+        Sym *s = add_sym(name, nloc, t, flags);
+        s->sflags = (unsigned char)flags;
+        if (flags & HAS_TYPEDEF) s->kind = K_TYPEDEF;
         else if (eat(T_ASSIGN)) {
-            Node *init = sym->init = parse_init();
-            if (t->kind == TY_ARRAY && !(t->flags & HAS_LEN) && init->kind == N_BLOCK) {
-                t->flags |= HAS_LEN;
-                t->arr_len = node_length(init->rhs);
-                t->arr_size = ty_size(base) * t->arr_len;
+            Node *init = s->init = parse_init();
+            if (init->kind == N_BLOCK && t->kind == TY_ARRAY && !(t->pflags & HAS_LEN)) {
+                s->type = array_of(t->base, node_length(init->rhs), NULL, t->qflags, HAS_LEN);
             }
         }
     next:
@@ -2725,7 +2774,7 @@ static bool has_flow(Node *n) {
 }
 
 static Member *find_member(Type *st, atom_t name, Node *n) {
-    if (st->kind == TY_PTR) st = st->ptr;
+    if (st->kind == TY_PTR) st = st->base;
     for (Member *m = st->members; m; m = m->next) {
         if (m->name == name) return m;
         if (!m->name) {
@@ -2985,8 +3034,8 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
 #ifndef XXX//@@@
         Type *t = gen_expr(n->lhs, r, save_rax);
         if (offset) emit_reg_imm("add", r, offset);
-        //return t; //is_ptrish(t) ? t->ptr : ty_long(); @@@
-        return is_ptrish(t) ? t->ptr : ty_long();
+        //return t; //is_ptrish(t) ? t->base : ty_long(); @@@
+        return is_ptrish(t) ? t->base : ty_long();
 #else
         Type *t = gen_expr(n->lhs, r, save_rax);
         if (offset) emit_reg_imm("add", r, offset);
@@ -3009,7 +3058,7 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
 static Type *static_typeof(Node *n, Type *def) {
     switch (n->kind) {
     case N_NUM:    return n->type ? n->type : def;
-    case N_STR:    return array_of(ty_char(), true, atom_len(n->str) + 1, NULL);
+    case N_STR:    return array_of(qualified_type(ty_char(), HAS_CONST), atom_len(n->str) + 1, NULL, 0, HAS_LEN);
     case N_CAST:   return n->type;
     case N_VAR:    { Sym *s = lookup(n->name, NULL); return s ? s->type : def; }
     case N_MEMBER: {
@@ -3017,8 +3066,8 @@ static Type *static_typeof(Node *n, Type *def) {
         Member *m = find_member(st, n->name, n);
         return m ? m->type : def;
     }
-    case N_DEREF:  { Type *t = static_typeof(n->lhs, NULL); return t && is_ptrish(t) ? t->ptr : def; } // should report error
-    case N_ADDR:   { Type *t = static_typeof(n->lhs, NULL); return t ? ptr_to(t) : def; }
+    case N_DEREF:  { Type *t = static_typeof(n->lhs, NULL); return t && is_ptrish(t) ? t->base : def; } // should report error
+    case N_ADDR:   { Type *t = static_typeof(n->lhs, NULL); return t ? ptr_to(t, 0) : def; }
     default:       return def;
     }
 }
@@ -3689,12 +3738,12 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         return promote_reg(n->type, r);
     case N_DEREF: {
         Type *t = gen_expr(n->lhs, r, save_rax);
-        Type *pt = is_ptrish(t) ? t->ptr : ty_long();
+        Type *pt = is_ptrish(t) ? t->base : ty_long();
         return load_ind(pt, r, r, 0);
     }
     case N_ADDR: {
         Type *t = gen_addr(n->lhs, r, save_rax, 0);
-        return ptr_to(t); // XXX why allocate new type!
+        return ptr_to(t, 0);
     }
     case N_ASSIGN: {
         Type *lt; Node *lhs = n->lhs;
@@ -4343,13 +4392,13 @@ static Flow gen_stmt(Node *n) {
     case N_BREAK:    emit_jmp(n, "jmp", brk_lbl[loop_sp]);  return FLOW_NONE;
     case N_CONTINUE: emit_jmp(n, "jmp", cont_lbl[loop_sp]); return FLOW_NONE;
     case N_GOTO: {
-        Label *lab = find_label(n->name);
+        Node *lab = find_label(n->name);
         if (!lab) {
             error(n, "label '%s' not found", atom_str(n->name));
             break;
         }
-        lab->used = true;
-        emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", lab->n->lab);
+        lab->flags |= LAB_USED;
+        emit_comment(atom_str(n->name)); emit_jmp(n, "jmp", lab->lab);
         return FLOW_NONE;
     }
     case N_ASM: return gen_asm(n);
@@ -4364,7 +4413,7 @@ static void gen_func(Func *fn) {
     // space out functions so small modifications do not change all labels
     label_id = ((label_id / 10) + 1) * 10;
     this_fn = fn;
-    for (Label *lab = fn->labels; lab; lab = lab->next) { lab->n->lab = label_id++; }
+    for (Node *lab = fn->labels; lab; lab = lab->rhs) { lab->lab = label_id++; }
     if (fn->is_variadic) {
         // reserve extra space to save registers for variadic functions
         // only save registers beyond the last named parameter
@@ -4476,8 +4525,11 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
             }
             break;
         case TY_PTR:
-            if (t->ptr->kind == TY_CHAR) {
+            if (t->base->kind == TY_CHAR) {
                 if (init->kind == N_STR) {
+                    if (!(t->base->qflags & HAS_CONST)) {
+                        warning(init->loc, "pointer initialization overrides 'const' qualifier");
+                    }
                     atom_flags(init->str) |= ATOM_USED;
                     if (s) {
                         gen_addr(init, RAX, false, 0);
@@ -4513,7 +4565,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
                         gen_init_zero(s, offset + off, ty_size(t) - off);
                         break;
                     }
-                    gen_init(t->ptr, 0, e, NULL, s, offset + off);
+                    gen_init(t->base, 0, e, NULL, s, offset + off);
                     e = e->next;
                 }
                 return;
@@ -4590,7 +4642,7 @@ static int output_token(FILE *fp, Token *t) {
             char *p = buf + 68; *--p = '\0';
             unsigned long val = t->uval;
             unsigned char base = t->base;
-            if (ty_is_unsigned(t)) *--p = 'U';
+            if (t->is_unsigned) *--p = 'U';
             if (t->is_long) *--p = 'L';
             do { *--p = "0123456789abcdef"[val % base]; } while (val /= base);
             switch (base) {

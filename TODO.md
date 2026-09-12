@@ -1,11 +1,10 @@
 # TODO list
 
 * merge upstream
-* remove `Label` type: use linked list of `N_LABEL` nodes.
 * support function pointers
 * add analysis pass:
-  - constant folding
-  - type resolution
+  - late constant folding
+  - automatic library fetch
   - register allocation, stack usage
   - set discard information
   - [90%] detect unreachable code
@@ -21,21 +20,17 @@
 * [20%] optimize <expr> = <const> and <expr> = <sym>
 * share code between `emit_idiv_imm` and `emit_imod_imm`
 * use common type for `N_TERNARY`
-* [X] should refine `errno` test in `__syscall` builtin
-* [10%] optimize tests for constant conditions in `N_IF` and loop statements
 * direct load and store
 * improve inc / dec
-* `gen_stmt` should return flow state
 * `gen_expr` should return flow state and flags state
 * elide register reload:
 * use generic save mask
 * use spill area and stop `push`/`pop` method
 * use unpromoted ABI and promote if needed
-* merge `parse_tolevel` and `parse_decl` or `parse_stmt`
+* merge `parse_toplevel` and `parse_decl` or `parse_stmt`
 * [95%] optimize code gen for condition expressions
 * [50%] complete support for short/int/long semantics
 * [50%] complete support of unsigned semantics
-* [X] `return cond ? a : b` ->  `if (cond) return a; else return b;`
 * check and convert function arguments according to prototype
 * fix bogus 2D array handling
 * accept more than 6 function arguments
@@ -59,7 +54,6 @@
 * add `get_loc` to generate better load/store/update code
 * `stdin`, `stdout` and `stderr` should be defined as pointers
 * should support `__func__`, a pre-defined static local `char` array
-* analyser pass for variable scoping and lazy constant folding
 * support `extern`, `static`, `typedef` correctly
 * accept flexible arrays at end of `struct`/`union` definition, and flag recursively
 * check if strings with embedded null bytes can be output as `.string`
@@ -71,7 +65,7 @@
 * support bit-field proper layout
 * `expect_id()`, `expect_string()`: check kind, increment `P`, return data
 * [50%] add timings and other stats using helper program
-* emit static data initializers for non constant elements (eg: `char a, *p = &a;`)
+* emit static data initializers for address expressions (eg: `char a, *p = &a;`)
 * more optimizations
 * complete library
 * more intrinsics
@@ -95,13 +89,13 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 ```
 * optimize member load and assignments:
 ```c
-            if (lhs->kind == N_MEMBER && lhs->lhs->kind === N_VAR) {
-                gen_expr(n->rhs, r, save_rax);
-                resolve_name(lhs->lhs);
-                lt = store_var(lhs->decl, 0, lhs->decl->type, r);
-                if (!(n->flags & DISCARD)) promote_reg(lt, r);
-                return lt;
-            }
+    if (lhs->kind == N_MEMBER && lhs->lhs->kind === N_VAR) {
+        gen_expr(n->rhs, r, save_rax);
+        resolve_name(lhs->lhs);
+        lt = store_var(lhs->decl, 0, lhs->decl->type, r);
+        if (!(n->flags & DISCARD)) promote_reg(lt, r);
+        return lt;
+    }
 ```
 * += should not push previous value
 * support `\uxxxx`, `\Uxxxxxxxx`, `\u{x+}`, `\U{x+}`,
