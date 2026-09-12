@@ -110,12 +110,6 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
   - `_Countof` _unary-expression_
   - `_Countof` `(` _type-name_ `)`
   - `alignof` `(` _type-name_ `)`
-  - _static-assertion_
-* parse _static-assertion_:
-  - `static_assert` `(` _constant-expression_ `,` _string-literal_ `)`
-  - `static_assert` `(` _constant-expression_ `)`
-* parse _static_assert-declaration_ as a _declaration_:
-  -  _static-assertion_ `;`
 * support initialized `const` variables as _constant-expression_
 * support _constant-range-expression_:
   - _constant-expression_ `...` _constant-expression_

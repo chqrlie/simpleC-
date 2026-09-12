@@ -405,7 +405,7 @@ typedef enum TokenKind enum_type(unsigned char) {
 
     K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
     K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF,
-    K_SWITCH, K_CASE, K_DEFAULT, K_GOTO,
+    K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_STATIC_ASSERT,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
     K_INCLUDE, K_LINE, ID__FILE__, ID__LINE__, ID__COUNTER__,
@@ -437,7 +437,7 @@ static const char * const token_name[T_count] = {
     "signed", "unsigned", "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
     "for", "do", "break", "continue", "sizeof",
-    "switch", "case", "default", "goto",
+    "switch", "case", "default", "goto", "static_assert",
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
     "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
     "__builtin_va_start", "va_start", "__builtin_va_arg", "va_arg",
@@ -1349,7 +1349,7 @@ typedef enum NodeKind enum_type(unsigned char) {
     N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
     N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH,
     N_CASE, N_DEFAULT, N_LABEL,
-    N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM,
+    N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM, N_STATIC_ASSERT,
 } NodeKind;
 
 struct Node {
@@ -1481,6 +1481,7 @@ static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) 
     Sym *s = allocz(1, sizeof(Sym));
     s->name = name; s->loc = loc; s->type = type; s->sflags = (unsigned char)sflags;
     s->scope_depth = scope_depth;
+    if (sflags & HAS_TYPEDEF) s->kind = K_TYPEDEF;
     if (scope_depth) {
         // XXX: should handle HAS_THREAD_LOCAL
         // Do not test HAS_AUTO because `auto` now means infer type and can be applied to any storage class
@@ -1653,6 +1654,7 @@ static Node *parse_const_expr(void);
 static Node *parse_init(void);
 static bool eval_expr(Node *n, Value *vp);
 static bool eval_const_expr(Node *n, Value *vp, const char *context);
+static void eval_static_assertion(Node *n);
 static Type *static_typeof(Node *n, Type *def);
 
 static Type *parse_ptrs(Type *base, unsigned *flagsp) {
@@ -1997,6 +1999,18 @@ static Node *parse_postfix(void) {
     }
 }
 
+// _static-assertion_:
+// - `static_assert` `(` _constant-expression_ `,` _string-literal_ `)`
+// - `static_assert` `(` _constant-expression_ `)`
+static Node *parse_static_assertion(void) {
+    Node *n = new_node(N_STATIC_ASSERT); P++;
+    expect(T_LP);
+    n->lhs = parse_const_expr();
+    if (eat(T_COMMA)) n->rhs = parse_string();
+    expect(T_RP);
+    return n;
+}
+
 #define parse_cast_expression() parse_unary(true)
 static Node *parse_unary(bool accept_cast) {
     Node *n;
@@ -2031,7 +2045,7 @@ static Node *parse_unary(bool accept_cast) {
                    return n;
     case T_INC:
     case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
-    //case K_STATIC_ASSERT:
+    case K_STATIC_ASSERT: return parse_static_assertion();
     case T_LP:
         if (accept_cast && is_type_start(&toks[P+1])) {
             n = new_node(N_CAST); P++;
@@ -2238,66 +2252,67 @@ static Node *parse_block(void) {
     return scope_pop(n);
 }
 
+static Node *parse_switch(void) {
+    Node *sw = this_switch;
+    Node *n = new_node(N_SWITCH); P++;
+    this_switch = n;
+    expect(T_LP); n->cond = parse_expr(); expect(T_RP);
+    n->rhs = parse_block();
+    this_switch = sw;
+    return n;
+}
+
+static Node *parse_case(NodeKind kind) {
+    Node *sw = this_switch;
+    if (!sw) error(NULL, "'%s' outside a 'switch' statement", token_str(cur()));
+    Node *n = new_node(kind); P++;
+    if (kind == N_CASE) {
+        n->cond = parse_const_expr();
+        if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
+    } else { // N_DEFAULT
+        if (sw) {
+            if (sw->flags & HAS_DEFAULT) {
+                error(NULL, "duplicate 'default' in 'switch' statement");
+            }
+            sw->flags |= HAS_DEFAULT;
+        }
+        n->name = K_DEFAULT;
+    }
+    if (sw) {
+        // append node to case list (quadratic but small n)
+        // keep 'default' node at the end of list
+        Node **np = &sw->lhs, *e;
+        while ((e = *np) && e->kind != N_DEFAULT) np = &e->lhs;
+        n->lhs = e; *np = n;
+    }
+    expect(T_COLON);
+    return n;
+}
+
 static Node *parse_stmt(void) {
     Node *n;
-    if (at(T_LBRACE)) return parse_block();
-    if (at(T_SEMI))  { n = new_node(N_EMPTY); P++; return n; }
-    if (at(K_IF)) {
+    switch (toks[P].kind) {
+    case T_LBRACE: return parse_block();
+    case T_SEMI:   n = new_node(N_EMPTY); P++; return n;
+    case K_IF:
         n = new_node(N_IF); P++;
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_stmt();
         if (eat(K_ELSE)) n->rhs = parse_stmt();
         return n;
-    }
-    if (at(K_WHILE)) {
+    case K_WHILE:
         n = new_node(N_WHILE); P++;
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_loop_body(n);
         return n;
-    }
-    if (at(K_SWITCH)) {
-        n = new_node(N_SWITCH); P++;
-        expect(T_LP); n->cond = parse_expr(); expect(T_RP);
-        Node *save_this_switch = this_switch;
-        this_switch = n;
-        n->rhs = parse_block();
-        this_switch = save_this_switch;
-        return n;
-    }
-    if (at(K_CASE)) {
-        if (!this_switch) error(NULL, "'case' outside a 'switch' statement");
-        n = new_node(N_CASE); P++; n->cond = parse_const_expr();
-        if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
-        goto link_case;
-    }
-    if (at(K_DEFAULT))  {
-        if (!this_switch) error(NULL, "'default' outside a 'switch' statement");
-        else {
-            if (this_switch->flags & HAS_DEFAULT) {
-                error(NULL, "duplicate 'default' in 'switch' statement");
-            }
-            this_switch->flags |= HAS_DEFAULT;
-        }
-        n = new_node(N_DEFAULT); P++;
-        n->name = K_DEFAULT;
-    link_case:
-        if (this_switch) {
-            // append node to case list (quadratic but small n)
-            // keep 'default' node at the end of list
-            Node **np = &this_switch->lhs, *e;
-            while ((e = *np) && e->kind != N_DEFAULT) np = &e->lhs;
-            n->lhs = e; *np = n;
-        }
-        expect(T_COLON);
-        return n;
-    }
-    if (at(K_GOTO)) {
+    case K_SWITCH:  return parse_switch();
+    case K_CASE:    return parse_case(N_CASE);
+    case K_DEFAULT: return parse_case(N_DEFAULT);
+    case K_GOTO:
         n = new_node(N_GOTO); P++;
         n->name = getid();
-        expect(T_SEMI);
-        return n;
-    }
-    if (at(K_FOR)) {
+        break;
+    case K_FOR:
         n = new_node(N_FOR); P++; scope_push(n);
         expect(T_LP);
         if (is_type_start(cur())) n->finit = parse_decl_stmt();      // consumes ';'
@@ -2311,47 +2326,53 @@ static Node *parse_stmt(void) {
         expect(T_RP);
         n->lhs = parse_loop_body(n);
         return scope_pop(n);
-    }
-    if (at(K_DO)) {
+    case K_DO:
         n = new_node(N_DOWHILE); P++;
         n->lhs = parse_loop_body(n);
-        expect(K_WHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP); expect(T_SEMI);
-        return n;
-    }
-    if (at(K_BREAK)) {
+        expect(K_WHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP);
+        break;
+    case K_BREAK:
         if (this_switch) { this_switch->flags |= HAS_BREAK; }
         else if (this_loop) { this_loop->flags |= HAS_BREAK; }
         else { error(NULL, "'break' outside a loop or 'switch' statement"); }
-        n = new_node(N_BREAK); P++; expect(T_SEMI); return n;
-    }
-    if (at(K_CONTINUE)) {
+        n = new_node(N_BREAK); P++;
+        break;
+    case K_CONTINUE:
         if (this_loop) { this_loop->flags |= HAS_CONTINUE; }
         else error(NULL, "'continue' outside a loop statement");
-        n = new_node(N_CONTINUE); P++; expect(T_SEMI); return n;
-    }
-    if (at(K_RETURN)) {
+        n = new_node(N_CONTINUE); P++;
+        break;
+    case K_RETURN:
         n = new_node(N_RETURN); P++;
         if (!at(T_SEMI)) n->lhs = parse_expr();
-        expect(T_SEMI);
-        return n;
-    }
-    if (at(K_ASM) || at(K__ASM__)) {
+        break;
+    case K_ASM: case K__ASM__:
         n = new_node(N_ASM); P++;
         expect(T_LP);
         n->str = parse_string()->str;
-        expect(T_RP); expect(T_SEMI);
-        return n;
+        expect(T_RP);
+        break;
+    case K_STATIC_ASSERT:
+        // _static_assert-declaration_: _static-assertion_ `;`
+        n = parse_static_assertion();
+        break;
+    case T_ID:
+        if (toks[P+1].kind == T_COLON) {
+            n = new_node(N_LABEL);
+            n->name = getid();
+            if (find_label(n->name)) warning(n->loc, "duplicate label '%s'", atom_str(n->name));
+            add_label(n);
+            // C grammar specifies N_LABEL as prefixing a statement
+            expect(T_COLON);
+            return n;
+        }
+        fallthrough;
+    default:
+        if (is_type_start(cur())) return parse_decl_stmt();
+        n = new_node(N_EXPR); n->lhs = parse_expr();
+        break;
     }
-    if (at(T_ID) && toks[P+1].kind == T_COLON) {
-        n = new_node(N_LABEL);
-        n->name = getid();
-        if (find_label(n->name)) warning(n->loc, "duplicate label '%s'", atom_str(n->name));
-        add_label(n);
-        expect(T_COLON);
-        return n;
-    }
-    if (is_type_start(cur())) return parse_decl_stmt();
-    n = new_node(N_EXPR); n->lhs = parse_expr(); expect(T_SEMI);
+    expect(T_SEMI);
     return n;
 }
 
@@ -2464,6 +2485,7 @@ static bool eval_expr(Node *n, Value *vp) {
             error(n, "division overflow in constant expression"); return false;
         }
         break;
+    case N_STATIC_ASSERT: eval_static_assertion(n); return true;
     default:
         error(n, "invalid expression"); return false;
     }
@@ -2490,6 +2512,20 @@ static bool eval_const_expr(Node *n, Value *vp, const char *context) {
         return false;
     }
     return true;
+}
+
+static void eval_static_assertion(Node *n) {
+    Value v;
+    eval_const_expr(n->lhs, &v, "static assertion expression");
+    if (!v.uval) {
+        if (n->rhs) {
+            error(n, "%s: %s", "static assertion failed",
+                  atom_str(n->rhs->str));
+        } else {
+            // should output expression source
+            error(n, "static assertion failed");
+        }
+    }
 }
 
 // ---- top level ----
@@ -2602,7 +2638,9 @@ static Node *parse_decl_stmt(void) {
         if (eat(T_LP)) {
             s = parse_function(t, flags, name, nloc);
             if (s->fn->body) {
-                warning(nloc, "local functions are not supported yet");
+                if (scope_depth) {
+                    warning(nloc, "local functions are not supported yet");
+                }
                 break;
             }
         } else {
@@ -2618,56 +2656,25 @@ static Node *parse_decl_stmt(void) {
             }
         }
         if (s) *tailp = s; tailp = &s->next_decl;
-        if (!eat(T_COMMA)) break;
+        if (!eat(T_COMMA)) { expect(T_SEMI); break; }
     }
-    expect(T_SEMI);
     return n;
 }
 
-static void parse_toplevel(void) {
-#if 0
+static Node *parse_toplevel(void) {
     Node *n = new_node(N_BLOCK);
     Node **tailp = &n->rhs;
     while (!at(T_EOF)) {
-        // XXX: should only accept N_DECL and static asserts
         Node *e = parse_stmt();
+        // should delay until analysis
+        switch (e->kind) {
+        case N_STATIC_ASSERT: eval_static_assertion(e); continue;
+        case N_DECL:          break;
+        default:              warning(e->loc, "global code is not supported yet"); break;
+        }
         *tailp = e; tailp = &e->next;
     }
-#else
-    unsigned int flags;
-    srcloc_t loc = curloc();
-    Type *base = parse_type_base_only(&flags);
-    if (eat(T_SEMI)) return;                           // bare  struct Foo { ... };
-    Type *t = parse_ptrs(base, &flags);
-    srcloc_t nloc = curloc();
-    atom_t name = getid();
-    // XXX: should parse function pointers and such
-    if (eat(T_LP)) {
-        Sym *s = parse_function(t, flags, name, nloc);
-        if (s->fn->body) return;
-        goto next;
-    }
-    if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
-    // global variable(s):  type name [= ...] (, ...) ;
-    for (;;) {
-        if (eat(T_LBRK)) t = parse_array(t, 0);
-        Sym *s = add_sym(name, nloc, t, flags);
-        s->sflags = (unsigned char)flags;
-        if (flags & HAS_TYPEDEF) s->kind = K_TYPEDEF;
-        else if (eat(T_ASSIGN)) {
-            Node *init = s->init = parse_init();
-            if (init->kind == N_BLOCK && t->kind == TY_ARRAY && !(t->pflags & HAS_LEN)) {
-                s->type = array_of(t->base, node_length(init->rhs), NULL, t->qflags, HAS_LEN);
-            }
-        }
-    next:
-        if (!eat(T_COMMA)) break;
-        t = parse_ptrs(base, &flags);
-        nloc = curloc();
-        name = getid();
-    }
-    expect(T_SEMI);
-#endif
+    return n;
 }
 
 // =====================================================================
@@ -4037,6 +4044,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             if (save_rax) emit("pop rax");
             return lt;
         }
+    case N_STATIC_ASSERT: eval_static_assertion(n); return ty_void();
     default:
         error(n, "cannot generate expression type %d", n->kind);
         return NULL;
