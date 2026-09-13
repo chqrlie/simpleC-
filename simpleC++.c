@@ -1371,6 +1371,7 @@ struct Node {
 #define HAS_DEFAULT   16    // N_SWITCH
 #define HAS_PAREN     32    // all E-nodes
 #define LAB_USED      64    // N_LABEL
+#define HAS_WARNED    64    // N_DESIGNATOR
 #define HAS_DESIGNATOR 128    // N_BLOCK initializer
     unsigned char flags;
 #define MAX_ARGS 6
@@ -1435,7 +1436,8 @@ static Type *array_of(Type *base, size_t len, Node *len_expr, unsigned char qfla
 struct Sym {
     // XXX: should store scope_depth to detect invalid redefinitions
     TokenKind kind;
-    unsigned char flags;   // CONST_VAL
+//#define CONST_VAL     2  // symbol has constant value (enum value)
+    unsigned char flags;
     unsigned char sflags;  // QualifierFlags (some missing)
     unsigned char is_tag;  // should use flag in `flags`
     unsigned char scope_depth, is_reg, reg;
@@ -1667,15 +1669,29 @@ static bool eval_const_expr(Node *n, Value *vp, const char *context);
 static void eval_static_assertion(Node *n);
 static Type *static_typeof(Node *n, Type *def);
 
+static bool eval_array_designator(Node *n, Value *v1, Value *v2) {
+    if (!n->cond) error(n, "unexpected member designator in array initializer");
+    eval_const_expr(n->cond, v1, "array designator expression");
+    v2->uval = v1->uval;
+    if (n->rhs) {
+        eval_const_expr(n->rhs, v2, "array designator expression");
+        if (v2->uval < v1->uval) {
+            if (!(n->rhs->flags & HAS_WARNED)) warning(n->loc, "array designator range is empty");
+            n->rhs->flags |= HAS_WARNED;
+            return false;
+        }
+    }
+    return true;
+}
+
 static unsigned initializer_length(Node *n) {
     size_t len = 0, max = 0;
     while (n) {
         if (n->kind == N_DESIGNATOR) {
-            Value v;
-            if (!n->rhs) error(n, "unexpected member designator in array initializer");
-            eval_const_expr(n->rhs, &v, "array designator expression");
+            Value v1, v2;
+            eval_array_designator(n, &v1, &v2);
             if (max < len) max = len;
-            len = v.uval;
+            len = v2.uval;
         }
         n = n->next; len++;
     }
@@ -1974,7 +1990,7 @@ static Node *parse_primary(void) {
             }
             expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
         }
-        if (s && s->flags & CONST_VAL) {
+        if (s && (s->flags & CONST_VAL)) {
             n->flags |= CONST_VAL;
             n->uval |= s->uval;
             n->type = s->type;
@@ -2245,7 +2261,8 @@ static Node *parse_designator(void) {
         switch (toks[P].kind) {
         case T_LBRK: // array designator
             n = new_node1(N_DESIGNATOR, n); P++;
-            n->rhs = parse_const_expr();
+            n->cond = parse_const_expr();
+            if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
             expect(T_RBRK);
             continue;
         case T_DOT: // member designator
@@ -4592,10 +4609,10 @@ static Node *get_array_initializer(Node *n, unsigned i) {
     size_t pos = 0;
     for (; n; n = n->next, pos++) {
         if (n->kind == N_DESIGNATOR) {
-            if (!n->rhs) error(n, "unexpected member designator in array initializer");
-            Value v;
-            eval_const_expr(n->rhs, &v, "array designator expression");
-            pos = v.uval;
+            Value v1, v2;
+            eval_array_designator(n, &v1, &v2);
+            if (i >= v1.uval && i <= v2.uval) found = n;
+            pos = v2.uval; continue;
         }
         if (pos == i) found = n;
     }
@@ -4635,7 +4652,7 @@ static Node *get_member_initializer(Type *t, Node *n, Member *m1) {
     Member *m = t->members;
     for (; n; n = n->next) {
         if (n->kind == N_DESIGNATOR) {
-            if (n->rhs) error(n, "unexpected array designator in struct initializer");
+            if (n->cond) error(n, "unexpected array designator in struct initializer");
             if (!m || n->name != m->name) {
                 m = find_member(t, n->name, NULL);
             }

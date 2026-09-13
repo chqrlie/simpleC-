@@ -76,10 +76,10 @@ $(TMP)/%_prog: examples/%.c $(BIN) build Makefile
 	$(AS) $(NOPIE) -nostdlib -static $@.s -o $@
 	$(RUN) ./$@
 
-%: %.c $(BIN) Makefile
-	$(BIN) $(FLAGS) $< -o $@.s
-	$(AS) $(NOPIE) -nostdlib -static $@.s -o $@
-	$(RUN) ./$@
+%: test/%.c $(BIN) Makefile
+	$(BIN) $(FLAGS) $< -o $(TMP)/$@.s
+	$(AS) $(NOPIE) -nostdlib -static $(TMP)/$@.s -o $(TMP)/$@
+	$(RUN) $(TMP)/$@
 
 test: $(TMP)/test_prog
 hello: $(TMP)/hello_prog
