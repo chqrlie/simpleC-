@@ -16,7 +16,8 @@
 # temporary files are created in the build directory
 
 CC     ?= gcc
-CFLAGS += -std=gnu11 -O2 -Wall -Wextra
+STD    ?= gnu11
+CFLAGS += -std=$(STD) -O2 -Wall -Wextra
 SIZE   ?= size
 STRIP  ?= strip
 NOPIE  ?= -no-pie
@@ -52,18 +53,20 @@ $(BIN): $(SRC) $(INC) Makefile
 build:
 	@mkdir -p $(TMP)
 
-extra: $(BIN) build
+extra: build
 ifneq (,$(shell which gcc))
-	gcc $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano_gcc_O2.s
-	gcc $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano_gcc_O0.s
-	gcc $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano_gcc_O2_g.s
-	gcc $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano_gcc_O0_g.s
+	gcc $(CFLAGS) -E -dM - < /dev/null > $(TMP)/gcc-E-dM.i
+	gcc $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano-gcc-O2.s
+	gcc $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano-gcc-O0.s
+	gcc $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano-gcc-O2-g.s
+	gcc $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano-gcc-O0-g.s
 endif
 ifneq (,$(shell which clang))
-	clang $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano_clang_O2.s
-	clang $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano_clang_O0.s
-	clang $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano_clang_O2_g.s
-	clang $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano_clang_O0_g.s
+	clang $(CFLAGS) -E -dM - < /dev/null > $(TMP)/clang-E-dM.i
+	clang $(CFLAGS) -S -O2    '$(SRC)' -o $(TMP)/nano-clang-O2.s
+	clang $(CFLAGS) -S -O0    '$(SRC)' -o $(TMP)/nano-clang-O0.s
+	clang $(CFLAGS) -S -O2 -g '$(SRC)' -o $(TMP)/nano-clang-O2-g.s
+	clang $(CFLAGS) -S -O0 -g '$(SRC)' -o $(TMP)/nano-clang-O0-g.s
 endif
 
 # Full end-to-end demo: nano_cc compiles the C source, GNU as assembles it,

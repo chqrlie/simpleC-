@@ -8,6 +8,7 @@
 #define nano_FILE FILE
 #define put1(c, fp)  putc(c, fp)
 #else
+// allow inclusion in printf-test.c and prevent warnings
 #pragma GCC diagnostic ignored "-Wpragmas"
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 #pragma GCC diagnostic ignored "-Wreserved-identifier"
@@ -20,6 +21,8 @@
 #endif
 typedef struct nano_FILE { size_t pos, cap, size; unsigned char *buf; } nano_FILE;
 #define put1(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)(c) : EOF)
+int snprintf(char *buf, size_t size, const char *fmt, ...) attr_printf(3, 4);
+int vfprintf(nano_FILE *fp, const char *fmt, va_list ap);
 static long __fwrite(const void *p, size_t len, nano_FILE *fp) {
     size_t nw = fp->cap - fp->pos; if (nw > len) nw = len;
     memcpy(fp->buf + fp->pos, p, nw); fp->pos += nw;

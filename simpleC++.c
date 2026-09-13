@@ -43,13 +43,19 @@ static void malloc_stats(void) {
 #pragma GCC diagnostic ignored "-Wgnu-case-range"
 #pragma GCC diagnostic ignored "-Wunsafe-buffer-usage"
 #pragma GCC diagnostic ignored "-Wc23-extensions"
+#pragma GCC diagnostic ignored "-Wpre-c23-compat"
 #pragma GCC diagnostic ignored "-Wfixed-enum-extension"
 #pragma GCC diagnostic ignored "-Wswitch-enum"
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #if __has_attribute(__fallthrough__)
-# define fallthrough                    __attribute__((__fallthrough__))
+# define fallthrough  __attribute__((__fallthrough__))
 #else
-# define fallthrough                    do {} while (0)  /* fallthrough */
+# define fallthrough  do {} while (0)
+#endif
+#if __STDC_VERSION__ <= 202311L
+# define countof(a)  (sizeof(a) / sizeof(*(a)))
+#else
+# include <stdcountof.h>
 #endif
 #else
 #define attr_printf(a, b)
@@ -373,7 +379,7 @@ static void atom_stats(void) {
         total += ap->refs + 1;
         const char *s = ap->str;
         if (ap->flags & ATOM_STRING) {
-            encode_string(buf, sizeof(buf), ap->str, ap->len, '"'); s = buf;
+            encode_string(buf, countof(buf), ap->str, ap->len, '"'); s = buf;
         }
         printf("%5u %3d %2d  %s\n", ap->refs + 1, ap->len, ap->flags, s);
     }
@@ -406,7 +412,7 @@ typedef enum TokenKind enum_type(unsigned char) {
     K_SIGNED, K_UNSIGNED, K_ENUM, K_STRUCT, K_UNION,
 
     K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
-    K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF,
+    K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF, K_COUNTOF, K__COUNTOF,
     K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_STATIC_ASSERT,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
@@ -438,7 +444,7 @@ static const char * const token_name[T_count] = {
     "int", "long", "char", "short", "void", "float", "double",
     "signed", "unsigned", "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
-    "for", "do", "break", "continue", "sizeof",
+    "for", "do", "break", "continue", "sizeof", "countof", "_Countof",
     "switch", "case", "default", "goto", "static_assert",
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
     "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
@@ -577,15 +583,15 @@ static void expand_line(const char *in, sbuf_t *sb) {
                 if (!m || (m->nparams >= 0 && p[k+b] != '(')) {
                     switch (name) {
                     case ID__FILE__: *buf = '"'; len = 1;
-                                     len += pstrcpy(buf + 1, sizeof(buf) - 3, get_filename(src_loc));
+                                     len += pstrcpy(buf + 1, countof(buf) - 3, get_filename(src_loc));
                                      buf[len++] = '"'; buf[len] = '\0'; break;
-                    case ID__LINE__: len = snprintf(buf, sizeof(buf), "%d", get_lineno(src_loc)); break;
-                    case ID__COUNTER__: len = snprintf(buf, sizeof(buf), "%d", counter++); break;
+                    case ID__LINE__: len = snprintf(buf, countof(buf), "%d", get_lineno(src_loc)); break;
+                    case ID__COUNTER__: len = snprintf(buf, countof(buf), "%d", counter++); break;
                     default: p += k; continue;
                     }
                     def = buf;
                 }
-                j += pmemcpy(out + j, sizeof(out) - j, q, (size_t)(p - q));
+                j += pmemcpy(out + j, countof(out) - j, q, (size_t)(p - q));
                 q = p += k;
                 MacroArguments ma; ma.argc = 0;
                 if (m && m->nparams >= 0) {
@@ -613,15 +619,15 @@ static void expand_line(const char *in, sbuf_t *sb) {
                     }
                     if (ma.argc != m->nparams) die("missing arguments for macro '%s'", atom_str(m->name));
                 }
-                j += macro_expand(m, &ma, def, out + j, sizeof(out) - j);
+                j += macro_expand(m, &ma, def, out + j, countof(out) - j);
                 changed = true;
             } else {
                 p++;
             }
         }
         if (!changed) { sbuf_put(sb, q, (size_t)(p - q)); return; }
-        j += pmemcpy(out + j, sizeof(out) - j, q, (size_t)(p - q));
-        if (j >= sizeof(out)) die("macro expansion overflow");
+        j += pmemcpy(out + j, countof(out) - j, q, (size_t)(p - q));
+        if (j >= countof(out)) die("macro expansion overflow");
         if (pass == 8) { sbuf_put(sb, out, j); return; }    // should complain about recursion
         memcpy(work, out, j); work[j] = '\0'; p = work;
     }
@@ -721,7 +727,7 @@ static const char *find_file(char *buf, size_t size, const char *name, const cha
 static void process_include(const char *name, bool sys, sbuf_t *sb) {
     char path[256];
     const char *curfile = sys ? NULL : get_filename(src_loc);
-    const char *filename = find_file(path, sizeof(path), name, curfile, include_path);
+    const char *filename = find_file(path, countof(path), name, curfile, include_path);
     if (filename) {
         atom_t a = new_atom(filename);
         if (sys) {
@@ -746,7 +752,7 @@ static void process_text(const char *text, sbuf_t *sb) {
         char c;
         while ((c = line[li] = *src)) {
             src++; if (c == '\n') break;
-            if (li++ >= sizeof(line)) die("line too long");
+            if (li++ >= countof(line)) die("line too long");
         }
         line[li] = 0;
 
@@ -879,12 +885,12 @@ static srcloc_t update_loc(srcloc_t loc, const char *path, unsigned int lineno) 
 static void sharp_line(srcloc_t loc, int state, bool sys, sbuf_t *sb) {
     const char *filename = get_filename(loc);
     if (filename) {
-        char buf[300]; size_t len = (size_t)snprintf(buf, sizeof(buf), "# %d \"%s\"", get_lineno(loc), filename);
-        if (state && len < sizeof(buf)) {
-            len += (size_t)snprintf(buf + len, sizeof(buf) - len, " %d", state);
-            if (sys && len < sizeof(buf)) len += pstrcpy(buf + len, sizeof(buf) - len, " 3 4");
+        char buf[300]; size_t len = (size_t)snprintf(buf, countof(buf), "# %d \"%s\"", get_lineno(loc), filename);
+        if (state && len < countof(buf)) {
+            len += (size_t)snprintf(buf + len, countof(buf) - len, " %d", state);
+            if (sys && len < countof(buf)) len += pstrcpy(buf + len, countof(buf) - len, " 3 4");
         }
-        if (len < sizeof(buf) - 1) { buf[len++] = '\n'; buf[len] = '\0'; }
+        if (len < countof(buf) - 1) { buf[len++] = '\n'; buf[len] = '\0'; }
         sbuf_trim_empty_lines(sb);
         sbuf_put(sb, buf, len);
     }
@@ -1071,7 +1077,7 @@ static size_t lex(const char *p) {
             while ((ch = (unsigned char)*p++) != c) {
                 if (!ch || ch == '\n') { p--; die("unterminated %s", thing); }
                 if (ch == '\\') { size_t k; if (!*p) continue; ch = (unsigned char)read_escape(p, &k); p += k; }
-                if (len >= sizeof(buf)) die("%s too long", thing);
+                if (len >= countof(buf)) die("%s too long", thing);
                 buf[len++] = (char)ch;
             }
             if (ch == '"') {
@@ -1102,7 +1108,7 @@ static size_t lex(const char *p) {
         }
         if (c == '-' && *p == '>') { p++; set_tok(T_ARROW); continue; }
         const unsigned char *pp = ops;
-        while (pp < ops + sizeof(ops) && *pp && *pp != c) pp += 5;
+        while (pp < ops + countof(ops) && *pp && *pp != c) pp += 5;
         if (*pp) {
             if (pp[2] && *p == c) {
                 if (pp[4] && p[1] == '=') { p += 2; set_tok(pp[4]); continue; }
@@ -1862,12 +1868,12 @@ static Node *parse_string(void) {
     if (at(T_STR)) {    // concatenate juxtaposed strings
         char buf[8192]; size_t len = 0;
         for (;;) {
-            len += pmemcpy(buf + len, sizeof(buf) - len,
+            len += pmemcpy(buf + len, countof(buf) - len,
                            atom_str(str), atom_len(str));
             if (!at(T_STR)) break;
             str = cur()->str; P++;
         }
-        if (len == sizeof buf) error(n, "string too long");
+        if (len == countof(buf)) error(n, "string too long");
         n->str = new_atom_len(buf, len);
     }
 #ifdef ATOM_STATS
@@ -2036,7 +2042,9 @@ static Node *parse_unary(bool accept_cast) {
     switch (toks[P].kind) {
     //case K_ALIGNOF:  // alignof(type)
     //case K_COUNTOF:
-    case K_SIZEOF: {
+    case K_SIZEOF:
+    case K_COUNTOF:
+    case K__COUNTOF: {
         n = new_node(N_SIZEOF); P++;
         Type *t = NULL;
         if (at(T_LP) && is_type_start(&toks[P+1])) {
@@ -2049,10 +2057,9 @@ static Node *parse_unary(bool accept_cast) {
             n->lhs = parse_unary(false);
             t = static_typeof(n->lhs, NULL);
         }
-        if (t) {
-            n->uval = ty_size(t);
-            n->type = ty_size_t();
-            n->flags |= CONST_VAL;
+        if (t && ty_size(t)) {
+            Value v;
+            eval_expr(n, &v);
         }
         return n;
     }
@@ -2466,7 +2473,19 @@ static bool eval_expr(Node *n, Value *vp) {
     }
     case N_SIZEOF: {
         Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
-        value_init(&v1, ty_size_t(), ty_size(t)); break;
+        value_init(&v1, ty_size_t(), ty_size(t));
+        if (n->op != K_SIZEOF) {
+            if (t->kind == TY_ARRAY) {
+                if (t->pflags & HAS_LEN) {
+                    v1.uval = t->arr_len;
+                } else {
+                    error(n, "'countof' applied to an array of unspecified length");
+                }
+            } else {
+                error(n, "'countof' can only be applied to an array");
+            }
+        }
+        break;
     }
     case N_CAST:
         if (!eval_expr(n->lhs, &v1)) return false;
@@ -2554,7 +2573,7 @@ static bool eval_expr(Node *n, Value *vp) {
     }
     if (!n->type) n->type = v1.type;
     if (!value_check_range(&v1, n->type)) {
-        char buf[32]; value_str(&v1, buf, sizeof(buf));
+        char buf[32]; value_str(&v1, buf, countof(buf));
         if (n->type->kind == TY_PTR) {
             warning(n->loc, "implicit conversion of non zero value %s as a pointer", buf);
         } else {
@@ -2897,7 +2916,7 @@ static void emit_label(int lab) { if (lab <= 0) return; if (next_label) emit(" "
 static void emit_comment(const char *comment) {
     if (out_comments) {
         if (*next_comment) emit(" ");
-        if (comment) pstrcpy(next_comment, sizeof(next_comment), comment);
+        if (comment) pstrcpy(next_comment, countof(next_comment), comment);
     }
 }
 
@@ -2988,7 +3007,7 @@ static void make_reg_address(char *buf, size_t size, Register r, unsigned offset
     else snprintf(buf, size, "[%s]", reg64[r]);
 }
 static Type *load_ind(Type *t, Register r1, Register r2, unsigned offset) {   // r1 = [r2+offset] (size and type aware)
-    char src[32]; make_reg_address(src, sizeof(src), r2, offset);
+    char src[32]; make_reg_address(src, countof(src), r2, offset);
     const char *dest = reg64[r1];
     const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
     switch (ty_size(t)) {
@@ -3019,11 +3038,11 @@ static Type *store_mem_imm(Type *t, const char *dest, long val) {
     return t;
 }
 static Type *store_ind(Type *t, Register r1, Register r2, unsigned offset) {    // [r1+offset] = r2 (size and type aware)
-    char dest[32]; make_reg_address(dest, sizeof(dest), r1, offset);
+    char dest[32]; make_reg_address(dest, countof(dest), r1, offset);
     return store_mem_reg(t, dest, r2);
 }
 static Type *store_ind_imm(Type *t, Register r, long val, unsigned offset) {    // [r1+offset] = val (size and type aware)
-    char dest[32]; make_reg_address(dest, sizeof(dest), r, offset);
+    char dest[32]; make_reg_address(dest, countof(dest), r, offset);
     if ((int)val != val) {
         emit_mov_reg_imm(RDX, val);
         return store_mem_reg(t, dest, RDX);
@@ -3086,7 +3105,7 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     case N_VAR: {
         Sym *s = resolve_name(n);
         if (s->kind) emit_comment(atom_str(n->name));
-        char buf[64]; const char *src = make_address(buf, sizeof(buf), s, offset, n->loc);
+        char buf[64]; const char *src = make_address(buf, countof(buf), s, offset, n->loc);
         switch (s->kind) {
         case 0:          emit("lea %s, %s", reg64[r], src); break;
         case K_AUTO:
@@ -3142,7 +3161,7 @@ static Type *static_typeof(Node *n, Type *def) {
 
 static void gen_string_def(atom_t a) {
     char buf[8192];
-    encode_string(buf, sizeof(buf), atom_str(a), atom_len(a), '"');
+    encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
     int col = fprintf(fout, ".LC%u:", atom_id(a));
     emit_indent(col, 8);
     fprintf(fout, ".string %s\n", buf);
@@ -3152,8 +3171,8 @@ static Type *load_string(Node *n, Register r) {
     atom_t a = n->str;
     if (out_comments) {
         char buf[37];
-        size_t len = encode_string(buf, sizeof(buf), atom_str(a), atom_len(a), '"');
-        if (len > 32) pstrcpy(buf + 32, sizeof(buf) - 32, "...\"");
+        size_t len = encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
+        if (len > 32) pstrcpy(buf + 32, countof(buf) - 32, "...\"");
         emit_comment(buf);
     }
     emit("lea %s, [rip + .LC%u]", reg64[r], atom_id(a));
@@ -3448,7 +3467,7 @@ static Type *load_var(Node *n, Register r) {
     Type *t = s->type;
     if (s->kind) emit_comment(atom_str(n->name));
     if (s->flags & CONST_VAL) { emit_mov_reg_imm(r, s->ival); return t; }
-    char buf[64]; const char *src = make_address(buf, sizeof(buf), s, 0, n->loc);
+    char buf[64]; const char *src = make_address(buf, countof(buf), s, 0, n->loc);
     switch (t->kind) {
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
         switch (s->kind) {
@@ -3494,7 +3513,7 @@ static Type *load_var(Node *n, Register r) {
 }
 
 static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register r) {
-    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     if (!dest) return t;
     if (!check_const(s, loc)) return t;
     switch (t->kind) {
@@ -3513,7 +3532,7 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
 }
 
 static void store_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
-    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     switch (size) {
     case 1:  emit("mov byte ptr %s, 0", dest); return;
     case 2:  emit("mov word ptr %s, 0", dest); return;
@@ -3525,7 +3544,7 @@ static void store_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
 }
 
 static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size) {
-    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     if (!dest) return;
     if (!check_const(s, loc)) return;
     if (s->kind == K_REGISTER) {
@@ -3559,7 +3578,7 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
 }
 
 static Type *store_var_imm(Sym *s, srcloc_t loc, unsigned offset, Type *t, long val) {
-    char buf[64]; const char *dest = make_address(buf, sizeof(buf), s, offset, loc);
+    char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     if (!dest) return t;
     if (!check_const(s, loc)) return t;
     if (s->kind) emit_comment(atom_str(s->name));
@@ -3797,8 +3816,9 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         return load_ind(mt, r, r, 0);
     }
     case N_SIZEOF: {
-        Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
-        emit_mov_reg_imm(r, ty_size(t));
+        Value v;
+        eval_expr(n, &v);
+        emit_mov_reg_imm(r, n->ival);
         return ty_size_t();
     }
     case N_CAST:
@@ -3874,7 +3894,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         if (lhs->kind == N_VAR) {
             Sym *s = resolve_name(lhs);
             Type *lt = s->type;
-            dest = make_address(buf, sizeof(buf), s, 0, n->loc);
+            dest = make_address(buf, countof(buf), s, 0, n->loc);
             if (!dest) return lt;
             if (!check_const(s, n->loc)) return lt;
             if (n->kind == N_PRE)  gen_inc(lt, n->op, dest);
@@ -4218,8 +4238,8 @@ static size_t gen_case_value(char *cbuf, size_t size, const char *s, Node *e) {
 static void gen_case_comment(Node *n) {
     if (!out_comments) return;
     char buf[48];
-    size_t len = gen_case_value(buf, sizeof(buf), "case ", n->cond);
-    if (n->rhs) len += gen_case_value(buf + len, sizeof(buf) - len, " ... ", n->rhs);
+    size_t len = gen_case_value(buf, countof(buf), "case ", n->cond);
+    if (n->rhs) len += gen_case_value(buf + len, countof(buf) - len, " ... ", n->rhs);
     emit_comment(buf);
 }
 
@@ -4723,7 +4743,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
                 store_var(s, init->loc, offset, t, RAX);
                 return;
             }
-            if (eval_const_expr(init, &v, NULL)) {
+            if (eval_expr(init, &v)) {
                 emit(".quad %ld", v.ival);
                 return;
             }
@@ -4808,8 +4828,8 @@ static int output_token(FILE *fp, Token *t) {
             }
             s = p; break;
         }
-    case T_CHAR:  c = (char)t->ival; encode_string(buf, sizeof(buf), &c, 1, '\''); break;
-    case T_STR:   encode_string(buf, sizeof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
+    case T_CHAR:  c = (char)t->ival; encode_string(buf, countof(buf), &c, 1, '\''); break;
+    case T_STR:   encode_string(buf, countof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
     case T_ID:    s = atom_str(t->name); break;
     default:      s = atom_str((atom_t)t->kind); break;
     }
@@ -4983,7 +5003,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "-E")) preprocess_mode = 1;
         else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
         else if (!strcmp(arg, "-g")) { debug = out_comments = true; }
-        else if (strstart(arg, "-I", NULL)) add_path(include_path, sizeof(include_path), arg[2] ? arg + 2 : argv[i++]);
+        else if (strstart(arg, "-I", NULL)) add_path(include_path, countof(include_path), arg[2] ? arg + 2 : argv[i++]);
         else if (!strcmp(arg, "-memory")) mem_stats = true;
         else if (!strcmp(arg, "--notabs")) no_tabs = true;
         else if (!strcmp(arg, "-O")) optimize++;

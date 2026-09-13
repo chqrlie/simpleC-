@@ -17,6 +17,7 @@
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
 #pragma GCC diagnostic ignored "-Wpragmas"
 #pragma GCC diagnostic ignored "-Wpre-c11-compat"
+#pragma GCC diagnostic ignored "-Wpre-c23-compat"
 #define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #else
 #define attr_printf(a, b)

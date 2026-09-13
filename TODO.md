@@ -108,14 +108,12 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 * support _compound-literal_ (a _postfix-expression_)
 * parse _call-expression_ as a _postfix-expression_
 * parse other _unary-expression_:
-  - `_Countof` _unary-expression_
-  - `_Countof` `(` _type-name_ `)`
   - `alignof` `(` _type-name_ `)`
 * support initialized `const` variables as _constant-expression_
 * support _constant-range-expression_:
   - _constant-expression_ `...` _constant-expression_
 * use correct terms:
-  - _type-qualifier_: `const`, `restrict`, `volatile`, `restrict`
+  - _type-qualifier_: `const`, `restrict`, `volatile`,
   - _function-specifier_: `inline`, `_Noreturn`
   - _alignment-specifier_:
     - `alignas` `(` _type-name_ `)`

@@ -518,7 +518,7 @@ const char * const sys_errlist[] = {
 thread_local static char errbuf[20];
 const char *strerror(int errnum) {
     if (errnum >= 0 && errnum < sys_nerr) return sys_errlist[errnum];
-    snprintf(errbuf, sizeof(errbuf), "Error %d", errnum);
+    snprintf(errbuf, countof(errbuf), "Error %d", errnum);
     return errbuf;
 }
 void perror(const char *s) {
