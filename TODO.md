@@ -37,7 +37,8 @@
 * simplify varargs API: all optional arguments on the stack
 * add builtins for `memcpy`, `memset`, `strcpy`, `strlen`
 * compound literals
-* designated initializers
+* fix unstructured initializers
+* fix complex designated initializers
 * structure assignment
 * structure passing and returning
 * accept `__attribute__` syntax

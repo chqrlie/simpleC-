@@ -75,6 +75,7 @@ typedef struct Func Func;
 static const char *progname;
 static bool use_library;
 static const char *src_name[64];
+static unsigned char src_flags[64];
 static char include_path[1024];
 static srcloc_t src_loc;
 static unsigned char optimize;
@@ -85,6 +86,7 @@ static bool debug, verbose;
 #define MAKE_LOC(fn, lineno)  (((fn) << LOC_SHIFT) + (unsigned)lineno)
 #define get_lineno(loc) (int)((loc) & ((1 << LOC_SHIFT) - 1))
 #define get_filenum(loc) ((loc) >> LOC_SHIFT)
+#define get_fileflags(loc)  src_flags[(loc) >> LOC_SHIFT]
 static const char *get_filename(srcloc_t loc) {
     return loc ? src_name[get_filenum(loc)] : NULL;
 }
@@ -902,6 +904,7 @@ static void preprocess(const char *path, bool sys, sbuf_t *sb) {
     fclose(f);
     srcloc_t save_loc = src_loc;
     src_loc = update_loc(src_loc, path, 1);
+    src_flags[get_filenum(src_loc)] = sys;
     sharp_line(src_loc, !!save_loc, sys, sb);
     process_text(sbuf_getptr(raw), sb);   // may recurse (with its own buffers)
     sharp_line(src_loc = save_loc, 2, 0, sb);
@@ -1349,7 +1352,7 @@ typedef enum NodeKind enum_type(unsigned char) {
     N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
     N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH,
     N_CASE, N_DEFAULT, N_LABEL,
-    N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM, N_STATIC_ASSERT,
+    N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM, N_STATIC_ASSERT, N_DESIGNATOR,
 } NodeKind;
 
 struct Node {
@@ -1362,6 +1365,7 @@ struct Node {
 #define HAS_DEFAULT   16    // N_SWITCH
 #define HAS_PAREN     32    // all E-nodes
 #define LAB_USED      64    // N_LABEL
+#define HAS_DESIGNATOR 128    // N_BLOCK initializer
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
@@ -1405,7 +1409,6 @@ static Node *new_bin_node(Node *lhs) { return new_node1(N_BIN, lhs); }
 static Node *set_num_node(Node *n, Type *t, unsigned long uval) { n->kind = N_NUM; n->flags |= CONST_VAL; n->type = t; n->uval = uval; return n; }
 static Node *new_num_node(Type *t, unsigned long uval) { return set_num_node(new_node(N_NUM), t, uval); }
 static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
-static unsigned node_length(Node *n) { unsigned len = 0; while (n) { len++; n = n->next; } return len; }
 
 static void error(Node *n, const char *fmt, ...) {
     srcloc_t loc = n ? n->loc : cur()->loc;
@@ -1461,6 +1464,7 @@ static Sym *sym_link(atom_t name, Sym *s) {
             }
             warning(s->loc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
         } else {
+            if (get_fileflags(s->loc)) break;
             warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
         }
         note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
@@ -1569,17 +1573,17 @@ static bool value_cast(Value *vp, Type *t) {
         switch (t->kind) {
         case TY_CHAR:
         case TY_SCHAR: case TY_SHORT:  case TY_INT:  case TY_LONG:
-            vp->uval |= ~((vp->uval & (t->max + 1)) - 1); vp->type = t; return true;
+            vp->uval |= ~((vp->uval & (t->max + 1)) - 1); break;
         case TY_UCHAR: case TY_USHORT: case TY_UINT: case TY_ULONG:
-            vp->uval &= t->max; vp->type = t; return true;
+            vp->uval &= t->max; break;
         case TY_VOID:  case TY_PTR:
-            vp->type = t; return true;
-        case TY_ARRAY: case TY_STRUCT: case TY_UNION: // error?
-            return false;
+            break;
         case TY_ENUM:
             t = t->enum_type; continue;
+        default:
+            return false;
         }
-        return false;
+        vp->type = t; return true;
     }
     return false;
 }
@@ -1656,6 +1660,21 @@ static bool eval_expr(Node *n, Value *vp);
 static bool eval_const_expr(Node *n, Value *vp, const char *context);
 static void eval_static_assertion(Node *n);
 static Type *static_typeof(Node *n, Type *def);
+
+static unsigned initializer_length(Node *n) {
+    size_t len = 0, max = 0;
+    while (n) {
+        if (n->kind == N_DESIGNATOR) {
+            Value v;
+            if (!n->rhs) error(n, "unexpected member designator in array initializer");
+            eval_const_expr(n->rhs, &v, "array designator expression");
+            if (max < len) max = len;
+            len = v.uval;
+        }
+        n = n->next; len++;
+    }
+    return (unsigned)(max > len ? max : len);
+}
 
 static Type *parse_ptrs(Type *base, unsigned *flagsp) {
     while (eat(T_STAR)) {
@@ -2213,12 +2232,43 @@ static Type *parse_type_base_only(unsigned int *pflags) {
     }
 }
 
+static Node *parse_designator(void) {
+    Node *n = NULL;
+    for (;;) {
+        switch (toks[P].kind) {
+        case T_LBRK: // array designator
+            n = new_node1(N_DESIGNATOR, n); P++;
+            n->rhs = parse_const_expr();
+            expect(T_RBRK);
+            continue;
+        case T_DOT: // member designator
+            n = new_node1(N_DESIGNATOR, n); P++;
+            n->name = getid();
+            continue;
+        default:
+            expect(T_ASSIGN);
+            n->finit = parse_init();
+            return n;
+        }
+    }
+}
+
 static Node *parse_init(void) {
     if (at(T_LBRACE)) {
         Node *n = new_node(N_BLOCK); P++;
         Node **tailp = &n->rhs;
         while (!at(T_RBRACE) && !at(T_EOF)) {
-            Node *e = parse_init();
+            Node *e;
+            switch (toks[P].kind) {
+            case T_LBRK: // array designator
+            case T_DOT:  // member designator
+                n->flags |= HAS_DESIGNATOR;
+                e = parse_designator();
+                break;
+            default:
+                e = parse_init();
+                break;
+            }
             *tailp = e; tailp = &e->next;
             if (!eat(T_COMMA)) break;
         }
@@ -2391,7 +2441,7 @@ static Sym *resolve_name(Node *n) {
 
 static bool eval_expr(Node *n, Value *vp) {
     if (n->flags & CONST_VAL) { return value_init(vp, n->type, n->ival); }
-    Value v1; v1.type = NULL; v1.uval = 0;
+    Value v1; v1.type = ty_void(); v1.uval = 0;
     switch (n->kind) {
     case N_EXPR:
         if (!eval_expr(n->lhs, &v1)) return false;
@@ -2416,46 +2466,57 @@ static bool eval_expr(Node *n, Value *vp) {
     }
     case N_SIZEOF: {
         Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
-        value_init(&v1, t, ty_size(t)); break;
+        value_init(&v1, ty_size_t(), ty_size(t)); break;
     }
     case N_CAST:
         if (!eval_expr(n->lhs, &v1)) return false;
         value_cast(&v1, n->type); break;    // XXX: check return value and complain
     case N_TERNARY:
+        if (!eval_expr(n->lhs, &v1)) return false; // make sure both nodes have a type
+        if (!eval_expr(n->rhs, &v1)) return false;
         if (!eval_expr(n->cond, &v1)) return false;
         if (!eval_expr(v1.uval ? n->lhs : n->rhs, &v1)) return false;
-        // XXX: should find common type
+        value_cast(&v1, common_type(n->lhs->type, n->rhs->type));
         break;
     case N_UNARY:
         if (!eval_expr(n->lhs, &v1)) return false;
+        v1.type = promoted_type(v1.type);
         switch (n->op) {
         case T_PLUS:   break;
-        case T_MINUS:  v1.uval = -v1.uval; break;
+        case T_MINUS:  v1.uval = -v1.uval; value_cast(&v1, v1.type); break;
         case T_BITNOT: v1.uval = ~v1.uval; value_cast(&v1, v1.type); break;
-        case T_NOT:    v1.uval = !v1.uval; n->type = v1.type = ty_int(); goto done;
+        case T_NOT:    v1.uval = !v1.uval; v1.type = ty_int(); break;
         default: return false;
         }
         break;
     case N_LOGAND:
         if (!eval_expr(n->lhs, &v1)) return false;
         if (v1.uval && !eval_expr(n->rhs, &v1)) return false;
-        v1.uval = (v1.uval != 0); break;
+        v1.uval = (v1.uval != 0); v1.type = ty_int(); break;
     case N_LOGOR:
         if (!eval_expr(n->lhs, &v1)) return false;
         if (!v1.uval && !eval_expr(n->rhs, &v1)) return false;
-        v1.uval = (v1.uval != 0); break;
+        v1.uval = (v1.uval != 0); v1.type = ty_int(); break;
     case N_COMMA:
         if (!eval_expr(n->lhs, &v1)) return false;
         if (!eval_expr(n->rhs, &v1)) return false;
         break;
     case N_BIN:
-    case N_CMP:
+    case N_CMP: {
         if (!eval_expr(n->lhs, &v1)) return false;
         Value v2; v2.type = NULL; v2.uval = 0;
         if (!eval_expr(n->rhs, &v2)) return false;
-        // XXX: should find common type
         // XXX: signed/unsigned arithmetics still not correct in case of different sizes
-        unsigned char is_unsigned = ty_is_unsigned(v1.type) | ty_is_unsigned(v2.type);
+        Type *ct = common_type(v1.type, v2.type);
+        unsigned char is_unsigned = ty_is_unsigned(ct);
+        if (n->op >= T_SHL && n->op <= T_SHR) {
+            n->type = promoted_type(v1.type);
+            is_unsigned = ty_is_unsigned(n->type);
+        } else {
+            n->type = (n->kind == N_BIN) ? ct : ty_int();
+            value_cast(&v1, ct);
+            value_cast(&v2, ct);
+        }
         switch (n->op) {
         case T_PLUS:    v1.uval += v2.uval; break;
         case T_MINUS:   v1.uval -= v2.uval; break;
@@ -2472,7 +2533,7 @@ static bool eval_expr(Node *n, Value *vp) {
         case T_SHL:     v1.uval <<= v2.uval & 63; break;
         case T_SHR:     v1.uval >>= (v2.uval &= 63);
                         // emulate signed right shift
-                        if (!ty_is_unsigned(v1.type)) v1.uval |= ~(((1UL << (63 - v2.uval)) & v1.uval) - 1); break;
+                        if (!is_unsigned) v1.uval |= ~(((1UL << (63 - v2.uval)) & v1.uval) - 1); break;
         case T_LT:      if (is_unsigned) v1.uval = v1.uval <  v2.uval; else v1.uval = v1.ival <  v2.ival; break;
         case T_GT:      if (is_unsigned) v1.uval = v1.uval >  v2.uval; else v1.uval = v1.ival >  v2.ival; break;
         case T_LE:      if (is_unsigned) v1.uval = v1.uval <= v2.uval; else v1.uval = v1.ival <= v2.ival; break;
@@ -2485,7 +2546,9 @@ static bool eval_expr(Node *n, Value *vp) {
             error(n, "division overflow in constant expression"); return false;
         }
         break;
-    case N_STATIC_ASSERT: eval_static_assertion(n); return true;
+    }
+    case N_STATIC_ASSERT:
+        eval_static_assertion(n); break;
     default:
         error(n, "invalid expression"); return false;
     }
@@ -2499,7 +2562,6 @@ static bool eval_expr(Node *n, Value *vp) {
         }
     }
     value_cast(&v1, n->type);
-done:
     vp->type = v1.type;
     n->uval = vp->uval = v1.uval;
     n->flags |= CONST_VAL;
@@ -2507,11 +2569,9 @@ done:
 }
 
 static bool eval_const_expr(Node *n, Value *vp, const char *context) {
-    if (!eval_expr(n, vp) || !(n->flags & CONST_VAL)) {
-        if (context) error(n, "%s is not constant", context);
-        return false;
-    }
-    return true;
+    if (eval_expr(n, vp)) return true;
+    if (context) error(n, "%s is not constant", context);
+    return false;
 }
 
 static void eval_static_assertion(Node *n) {
@@ -2650,7 +2710,7 @@ static Node *parse_decl_stmt(void) {
             if (eat(T_ASSIGN)) {
                 Node *init = s->init = parse_init();
                 if (init->kind == N_BLOCK && t->kind == TY_ARRAY && !(t->pflags & HAS_LEN)) {
-                    s->type = array_of(t->base, node_length(init->rhs), NULL, t->qflags, HAS_LEN);
+                    s->type = array_of(t->base, initializer_length(init->rhs), NULL, t->qflags, HAS_LEN);
                     if (s->kind == K_AUTO) set_local_offset(s);
                 }
             }
@@ -2748,6 +2808,7 @@ static void check_used(Node *n) {
         for (Node *e = n->rhs; e; e = e->next) check_used(e); return;
     case N_DECL:
         for (Sym *s = n->decl; s; s = s->next_decl) check_used(s->init); return;
+    case N_DESIGNATOR:
     case N_FOR:
         check_used(n->finit); fallthrough;
     case N_IF: case N_WHILE: case N_DOWHILE:
@@ -4506,6 +4567,111 @@ static void gen_init_zero(Sym *s, unsigned offset, unsigned size) {
     }
     emit(".zero %u", size);
 }
+static Node *get_array_initializer(Node *n, unsigned i) {
+    Node *found = NULL;
+    size_t pos = 0;
+    for (; n; n = n->next, pos++) {
+        if (n->kind == N_DESIGNATOR) {
+            if (!n->rhs) error(n, "unexpected member designator in array initializer");
+            Value v;
+            eval_const_expr(n->rhs, &v, "array designator expression");
+            pos = v.uval;
+        }
+        if (pos == i) found = n;
+    }
+    return found;
+}
+static void gen_init_array(Type *t, Node *init, Sym *s, unsigned offset) {
+    if (init->flags & HAS_DESIGNATOR) {
+        Node *e = init->rhs;
+        unsigned off = 0;
+        // brute force quadratic enumeration. should sort designated sequences
+        for (unsigned i = 0; i < t->arr_len; i++, off += elem_size(t)) {
+            e = get_array_initializer(init->rhs, i);
+            if (e) {
+                Node *e1 = e->kind == N_DESIGNATOR ? e->finit : e;
+                gen_init(t->base, 0, e1, NULL, s, offset + off);
+                e = e->next;
+            } else {
+                gen_init_zero(s, offset + off, ty_size(t->base));
+            }
+        }
+    } else {
+        Node *e = init->rhs;
+        unsigned n = check_zero_init(e);
+        unsigned off = 0;
+        for (unsigned i = 0; i < t->arr_len; i++, off += elem_size(t)) {
+            if (!n--) {
+                gen_init_zero(s, offset + off, ty_size(t) - off);
+                break;
+            }
+            gen_init(t->base, 0, e, NULL, s, offset + off);
+            e = e->next;
+        }
+    }
+}
+static Node *get_member_initializer(Type *t, Node *n, Member *m1) {
+    Node *found = NULL;
+    Member *m = t->members;
+    for (; n; n = n->next) {
+        if (n->kind == N_DESIGNATOR) {
+            if (n->rhs) error(n, "unexpected array designator in struct initializer");
+            if (!m || n->name != m->name) {
+                m = find_member(t, n->name, NULL);
+            }
+        }
+        if (m == m1) found = n;
+        if (m) m = m->next;
+    }
+    return found;
+}
+static void gen_init_struct(Type *t, Node *init, Sym *s, unsigned offset) {
+    if (init->flags & HAS_DESIGNATOR) {
+        if (t->kind == TY_UNION) {
+            Node *e = NULL;
+            Member *m = NULL;
+            Node *n = init->rhs;
+            if (n->kind != N_DESIGNATOR) { e = n; m = t->members; }
+            for (; n; n = n->next) {
+                if (n->kind == N_DESIGNATOR) {
+                    Member *m1 = find_member(t, n->name, NULL);
+                    if (m1) { m = m1; e = n->finit; }
+                }
+            }
+            if (e) {
+                gen_init(m->type, 0, e, m, s, offset);
+                if (m->pad && !s) emit(".zero %u", m->pad);
+            } else {
+                gen_init_zero(s, offset, ty_size(t));
+            }
+            return;
+        }
+        // brute force quadratic enumeration. should sort designated sequences
+        for (Member *m = t->members; m; m = m->next) {
+            Node *n = get_member_initializer(t, init->rhs, m);
+            if (n) {
+                Node *e = n->kind == N_DESIGNATOR ? n->finit : n;
+                gen_init(m->type, 0, e, m, s, offset + m->offset);
+                if (m->pad && !s) emit(".zero %u", m->pad);
+            } else {
+                gen_init_zero(s, offset + m->offset, ty_size(m->type) + m->pad);
+            }
+        }
+    } else {
+        Node *n = init->rhs;
+        unsigned num = check_zero_init(n);
+        for (Member *m = t->members; m; m = m->next) {
+            if (!num--) {
+                gen_init_zero(s, offset + m->offset, ty_size(t) - m->offset);
+                break;
+            }
+            gen_init(m->type, 0, n, m, s, offset + m->offset);
+            if (m->pad && !s) emit(".zero %u", m->pad);
+            if (t->kind == TY_UNION) break;
+            n = n->next;
+        }
+    }
+}
 static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsigned offset) {
     if (m) emit_comment(atom_str(m->name));
     if (init) {
@@ -4518,7 +4684,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
         case TY_CHAR: case TY_ENUM:
             if (s) {
                 // accept braced initializers for scalars
-                if (init->kind == N_BLOCK) init = init->rhs;
+                if (init->kind == N_BLOCK) { init = init->rhs; if (!init) goto zero; }
                 if (init->flags & CONST_VAL) { store_var_imm(s, init->loc, offset, t, init->ival); return; }
                 gen_expr(init, RAX, false); store_var(s, init->loc, offset, t, RAX); return;
             }
@@ -4565,42 +4731,24 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
             break;
         case TY_ARRAY:
             if (init->kind == N_BLOCK) {
-                Node *e = init->rhs;
-                unsigned n = check_zero_init(e);
-                unsigned off = 0;
-                for (unsigned i = 0; i < t->arr_len; i++, off += elem_size(t)) {
-                    if (!n--) {
-                        gen_init_zero(s, offset + off, ty_size(t) - off);
-                        break;
-                    }
-                    gen_init(t->base, 0, e, NULL, s, offset + off);
-                    e = e->next;
-                }
+                gen_init_array(t, init, s, offset);
                 return;
             }
             // XXX: support other initializers: char digits[] = "0123456789abcdef";
             break;
         case TY_STRUCT:
         case TY_UNION:
-            if (init->kind != N_BLOCK) break;
-            Node *e = init->rhs;
-            unsigned n = check_zero_init(e);
-            for (m = t->members; m; m = m->next) {
-                if (!n--) {
-                    gen_init_zero(s, offset + m->offset, ty_size(t) - m->offset);
-                    break;
-                }
-                gen_init(m->type, 0, e, m, s, offset + m->offset);
-                if (m->pad && !s) emit(".zero %u", m->pad);
-                if (t->kind == TY_UNION) break;
-                e = e->next;
+            if (init->kind == N_BLOCK) {
+                gen_init_struct(t, init, s, offset);
+                return;
             }
-            return;
+            break;
         }
         if (name) { warning(init->loc, "unsupported initializer for '%s'", atom_str(name)); }
         else if (m) { warning(init->loc, "unsupported initializer for member '%s'", atom_str(m->name)); }
         else { warning(init->loc, "unsupported initializer"); }
     }
+zero:
     unsigned sz = ty_size(t); if (sz < 1) sz = 8;  // XXX this test is bogus
     gen_init_zero(s, offset, sz);
 }
