@@ -10,6 +10,7 @@
   - [90%] detect unreachable code
   - [90%] dead code elimination
 * add `N_MEMBER` variant for `pointer->member`
+* add `gen_addr_type` to optimize `N_MEMBER` case
 * optimize `var->member` access
 * optimize `var[const_val]` address computations
 * optimize expressions with commutativity and associativity
