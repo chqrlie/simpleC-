@@ -3005,7 +3005,7 @@ static void emit_mov_reg_imm(Register r, long val) {
 }
 static void emit_reg_imm(const char *instr, Register r, long val) {
     if ((int)val == val) {
-        emit("%s %s, %d", instr, reg64[r], (int)val);
+        emit("%s %s, %ld", instr, reg64[r], val);
     } else {
         emit_mov_reg_imm(RDX, val);
         emit_reg_reg(instr, r, RDX);
@@ -3441,18 +3441,40 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt, Register r) {
     return ct;
 }
 
+static void gen_inc(Type *lt, TokenKind op, const char *dest, long val) {
+    const char *prefix = "";
+    if (*dest == '[') {
+        switch (ty_size(lt)) {
+        case 1: prefix = "byte ptr "; break;
+        case 2: prefix = "word ptr "; break;
+        case 4: prefix = "dword ptr "; break;
+        case 8: prefix = "qword ptr "; break;
+        }
+    }
+    if (is_ptrish(lt)) val *= elem_size(lt);
+    if (!val) return;
+    if (val == 1) {
+        const char *instr = op == T_INC ? "inc" : "dec";
+        emit("%s %s%s", instr, prefix, dest);
+    } else {
+        const char *instr = op == T_INC ? "add" : "sub";
+        if (val == (int)val) {
+            emit("%s %s%s, %ld", instr, prefix, dest, val);
+        } else {
+            emit_mov_reg_imm(RDX, val);
+            emit("%s %s%s, rdx", instr, prefix, dest);
+        }
+    }
+}
+
 static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_rax) {
     // r = left and result, val = right
     Type *ct = common_type(lt = promoted_type(lt), n->rhs->type);
     long val = n->rhs->ival;
     switch (op) {
-    case T_PLUS:
-        if (is_ptrish(lt)) val *= elem_size(lt);
-        if (val) emit_reg_imm("add", r, val); break;
-    case T_MINUS:
-        if (is_ptrish(lt)) val *= elem_size(lt);
-        if (val) emit_reg_imm("sub", r, val); break;
-    case T_STAR:    emit_imul_imm(r, val); break;
+    case T_PLUS:    gen_inc(lt, T_INC, reg64[r], val); break;
+    case T_MINUS:   gen_inc(lt, T_DEC, reg64[r], val); break;
+    case T_STAR:    emit_imul_imm(r, val);             break;
     case T_SLASH:
         if (ty_is_unsigned(ct)) emit_div_imm(r, val, save_rax);
         else emit_idiv_imm(r, val, save_rax);
@@ -3461,16 +3483,16 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
         if (ty_is_unsigned(ct)) emit_mod_imm(r, val, save_rax);
         else emit_imod_imm(r, val, save_rax);
         break;
-    case T_AMP:     if (val + 1) emit_reg_imm("and", r, val); break;
-    case T_BITOR:   if (val) emit_reg_imm("or", r, val);      break;
-    case T_BITXOR:  if (val) emit_reg_imm("xor", r, val);     break;
+    case T_AMP:     if (val + 1)   emit_reg_imm("and", r, val); break;
+    case T_BITOR:   if (val)       emit_reg_imm("or",  r, val); break;
+    case T_BITXOR:  if (val)       emit_reg_imm("xor", r, val); break;
     case T_SHL:     if (val &= 63) emit_reg_imm("shl", r, val); return lt;
-    case T_SHR:     if (val &= 63) { if (ty_is_unsigned(lt)) emit_reg_imm("shr", r, val); else emit_reg_imm("sar", r, val); } return lt;
+    case T_SHR:     if (val &= 63) emit_reg_imm(ty_is_unsigned(lt) ? "shr" : "sar", r, val); return lt;
     case T_LT: case T_GT: case T_LE: case T_GE: case T_EQ: case T_NE:
         emit_cmp_imm(r, val);
         emit("set%s %s", get_jcc(op, ty_is_unsigned(ct)) + 1, reg8[r]);
         emit("movzx %s, %s", reg64[r], reg8[r]);
-        break;
+        return ty_int();
     default: error(n, "bad binary operator '%s'", token_name[op]);
     }
     return ct;
@@ -3642,6 +3664,8 @@ static bool is_simple_load(Node *n) {
         }}
     case N_PRE: case N_POST:
         return n->lhs->kind == N_VAR;
+    case N_TERNARY:
+        return is_simple_load(n->cond) && is_simple_load(n->lhs) && is_simple_load(n->rhs);
 #if 0
     case N_COMMA:
         // would qualify if both are simple
@@ -3786,26 +3810,6 @@ static bool gen_test(Node *n, Register r, bool save_rax, int lab, bool truth) {
     return true;
 }
 
-static void gen_inc(Type *lt, TokenKind op, const char *dest) {
-    const char *prefix = "";
-    if (*dest == '[') {
-        switch (ty_size(lt)) {
-        case 1: prefix = "byte ptr "; break;
-        case 2: prefix = "word ptr "; break;
-        case 4: prefix = "dword ptr "; break;
-        case 8: prefix = "qword ptr "; break;
-        }
-    }
-    unsigned int step = is_ptrish(lt) ? elem_size(lt) : 1;
-    if (step == 1) {
-        const char *instr = op == T_INC ? "inc" : "dec";
-        emit("%s %s%s", instr, prefix, dest);
-    } else {
-        const char *instr = op == T_INC ? "add" : "sub";
-        emit("%s %s%s, %u", instr, prefix, dest, step);
-    }
-}
-
 static Type *gen_expr(Node *n, Register r, bool save_rax) {
     const char *reg = reg64[r];
     if (n->flags & CONST_VAL) goto has_num;
@@ -3912,21 +3916,22 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             dest = make_address(buf, countof(buf), s, 0, n->loc);
             if (!dest) return lt;
             if (!check_const(s, n->loc)) return lt;
-            if (n->kind == N_PRE)  gen_inc(lt, n->op, dest);
+            if (n->kind == N_PRE)  gen_inc(lt, n->op, dest, 1);
             if (!(n->flags & DISCARD)) load_var(lhs, r);
-            if (n->kind == N_POST) gen_inc(lt, n->op, dest);
+            if (n->kind == N_POST) gen_inc(lt, n->op, dest, 1);
             return lt;
         }
         Type *lt = gen_addr(n->lhs, RDX, save_rax, 0);
-        if (n->kind == N_PRE)  gen_inc(lt, n->op, dest);
+        if (n->kind == N_PRE)  gen_inc(lt, n->op, dest, 1);
         if (!(n->flags & DISCARD)) load_ind(lt, r, RDX, 0);
-        if (n->kind == N_POST) gen_inc(lt, n->op, dest);
+        if (n->kind == N_POST) gen_inc(lt, n->op, dest, 1);
         return lt;                                 // rax = new value
     }
     case N_TERNARY: {
         int els = label_id++, end = label_id++;
-        gen_test(n->cond, r, save_rax, els, false);
-        gen_expr(n->lhs, r, save_rax); emit_jmp(n, "jmp", end);
+        if (gen_test(n->cond, r, save_rax, els, false)) {
+            gen_expr(n->lhs, r, save_rax); emit_jmp(n, "jmp", end);
+        }
         emit_label(els); gen_expr(n->rhs, r, save_rax);
         emit_label(end);
         return ty_long();
@@ -4348,23 +4353,27 @@ static Flow gen_return(Node *e) {
             switch (e->kind) {
             case N_TERNARY: {
                 int els = label_id++;
-                gen_test(e->cond, RAX, false, els, false); gen_return(e->lhs);
+                if (gen_test(e->cond, RAX, false, els, false)) {
+                    gen_return(e->lhs);
+                }
                 emit_label(els); e = e->rhs;
                 continue;
             }
             case N_LOGAND: {
                 int lab = label_id++;
-                gen_test(e->lhs, RAX, false, lab, false);
-                gen_test(e->rhs, RAX, false, 0, true);
-                gen_return(NULL);
+                if (gen_test(e->lhs, RAX, false, lab, false)) {
+                    gen_test(e->rhs, RAX, false, 0, true);
+                    gen_return(NULL);
+                }
                 emit_label(lab); emit("xor rax, rax");
                 return gen_return(NULL);
             }
             case N_LOGOR: {
                 int lab = label_id++;
-                gen_test(e->lhs, RAX, false, lab, true);
-                gen_test(e->rhs, RAX, false, 0, true);
-                gen_return(NULL);
+                if (gen_test(e->lhs, RAX, false, lab, true)) {
+                    gen_test(e->rhs, RAX, false, 0, true);
+                    gen_return(NULL);
+                }
                 emit_label(lab); emit_mov_reg_imm(RAX, 1);
                 return gen_return(NULL);
             }
