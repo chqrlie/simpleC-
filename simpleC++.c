@@ -546,15 +546,24 @@ static bool find_macro_param(const Macro *m, atom_t name, int *pi) {
 static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, char *out, size_t size) {
     const char *q = p;
     size_t j = 0, k = 0;
-    int pi = -1;
+    int pi = -1; bool quote = false;
     for (unsigned char vc;;) {
         if      ((vc = (unsigned char)*p) == '\0') k = 0;
         else if (isdigit(vc)) { p += skip_pp_number(p); continue; }
         else if (isalpha((unsigned char)vc) || vc == '_') {
             k = skip_word(p);
             if (!m || m->nparams <= 0 || !find_macro_param(m, new_atom_len(p, k), &pi)) { p += k; continue; }
+            size_t i0 = (size_t)(p - q), i = i0; i -= trailing_blanks(q, i);
+            if (i && q[i - 1] == '#') {
+                i--;
+                if (i && q[i - 1] == '#') { i--; i -= trailing_blanks(q, i); }
+                else { quote = true; }
+                k += i0 - i;
+                p -= i0 - i;
+            }
         } else { p++; continue; }
         j += pmemcpy(out + j, size - j, q, (size_t)(p - q));
+        if (quote) { j += encode_string(out + j, size - j, ma->argv[pi], ma->len[pi], '"'); quote = false; pi = -1; }
         if (pi >= 0) { j += pmemcpy(out + j, size - j, ma->argv[pi], ma->len[pi]); pi = -1; }
         q = p += k;
         if (!vc) return j;
@@ -2969,19 +2978,20 @@ static void emit_jmp(Node *n, const char *jmp, int lab) {
 // =====================================================================
 // 7.1 CODE GENERATION
 // =====================================================================
-typedef enum Register enum_type(unsigned char) {
+typedef enum RegNum enum_type(unsigned char) {
     RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15
-} Register;
+} RegNum;
 static const char * const reg64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
 static const char * const reg32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d" };
 static const char * const reg16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
 static const char * const reg8[] =  { "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b" };
 
 static int label_id = 10;  // labels 1-9 reserved as local labels
-static Register const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };   // function arguments
-static Register const ARGREG1[6] = { RDI, RSI, R11, R10, R8, R9 };  // registers available for arguments and temporaries
-static Register const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };   // syscall arguments
+static RegNum const ARGREG[6] = { RDI, RSI, RDX, RCX, R8, R9 };   // function arguments
+static RegNum const ARGREG1[6] = { RDI, RSI, R11, R10, R8, R9 };  // registers available for arguments and temporaries
+static RegNum const SYSREG[6] = { RDI, RSI, RDX, R10, R8, R9 };   // syscall arguments
 
+typedef unsigned long Register; // use default word size for function arguments
 typedef unsigned long Flow;
 #define FLOW_NONE  0
 #define FLOW_RUN   1
@@ -3221,32 +3231,35 @@ static void emit_imul_imm(Register r, long val) {
 }
 
 static void emit_idiv_imm(Register r, long val, bool save_rax) {
-    const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        emit_mov_reg_imm(RDX, 7378697629483820647);
-        emit("imul rdx");
-        emit_mov_reg_reg(r, RDX);
-        emit_reg_imm("shr", r, 63);
+        emit_mov_reg_reg(RCX, r);
+        emit_mov_reg_imm(RAX, 7378697629483820647);
+        emit("imul rcx");
+        emit_mov_reg_reg(RAX, RDX);
+        emit_reg_imm("shr", RAX, 63);
         emit("sar rdx, 2");
-        emit_mov_reg_reg(r, RDX);
+        emit("add rax, rdx");
+        emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
     } else
     if (val == 1) {
         // no code
     } else
+    if (val == -1) {
+        emit_reg("neg", r);
+    } else
     if ((val & (val - 1)) == 0) { // power of 2
         long adj = val - 1;
         if ((unsigned long)adj <= INT_MAX) {
-            emit("lea rdx, [%s + %ld]", reg, adj);
+            emit("lea rdx, [%s + %ld]", reg64[r], adj);
         } else {
             emit_mov_reg_imm(RDX, adj);
             emit_reg_reg("add", RDX, r);
         }
         emit_reg_reg("test", r, r);
-        emit_reg_reg("cmovns", r, RDX);
+        emit_reg_reg("cmovs", r, RDX);
         emit_reg_imm("sar", r, __builtin_ctzl((unsigned long)val));
     } else {
         if (save_rax) emit("push rax");
@@ -3262,11 +3275,11 @@ static void emit_div_imm(Register r, long val, bool save_rax) {
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        emit_mov_reg_imm(RCX, -3689348814741910323);
+        emit_mov_reg_reg(RCX, r);
+        emit_mov_reg_imm(RAX, -3689348814741910323);
         emit("mul rcx");
+        emit("shr rdx, 3");
         emit_mov_reg_reg(r, RDX);
-        emit_reg_imm("shr", r, 3);
         if (save_rax) emit("pop rax");
     } else
     if (val == 1) {
@@ -3286,39 +3299,37 @@ static void emit_div_imm(Register r, long val, bool save_rax) {
 }
 
 static void emit_imod_imm(Register r, long val, bool save_rax) {
-    const char *reg = reg64[r];
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        emit_mov_reg_imm(RDX, 7378697629483820647);
         emit_mov_reg_reg(RCX, r);
-        emit("imul rdx");
+        emit_mov_reg_imm(RAX, 7378697629483820647);
+        emit("imul rcx");
         emit_mov_reg_reg(RAX, RDX);
-        emit("shr rax, 63");
+        emit_reg_imm("shr", RAX, 63);
         emit("sar rdx, 2");
-        emit("add rdx, rax");
-        emit("add rdx, rdx");
-        emit("lea rax, [rdx + 4*rdx]");
-        emit("sub rcx, rax");
-        emit_mov_reg_reg(r, RCX);
+        emit("add rax, rdx");
+        emit("imul rax, -10");
+        emit("add rax, rcx");
+        emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
     } else
-    if (val == 1) {
+    if (labs(val) == 1) {
         emit_reg_reg("xor", r, r);
     } else
     if ((val & (val - 1)) == 0) { // power of 2
         long adj = val - 1;
         if ((unsigned long)adj <= INT_MAX) {
-            emit("lea rcx, [%s + %ld]", reg, adj);
+            emit("lea rdx, [%s + %ld]", reg64[r], adj);
         } else {
-            emit_mov_reg_imm(RCX, adj);
-            emit_reg_reg("add", RCX, r);
+            emit_mov_reg_imm(RDX, adj);
+            emit_reg_reg("add", RDX, r);
         }
         emit_reg_reg("test", r, r);
-        emit_reg_reg("cmovns", RCX, r);
-        emit_reg_imm("and", RCX, -val);
-        emit_reg_reg("sub", r, RCX);
+        emit_reg_reg("cmovns", RDX, r);
+        emit_reg_imm("sar", RDX, __builtin_ctzl((unsigned long)val));
+        emit_reg_imm("shl", RDX, __builtin_ctzl((unsigned long)val));
+        emit_reg_reg("sub", r, RDX);
     } else {
         if (save_rax) emit("push rax");
         emit_mov_reg_reg(RAX, r);
@@ -3333,15 +3344,14 @@ static void emit_mod_imm(Register r, long val, bool save_rax) {
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        emit_mov_reg_imm(RDX, -3689348814741910323);
         emit_mov_reg_reg(RCX, r);
-        emit("mul rdx");
-        emit("shr rdx, 2");
-        emit("and rdx, -2");
-        emit("lea rax, [rdx + 4*rdx]");
-        emit("sub rcx, rax");
-        emit_mov_reg_reg(r, RCX);
+        emit_mov_reg_imm(RAX, -3689348814741910323);
+        emit("mul rcx");
+        emit_mov_reg_reg(RAX, RDX);
+        emit("shr rax, 3");
+        emit("imul rax, -10");
+        emit("add rax, rcx");
+        emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
     } else
     if (val == 1) {
@@ -4117,7 +4127,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             while (i-- > 0) emit("pop %s", reg64[ARGREG[i]]);
         }
         if (!fn || fn->is_variadic) emit("xor eax, eax"); // variadic-safe; harmless otherwise
-        emit("call %s", atom_str(n->name));
+        emit("call \"%s\"", atom_str(n->name));
         emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
         if (fn) return fn->rtype;

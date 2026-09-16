@@ -47,8 +47,6 @@
 * better macro processing (single pass, token based)
 * accept more than 8 macro arguments
 * accept varargs macros
-* accept stringization
-* accept token pasting
 * save locations as offsets with full range capabilities
 * output column in error messages
 * pass integer offset to `gen_expr()`

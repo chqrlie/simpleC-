@@ -83,8 +83,8 @@ int _filbuf(FILE *fp) {
             fp->pos = 0; fp->len = (size_t)rsz; return fp->buf[fp->pos++];
         }
     }
-    char b;
-    if (read(fp->hd, &b, 1) == 1) return b & 255;
+    unsigned char b;
+    if (read(fp->hd, &b, 1) == 1) return b;
     return EOF;
 }
 int fgetc(FILE *fp) { return getc(fp); }
@@ -161,9 +161,10 @@ int _allocbuf(FILE *fp) {
 }
 // writing
 int _flsbuf(int c, FILE *fp) {
+    unsigned char uc = (unsigned char)c;
     if (fp->pos < fp->size && fp->buf) {       // line buffered case
-        fp->buf[fp->pos++] = (unsigned char)c;
-        if (c != '\n') return (unsigned char)c;
+        fp->buf[fp->pos++] = uc;
+        if (c != '\n') return uc;
         return fflush(fp) ? EOF : '\n';
     }
     if (!(fp->flags & _IOWRITE)) return EOF; // XXX: should potentially reallocate memory buffer
@@ -173,11 +174,10 @@ int _flsbuf(int c, FILE *fp) {
         } else if (fflush(fp)) {
             if (fp->pos >= fp->size) return EOF;
         }
-        return fp->buf[fp->pos++] = (unsigned char)c;
+        return fp->buf[fp->pos++] = uc;
     }
 unbuf:;
-    unsigned char b = (unsigned char)c;
-    if (write(fp->hd, &b, 1) == 1) return b;
+    if (write(fp->hd, &uc, 1) == 1) return uc;
     return EOF;
 }
 
