@@ -1414,7 +1414,7 @@ struct Node {
 
 static Node *new_node(NodeKind k) {
     Node *n = allocz(1, sizeof(Node));
-    n->kind = k; n->loc = P->loc; n->op = P->kind;
+    n->kind = k; n->loc = P->loc; n->op = P->kind; P++;
     return n;
 }
 static Node *new_node1(NodeKind k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
@@ -1933,7 +1933,7 @@ static Type *parse_type(unsigned int *flags) {
 static Node *parse_string(void) {
     if (!at(T_STR)) expect(T_STR);
     atom_t str = P->str;
-    Node *n = new_node(N_STR); n->str = str; P++;
+    Node *n = new_node(N_STR); n->str = str;
     if (at(T_STR)) {    // concatenate juxtaposed strings
         char buf[8192]; size_t len = 0;
         for (;;) {
@@ -1987,16 +1987,19 @@ static Node *parse_primary(void) {
         if (max_val > LONG_MAX) t = ty_ulong();
         else if (max_val > UINT_MAX) t = P->is_unsigned ? ty_ulong() : ty_long();
         else if (max_val > INT_MAX) t = (P->is_unsigned || P->base != 10) ? ty_uint() : ty_long();
-        Node *n = new_num_node(t, P->uval); P++; return n;
+        Node *n = new_num_node(t, P->uval); return n;
     }
     case T_CHAR: {
-        Node *n = new_num_node(ty_int(), P->uval); P++; return n;
+        Node *n = new_num_node(ty_int(), P->uval); return n;
     }
     case T_STR: return parse_string();
     case T_ID: {
         atom_t name = P->name;
-        Node *n = new_node(N_VAR); P++; n->name = name;
-        if (eat(T_LP)) {
+        Node *n = new_node(N_VAR); n->name = name;
+        Sym *s = lookup(name, NULL);
+        n->decl = s;
+        // XXX: this is actually a postfix expression
+        if (eat(T_LP)) {  // function call
             switch (name) { // check builtins
             case ID__BUILTIN_VA_START:
             case ID_VA_START:
@@ -2025,12 +2028,6 @@ static Node *parse_primary(void) {
             done_builtin:
                 n->kind = N_BUILTIN; expect(T_RP); return n;
             }
-            P--; // unget '('
-        }
-        Sym *s = lookup(name, NULL);
-        n->decl = s;
-        // XXX: this is actually a postfix expression
-        if (eat(T_LP)) {  // function call
             n->kind = N_CALL;
             if (this_fn) this_fn->flags |= HAS_CALLS;
             Node **ap = &n->rhs;
@@ -2065,8 +2062,8 @@ static Node *parse_postfix(void) {
     for (;;) {
         switch (cur()) {
         case T_LBRK:              // a[i]  ->  *(a + i)
-            n = new_bin_node(n); n->op = T_PLUS;
-            n = new_node1(N_DEREF, n); P++;
+            n = new_bin_node(n); P--; n->op = T_PLUS;
+            n = new_node1(N_DEREF, n);
             n->lhs->rhs = parse_expr();
             expect(T_RBRK);
             break;
@@ -2074,16 +2071,16 @@ static Node *parse_postfix(void) {
             // mutate n into a N_CALL or
             // wrap it if n is not a global reference
         case T_DOT:               // a.field
-            n = new_node1(N_MEMBER, n); P++;
+            n = new_node1(N_MEMBER, n);
             n->name = getid();
             break;
         case T_ARROW:             // p->field  ==  (*p).field
-            n = new_node1(N_DEREF, n);
-            n = new_node1(N_MEMBER, n); P++;
+            n = new_node1(N_DEREF, n); P--;
+            n = new_node1(N_MEMBER, n);
             n->name = getid();
             break;
         case T_INC: case T_DEC:
-            n = new_node1(N_POST, n); P++;
+            n = new_node1(N_POST, n);
             break;
         // case T_LP: check for compound literal
         default:
@@ -2096,7 +2093,7 @@ static Node *parse_postfix(void) {
 // - `static_assert` `(` _constant-expression_ `,` _string-literal_ `)`
 // - `static_assert` `(` _constant-expression_ `)`
 static Node *parse_static_assertion(void) {
-    Node *n = new_node(N_STATIC_ASSERT); P++;
+    Node *n = new_node(N_STATIC_ASSERT);
     expect(T_LP);
     n->lhs = parse_const_expr();
     if (eat(T_COMMA)) n->rhs = parse_string();
@@ -2113,7 +2110,7 @@ static Node *parse_unary(bool accept_cast) {
     case K_SIZEOF:
     case K_COUNTOF:
     case K__COUNTOF: {
-        n = new_node(N_SIZEOF); P++;
+        n = new_node(N_SIZEOF);
         Type *t = NULL;
         if (at(T_LP) && is_type_start(P+1)) {
             // XXX: should accept `sizeof(char[xxx])`
@@ -2132,17 +2129,17 @@ static Node *parse_unary(bool accept_cast) {
         return n;
     }
     case T_PLUS: case T_MINUS: case T_NOT:
-    case T_BITNOT: n = new_node(N_UNARY); P++; n->lhs = parse_cast_expression(); return check_const_unary(n);
-    case T_STAR:   n = new_node(N_DEREF); P++; n->lhs = parse_cast_expression(); return n;
-    case T_AMP:    n = new_node(N_ADDR);  P++; n->lhs = parse_cast_expression();
+    case T_BITNOT: n = new_node(N_UNARY); n->lhs = parse_cast_expression(); return check_const_unary(n);
+    case T_STAR:   n = new_node(N_DEREF); n->lhs = parse_cast_expression(); return n;
+    case T_AMP:    n = new_node(N_ADDR);  n->lhs = parse_cast_expression();
                    if (this_fn) this_fn->flags |= HAS_ADDR;
                    return n;
     case T_INC:
-    case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
+    case T_DEC:    n = new_node(N_PRE);   n->lhs = parse_unary(false); return n;
     case K_STATIC_ASSERT: return parse_static_assertion();
     case T_LP:
         if (accept_cast && is_type_start(P+1)) {
-            n = new_node(N_CAST); P++;
+            n = new_node(N_CAST);
             unsigned int flags;
             n->type = parse_type(&flags);
             expect(T_RP);
@@ -2157,60 +2154,60 @@ static Node *parse_unary(bool accept_cast) {
 
 static Node *parse_mul(void) {
     Node *n = parse_cast_expression();
-    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { n = new_bin_node(n); P++; n->rhs = parse_cast_expression(); check_const_binary(n); }
+    while (at(T_STAR) || at(T_SLASH) || at(T_PERCENT)) { n = new_bin_node(n); n->rhs = parse_cast_expression(); check_const_binary(n); }
     return n;
 }
 static Node *parse_add(void) {
     Node *n = parse_mul();
-    while (at(T_PLUS) || at(T_MINUS)) { n = new_bin_node(n); P++; n->rhs = parse_mul(); check_const_binary(n); }
+    while (at(T_PLUS) || at(T_MINUS)) { n = new_bin_node(n); n->rhs = parse_mul(); check_const_binary(n); }
     return n;
 }
 // C precedence:  <<  >>  bind tighter than the relational operators.
 static Node *parse_shift(void) {
     Node *n = parse_add();
-    while (at(T_SHL) || at(T_SHR)) { n = new_bin_node(n); P++; n->rhs = parse_add(); check_const_binary(n); }
+    while (at(T_SHL) || at(T_SHR)) { n = new_bin_node(n); n->rhs = parse_add(); check_const_binary(n); }
     return n;
 }
 static Node *parse_rel(void) {
     Node *n = parse_shift();
-    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_node1(N_CMP, n); P++; n->rhs = parse_shift(); check_const_binary(n); }
+    while (at(T_LT) || at(T_GT) || at(T_LE) || at(T_GE)) { n = new_node1(N_CMP, n); n->rhs = parse_shift(); check_const_binary(n); }
     return n;
 }
 static Node *parse_eq(void) {
     Node *n = parse_rel();
-    while (at(T_EQ) || at(T_NE)) { n = new_node1(N_CMP, n); P++; n->rhs = parse_rel(); check_const_binary(n); }
+    while (at(T_EQ) || at(T_NE)) { n = new_node1(N_CMP, n); n->rhs = parse_rel(); check_const_binary(n); }
     return n;
 }
 // Bitwise AND / XOR / OR sit between equality and logical-AND, in that order.
 static Node *parse_band(void) {
     Node *n = parse_eq();
-    while (at(T_AMP)) { n = new_bin_node(n); P++; n->rhs = parse_eq(); check_const_binary(n); }
+    while (at(T_AMP)) { n = new_bin_node(n); n->rhs = parse_eq(); check_const_binary(n); }
     return n;
 }
 static Node *parse_bxor(void) {
     Node *n = parse_band();
-    while (at(T_BITXOR)) { n = new_bin_node(n); P++; n->rhs = parse_band(); check_const_binary(n); }
+    while (at(T_BITXOR)) { n = new_bin_node(n); n->rhs = parse_band(); check_const_binary(n); }
     return n;
 }
 static Node *parse_bor(void) {
     Node *n = parse_bxor();
-    while (at(T_BITOR)) { n = new_bin_node(n); P++; n->rhs = parse_bxor(); check_const_binary(n); }
+    while (at(T_BITOR)) { n = new_bin_node(n); n->rhs = parse_bxor(); check_const_binary(n); }
     return n;
 }
 static Node *parse_land(void) {
     Node *n = parse_bor();
-    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); P++; n->rhs = parse_bor(); check_const_logical(n); }
+    while (at(T_ANDAND)) { n = new_node1(N_LOGAND, n); n->rhs = parse_bor(); check_const_logical(n); }
     return n;
 }
 static Node *parse_lor(void) {
     Node *n = parse_land();
-    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); P++; n->rhs = parse_land(); check_const_logical(n); }
+    while (at(T_OROR)) { n = new_node1(N_LOGOR, n); n->rhs = parse_land(); check_const_logical(n); }
     return n;
 }
 static Node *parse_ternary(void) {
     Node *n = parse_lor();
     if (at(T_QUESTION)) {
-        Node *t = new_node(N_TERNARY); P++;
+        Node *t = new_node(N_TERNARY);
         t->cond = n; t->lhs = parse_expr(); expect(T_COLON); t->rhs = parse_ternary();
         return check_const_ternary(t);
     }
@@ -2223,7 +2220,7 @@ static Node *parse_assign(void) {
     case T_ASSIGN:  case T_PLUSEQ:    case T_MINUSEQ:  case T_STAREQ:
     case T_SLASHEQ: case T_PERCENTEQ: case T_OREQ:     case T_ANDEQ:
     case T_XOREQ:   case T_SHLEQ:     case T_SHREQ:
-        n = new_node1(N_ASSIGN, n); P++; n->rhs = parse_assign();
+        n = new_node1(N_ASSIGN, n); n->rhs = parse_assign();
         break;
     default: break;
     }
@@ -2231,7 +2228,7 @@ static Node *parse_assign(void) {
 }
 static Node *parse_expr(void) {
     Node *n = parse_assign();
-    while (at(T_COMMA)) { n = new_node1(N_COMMA, n); P++; n->rhs = parse_assign(); }
+    while (at(T_COMMA)) { n = new_node1(N_COMMA, n); n->rhs = parse_assign(); }
     return n;
 }
 
@@ -2317,13 +2314,13 @@ static Node *parse_designator(void) {
     for (;;) {
         switch (cur()) {
         case T_LBRK: // array designator
-            n = new_node1(N_DESIGNATOR, n); P++;
+            n = new_node1(N_DESIGNATOR, n);
             n->cond = parse_const_expr();
             if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
             expect(T_RBRK);
             continue;
         case T_DOT: // member designator
-            n = new_node1(N_DESIGNATOR, n); P++;
+            n = new_node1(N_DESIGNATOR, n);
             n->name = getid();
             continue;
         default:
@@ -2336,7 +2333,7 @@ static Node *parse_designator(void) {
 
 static Node *parse_init(void) {
     if (at(T_LBRACE)) {
-        Node *n = new_node(N_BLOCK); P++;
+        Node *n = new_node(N_BLOCK);
         Node **tailp = &n->rhs;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             Node *e;
@@ -2373,7 +2370,7 @@ static Node *parse_loop_body(Node *n) {
 
 static Node *parse_block(void) {
     if (!at(T_LBRACE)) expect(T_LBRACE);
-    Node *n = new_node(N_BLOCK); P++; scope_push(n);
+    Node *n = new_node(N_BLOCK); scope_push(n);
     Node **tailp = &n->rhs;
     while (!at(T_RBRACE) && !at(T_EOF)) {
         Node *e = parse_stmt();
@@ -2385,7 +2382,7 @@ static Node *parse_block(void) {
 
 static Node *parse_switch(void) {
     Node *sw = this_switch;
-    Node *n = new_node(N_SWITCH); P++;
+    Node *n = new_node(N_SWITCH);
     this_switch = n;
     expect(T_LP); n->cond = parse_expr(); expect(T_RP);
     n->rhs = parse_block();
@@ -2396,7 +2393,7 @@ static Node *parse_switch(void) {
 static Node *parse_case(NodeKind kind) {
     Node *sw = this_switch;
     if (!sw) error(NULL, "'%s' outside a 'switch' statement", token_str(P));
-    Node *n = new_node(kind); P++;
+    Node *n = new_node(kind);
     if (kind == N_CASE) {
         n->cond = parse_const_expr();
         if (eat(T_ELLIPSIS)) n->rhs = parse_const_expr();
@@ -2425,15 +2422,15 @@ static Node *parse_stmt(void) {
     parse_attributes();
     switch (cur()) {
     case T_LBRACE: return parse_block();
-    case T_SEMI:   n = new_node(N_EMPTY); P++; return n;
+    case T_SEMI:   n = new_node(N_EMPTY); return n;
     case K_IF:
-        n = new_node(N_IF); P++;
+        n = new_node(N_IF);
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_stmt();
         if (eat(K_ELSE)) n->rhs = parse_stmt();
         return n;
     case K_WHILE:
-        n = new_node(N_WHILE); P++;
+        n = new_node(N_WHILE);
         expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         n->lhs = parse_loop_body(n);
         return n;
@@ -2441,16 +2438,16 @@ static Node *parse_stmt(void) {
     case K_CASE:    return parse_case(N_CASE);
     case K_DEFAULT: return parse_case(N_DEFAULT);
     case K_GOTO:
-        n = new_node(N_GOTO); P++;
+        n = new_node(N_GOTO);
         n->name = getid();
         break;
     case K_FOR:
-        n = new_node(N_FOR); P++; scope_push(n);
+        n = new_node(N_FOR); scope_push(n);
         expect(T_LP);
         parse_attributes();
         if (is_type_start(P)) n->finit = parse_declaration();      // consumes ';'
         else {
-            if (!at(T_SEMI)) { n->finit = new_node(N_EXPR); n->finit->lhs = parse_expr(); }
+            if (!at(T_SEMI)) { n->finit = new_node(N_EXPR); P--; n->finit->lhs = parse_expr(); }
             expect(T_SEMI);
         }
         if (!at(T_SEMI)) n->cond = parse_expr();
@@ -2460,7 +2457,7 @@ static Node *parse_stmt(void) {
         n->lhs = parse_loop_body(n);
         return scope_pop(n);
     case K_DO:
-        n = new_node(N_DOWHILE); P++;
+        n = new_node(N_DOWHILE);
         n->lhs = parse_loop_body(n);
         expect(K_WHILE); expect(T_LP); n->cond = parse_expr(); expect(T_RP);
         break;
@@ -2468,19 +2465,19 @@ static Node *parse_stmt(void) {
         if (this_switch) { this_switch->flags |= HAS_BREAK; }
         else if (this_loop) { this_loop->flags |= HAS_BREAK; }
         else { error(NULL, "'break' outside a loop or 'switch' statement"); }
-        n = new_node(N_BREAK); P++;
+        n = new_node(N_BREAK);
         break;
     case K_CONTINUE:
         if (this_loop) { this_loop->flags |= HAS_CONTINUE; }
         else error(NULL, "'continue' outside a loop statement");
-        n = new_node(N_CONTINUE); P++;
+        n = new_node(N_CONTINUE);
         break;
     case K_RETURN:
-        n = new_node(N_RETURN); P++;
+        n = new_node(N_RETURN);
         if (!at(T_SEMI)) n->lhs = parse_expr();
         break;
     case K_ASM: case K__ASM__:
-        n = new_node(N_ASM); P++;
+        n = new_node(N_ASM);
         expect(T_LP);
         n->str = parse_string()->str;
         expect(T_RP);
@@ -2491,7 +2488,7 @@ static Node *parse_stmt(void) {
         break;
     case T_ID:
         if (peek(T_COLON)) {
-            n = new_node(N_LABEL);
+            n = new_node(N_LABEL); P--;
             n->name = getid();
             if (find_label(n->name)) warning(n->loc, "duplicate label '%s'", atom_str(n->name));
             add_label(n);
@@ -2502,7 +2499,7 @@ static Node *parse_stmt(void) {
         fallthrough;
     default:
         if (is_type_start(P)) return parse_declaration();
-        n = new_node(N_EXPR); n->lhs = parse_expr();
+        n = new_node(N_EXPR); P--; n->lhs = parse_expr();
         break;
     }
     expect(T_SEMI);
@@ -2771,7 +2768,7 @@ static Node *parse_declaration(void) {
     unsigned int flags;
     srcloc_t loc = curloc();
     Type *base = parse_type_base_only(&flags);
-    Node *n = new_node(N_DECL);
+    Node *n = new_node(N_DECL); P--;
     n->loc = loc;
     n->decl_flags = flags;
     if (eat(T_SEMI)) {
@@ -2820,7 +2817,7 @@ static Node *parse_declaration(void) {
 }
 
 static Node *parse_toplevel(void) {
-    Node *n = new_node(N_BLOCK);
+    Node *n = new_node(N_BLOCK); P--;
     Node **tailp = &n->rhs;
     while (!at(T_EOF)) {
         Node *e = parse_stmt();
@@ -2865,9 +2862,9 @@ static bool check_rewrite(Node *n) {
         if (n->nargs != 2) break;
         Node *arg2 = n->rhs->next; if (arg2->kind != N_STR) break;
         const char *s = atom_str(arg2->str);
-        size_t len = strlen(s); // do not use atom len to allow embedded nuls
+        size_t len = strlen(s); // do not use atom len to stop at embedded nuls
         n->name = ID_MEMCPY;
-        arg2->next = new_num_node(ty_size_t(), len + 1);
+        arg2->next = new_num_node(ty_size_t(), len + 1); P--;
         arg2->next->loc = arg2->loc;
         n->nargs = 3;
         return true;
