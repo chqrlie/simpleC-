@@ -3230,7 +3230,7 @@ static void emit_imul_imm(Register r, long val) {
     }
 }
 
-static void emit_idiv_imm(Register r, long val, bool save_rax) {
+static void emit_idiv_imod_imm(Register r, long val, bool save_rax, bool mod) {
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
@@ -3241,16 +3241,21 @@ static void emit_idiv_imm(Register r, long val, bool save_rax) {
         emit_reg_imm("shr", RAX, 63);
         emit("sar rdx, 2");
         emit("add rax, rdx");
+        if (mod) {
+            emit("imul rax, -10");
+            emit("add rax, rcx");
+        }
         emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
     } else
-    if (val == 1) {
-        // no code
+    if (labs(val) == 1) {
+        if (mod) {
+            emit_reg_reg("xor", r, r);
+        } else {
+            if (val == -1) emit_reg("neg", r);
+        }
     } else
-    if (val == -1) {
-        emit_reg("neg", r);
-    } else
-    if ((val & (val - 1)) == 0) { // power of 2
+    if (val > 0 && (val & (val - 1)) == 0) { // power of 2
         long adj = val - 1;
         if ((unsigned long)adj <= INT_MAX) {
             emit("lea rdx, [%s + %ld]", reg64[r], adj);
@@ -3259,19 +3264,26 @@ static void emit_idiv_imm(Register r, long val, bool save_rax) {
             emit_reg_reg("add", RDX, r);
         }
         emit_reg_reg("test", r, r);
-        emit_reg_reg("cmovs", r, RDX);
-        emit_reg_imm("sar", r, __builtin_ctzl((unsigned long)val));
+        if (mod) {
+            emit_reg_reg("cmovns", RDX, r);
+            emit_reg_imm("sar", RDX, __builtin_ctzl((unsigned long)val));
+            emit_reg_imm("shl", RDX, __builtin_ctzl((unsigned long)val));
+            emit_reg_reg("sub", r, RDX);
+        } else {
+            emit_reg_reg("cmovs", r, RDX);
+            emit_reg_imm("sar", r, __builtin_ctzl((unsigned long)val));
+        }
     } else {
         if (save_rax) emit("push rax");
         emit_mov_reg_reg(RAX, r);
         emit_mov_reg_imm(RCX, val);
         emit("cqo"); emit("idiv rcx");
-        emit_mov_reg_reg(r, RAX);
+        emit_mov_reg_reg(r, mod ? RDX : RAX);
         if (save_rax) emit("pop rax");
     }
 }
 
-static void emit_div_imm(Register r, long val, bool save_rax) {
+static void emit_div_mod_imm(Register r, long val, bool save_rax, bool mod) {
     if (!val) return; // undefined behavior, no code
     if (val == 10) {
         if (save_rax) emit("push rax");
@@ -3279,92 +3291,25 @@ static void emit_div_imm(Register r, long val, bool save_rax) {
         emit_mov_reg_imm(RAX, -3689348814741910323);
         emit("mul rcx");
         emit("shr rdx, 3");
-        emit_mov_reg_reg(r, RDX);
-        if (save_rax) emit("pop rax");
-    } else
-    if (val == 1) {
-        // nothing
-    } else
-    if ((val & (val - 1)) == 0) { // power of 2
-        emit_reg_imm("shr", r, __builtin_ctzl((unsigned long)val));
-    } else {
-        if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        // could optimize furter using 32-bit division
-        emit_mov_reg_imm(RCX, val);
-        emit("sub rdx, rdx"); emit("div rcx");
-        emit_mov_reg_reg(r, RAX);
-        if (save_rax) emit("pop rax");
-    }
-}
-
-static void emit_imod_imm(Register r, long val, bool save_rax) {
-    if (!val) return; // undefined behavior, no code
-    if (val == 10) {
-        if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RCX, r);
-        emit_mov_reg_imm(RAX, 7378697629483820647);
-        emit("imul rcx");
-        emit_mov_reg_reg(RAX, RDX);
-        emit_reg_imm("shr", RAX, 63);
-        emit("sar rdx, 2");
-        emit("add rax, rdx");
-        emit("imul rax, -10");
-        emit("add rax, rcx");
-        emit_mov_reg_reg(r, RAX);
-        if (save_rax) emit("pop rax");
-    } else
-    if (labs(val) == 1) {
-        emit_reg_reg("xor", r, r);
-    } else
-    if ((val & (val - 1)) == 0) { // power of 2
-        long adj = val - 1;
-        if ((unsigned long)adj <= INT_MAX) {
-            emit("lea rdx, [%s + %ld]", reg64[r], adj);
-        } else {
-            emit_mov_reg_imm(RDX, adj);
-            emit_reg_reg("add", RDX, r);
+        if (mod) {
+            emit("imul rdx, -10");
+            emit("add rdx, rcx");
         }
-        emit_reg_reg("test", r, r);
-        emit_reg_reg("cmovns", RDX, r);
-        emit_reg_imm("sar", RDX, __builtin_ctzl((unsigned long)val));
-        emit_reg_imm("shl", RDX, __builtin_ctzl((unsigned long)val));
-        emit_reg_reg("sub", r, RDX);
-    } else {
-        if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RAX, r);
-        emit_mov_reg_imm(RCX, val);
-        emit("cqo"); emit("idiv rcx");
         emit_mov_reg_reg(r, RDX);
-        if (save_rax) emit("pop rax");
-    }
-}
-
-static void emit_mod_imm(Register r, long val, bool save_rax) {
-    if (!val) return; // undefined behavior, no code
-    if (val == 10) {
-        if (save_rax) emit("push rax");
-        emit_mov_reg_reg(RCX, r);
-        emit_mov_reg_imm(RAX, -3689348814741910323);
-        emit("mul rcx");
-        emit_mov_reg_reg(RAX, RDX);
-        emit("shr rax, 3");
-        emit("imul rax, -10");
-        emit("add rax, rcx");
-        emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
     } else
     if (val == 1) {
-        emit_reg_reg("xor", r, r);
+        if (mod) emit_reg_reg("xor", r, r);
     } else
     if ((val & (val - 1)) == 0) { // power of 2
-        emit_reg_imm("and", r, val - 1);
+        if (mod) emit_reg_imm("and", r, val - 1);
+        else emit_reg_imm("shr", r, __builtin_ctzl((unsigned long)val));
     } else {
         if (save_rax) emit("push rax");
         emit_mov_reg_reg(RAX, r);
         emit_mov_reg_imm(RCX, val);
         emit("sub rdx, rdx"); emit("div rcx");
-        emit_mov_reg_reg(r, RDX);
+        emit_mov_reg_reg(r, mod ? RDX : RAX);
         if (save_rax) emit("pop rax");
     }
 }
@@ -3377,7 +3322,7 @@ static TokenKind get_rop(TokenKind op) {
     case T_GT: return T_LE;
     case T_LE: return T_GT;
     case T_GE: return T_LT;
-    default: return op;
+    default:   return op;
     }
 }
 
@@ -3416,7 +3361,7 @@ static Type *gen_bin(Node *n, TokenKind op, Type *lt, Type *rt, Register r) {
             unsigned sz = elem_size(lt);
             if (is_ptrish(rt)) {
                 emit("sub rax, rcx");
-                emit_idiv_imm(RAX, sz, false);
+                emit_idiv_imod_imm(RAX, sz, false, false);
                 ct = ty_long();
                 break;
             }
@@ -3486,13 +3431,12 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
     case T_MINUS:   gen_inc(lt, T_DEC, reg64[r], val); break;
     case T_STAR:    emit_imul_imm(r, val);             break;
     case T_SLASH:
-        if (ty_is_unsigned(ct)) emit_div_imm(r, val, save_rax);
-        else emit_idiv_imm(r, val, save_rax);
+    case T_PERCENT: {
+        bool mod = (op == T_PERCENT);
+        if (ty_is_unsigned(ct)) emit_div_mod_imm(r, val, save_rax, mod);
+        else emit_idiv_imod_imm(r, val, save_rax, mod);
         break;
-    case T_PERCENT:
-        if (ty_is_unsigned(ct)) emit_mod_imm(r, val, save_rax);
-        else emit_imod_imm(r, val, save_rax);
-        break;
+    }
     case T_AMP:     if (val + 1)   emit_reg_imm("and", r, val); break;
     case T_BITOR:   if (val)       emit_reg_imm("or",  r, val); break;
     case T_BITXOR:  if (val)       emit_reg_imm("xor", r, val); break;
