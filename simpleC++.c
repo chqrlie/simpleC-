@@ -945,6 +945,7 @@ typedef struct Token {
 } Token;
 
 #define DEF_TOK_CAP 50000
+static Token *P;            // token cursor
 static Token *toks;
 static size_t toks_cap;
 static size_t ntok;
@@ -1360,12 +1361,10 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
 // 4. AST
 // =====================================================================
 typedef enum NodeKind enum_type(unsigned char) {
-    N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP,
-    N_COMMA, N_UNARY, N_POST, N_PRE, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
-    N_MEMBER, N_SIZEOF, N_TERNARY,
-    N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
-    N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH,
-    N_CASE, N_DEFAULT, N_LABEL,
+    N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP, N_COMMA,
+    N_UNARY, N_POST, N_PRE, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
+    N_MEMBER, N_SIZEOF, N_TERNARY, N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
+    N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH, N_CASE, N_DEFAULT, N_LABEL,
     N_RETURN, N_BREAK, N_CONTINUE, N_GOTO, N_ASM, N_STATIC_ASSERT, N_DESIGNATOR,
 } NodeKind;
 
@@ -1380,7 +1379,7 @@ struct Node {
 #define HAS_PAREN     32    // all E-nodes
 #define LAB_USED      64    // N_LABEL
 #define HAS_WARNED    64    // N_DESIGNATOR
-#define HAS_DESIGNATOR 128    // N_BLOCK initializer
+#define HAS_DESIGNATOR 128  // N_BLOCK initializer
     unsigned char flags;
 #define MAX_ARGS 6
     unsigned char nargs;    // N_CALL
@@ -1413,10 +1412,9 @@ struct Node {
     Node *next;
 };
 
-static Token *cur(void);
 static Node *new_node(NodeKind k) {
     Node *n = allocz(1, sizeof(Node));
-    n->kind = k; n->loc = cur()->loc; n->op = cur()->kind;
+    n->kind = k; n->loc = P->loc; n->op = P->kind;
     return n;
 }
 static Node *new_node1(NodeKind k, Node *lhs) { Node *n = new_node(k); n->lhs = lhs; return n; }
@@ -1426,7 +1424,7 @@ static Node *new_num_node(Type *t, unsigned long uval) { return set_num_node(new
 static Node *node_last(Node *n) { if (n) while (n->next) n = n->next; return n; }
 
 static void error(Node *n, const char *fmt, ...) {
-    srcloc_t loc = n ? n->loc : cur()->loc;
+    srcloc_t loc = n ? n->loc : P->loc;
     va_list a; va_start(a, fmt); err_message(loc, "error", fmt, a); va_end(a);
     if (1) exit(1);
 }
@@ -1619,17 +1617,16 @@ struct Func {
 // =====================================================================
 // 5. PARSER
 // =====================================================================
-static size_t P;                       // token cursor
 
-#define curloc()  (toks[P].loc)
-static Token *cur(void) { return &toks[P]; }
-static int at(int k)    { return toks[P].kind == k; }
-static int peek(int k)  { return toks[P+1].kind == k; }
-static int eat(int k)   { if (toks[P].kind == k) { P++; return 1; } return 0; }
-static void expect(int k) { if (!eat(k)) { error(NULL, "expected '%s', got '%s'", token_name[k], token_str(cur())); } }
+#define cur()     (P->kind)
+#define curloc()  (P->loc)
+#define at(k)     (P->kind == k)
+#define peek(k)   (P[1].kind == k)
+static int eat(int k)   { if (cur() == k) { P++; return 1; } return 0; }
+static void expect(int k) { if (!eat(k)) { error(NULL, "expected '%s', got '%s'", token_name[k], token_str(P)); } }
 
 static atom_t getid(void) {
-    if (toks[P].kind == T_ID) return toks[P++].name;
+    if (cur() == T_ID) return (P++)->name;
     expect(T_ID); return 0;
 }
 
@@ -1690,11 +1687,11 @@ static Type *static_typeof(Node *n, Type *def);
 static void parse_attributes(void) {
     // parse and consume an _attribute-specifier-sequence_
     for (;;) {
-        if (at(T_ID) && toks[P].name == ID__ATTRIBUTE__) {
+        if (at(T_ID) && P->name == ID__ATTRIBUTE__) {
             // scan and ignore `__attribute__` `(` _balanced-token-sequence_ `)`
             P++; expect(T_LP);
             for (size_t depth = 0;; P++) {
-                switch (cur()->kind) {
+                switch (cur()) {
                 case T_EOF: break;
                 case T_LP: depth++; continue;
                 case T_RP: if (depth--) continue; else break;
@@ -1707,7 +1704,7 @@ static void parse_attributes(void) {
         if (at(T_LBRK) && peek(T_LBRK)) {
             // scan and ignore `[` `[` _attribute-list_ `]` `]`
             for (P += 2;; P++) {
-                switch (cur()->kind) {
+                switch (cur()) {
                 case T_EOF: break;
                 case T_RBRK: if (peek(T_RBRK)) break; fallthrough;
                 default: continue;
@@ -1935,7 +1932,7 @@ static Type *parse_type(unsigned int *flags) {
 
 static Node *parse_string(void) {
     if (!at(T_STR)) expect(T_STR);
-    atom_t str = cur()->str;
+    atom_t str = P->str;
     Node *n = new_node(N_STR); n->str = str; P++;
     if (at(T_STR)) {    // concatenate juxtaposed strings
         char buf[8192]; size_t len = 0;
@@ -1943,7 +1940,7 @@ static Node *parse_string(void) {
             len += pmemcpy(buf + len, countof(buf) - len,
                            atom_str(str), atom_len(str));
             if (!at(T_STR)) break;
-            str = cur()->str; P++;
+            str = P->str; P++;
         }
         if (len == countof(buf)) error(n, "string too long");
         n->str = new_atom_len(buf, len);
@@ -1982,23 +1979,22 @@ static Node *check_const_logical(Node *n) {
 //}
 
 static Node *parse_primary(void) {
-    switch (toks[P].kind) {
+    switch (cur()) {
     case T_NUM: {
-        Token *tp = cur();
         Type *t = ty_int();
-        unsigned long max_val = tp->uval;
-        if (tp->is_long) max_val |= LONG_MAX;
+        unsigned long max_val = P->uval;
+        if (P->is_long) max_val |= LONG_MAX;
         if (max_val > LONG_MAX) t = ty_ulong();
-        else if (max_val > UINT_MAX) t = tp->is_unsigned ? ty_ulong() : ty_long();
-        else if (max_val > INT_MAX) t = (tp->is_unsigned || tp->base != 10) ? ty_uint() : ty_long();
-        Node *n = new_num_node(t, tp->uval); P++; return n;
+        else if (max_val > UINT_MAX) t = P->is_unsigned ? ty_ulong() : ty_long();
+        else if (max_val > INT_MAX) t = (P->is_unsigned || P->base != 10) ? ty_uint() : ty_long();
+        Node *n = new_num_node(t, P->uval); P++; return n;
     }
     case T_CHAR: {
-        Node *n = new_num_node(ty_int(), cur()->uval); P++; return n;
+        Node *n = new_num_node(ty_int(), P->uval); P++; return n;
     }
     case T_STR: return parse_string();
     case T_ID: {
-        atom_t name = toks[P].name;
+        atom_t name = P->name;
         Node *n = new_node(N_VAR); P++; n->name = name;
         if (eat(T_LP)) {
             switch (name) { // check builtins
@@ -2059,7 +2055,7 @@ static Node *parse_primary(void) {
     }
     //case K_GENERIC: error(NULL, "_Generic selection not supported");
     default:
-        error(NULL, "expected expression, got '%s'", token_str(cur())); return 0;
+        error(NULL, "expected expression, got '%s'", token_str(P)); return 0;
     }
 }
 
@@ -2067,7 +2063,7 @@ static Node *parse_primary(void) {
 static Node *parse_postfix(void) {
     Node *n = parse_primary();
     for (;;) {
-        switch (toks[P].kind) {
+        switch (cur()) {
         case T_LBRK:              // a[i]  ->  *(a + i)
             n = new_bin_node(n); n->op = T_PLUS;
             n = new_node1(N_DEREF, n); P++;
@@ -2111,7 +2107,7 @@ static Node *parse_static_assertion(void) {
 #define parse_cast_expression() parse_unary(true)
 static Node *parse_unary(bool accept_cast) {
     Node *n;
-    switch (toks[P].kind) {
+    switch (cur()) {
     //case K_ALIGNOF:  // alignof(type)
     //case K_COUNTOF:
     case K_SIZEOF:
@@ -2119,7 +2115,7 @@ static Node *parse_unary(bool accept_cast) {
     case K__COUNTOF: {
         n = new_node(N_SIZEOF); P++;
         Type *t = NULL;
-        if (at(T_LP) && is_type_start(&toks[P+1])) {
+        if (at(T_LP) && is_type_start(P+1)) {
             // XXX: should accept `sizeof(char[xxx])`
             // Should support delayed type resolution and
             // dynamic type expressions: sizeof(char[expr])
@@ -2145,7 +2141,7 @@ static Node *parse_unary(bool accept_cast) {
     case T_DEC:    n = new_node(N_PRE);   P++; n->lhs = parse_unary(false); return n;
     case K_STATIC_ASSERT: return parse_static_assertion();
     case T_LP:
-        if (accept_cast && is_type_start(&toks[P+1])) {
+        if (accept_cast && is_type_start(P+1)) {
             n = new_node(N_CAST); P++;
             unsigned int flags;
             n->type = parse_type(&flags);
@@ -2223,7 +2219,7 @@ static Node *parse_ternary(void) {
 static Node *parse_const_expr(void) { return parse_ternary(); }
 static Node *parse_assign(void) {
     Node *n = parse_ternary();
-    switch (toks[P].kind) {
+    switch (cur()) {
     case T_ASSIGN:  case T_PLUSEQ:    case T_MINUSEQ:  case T_STAREQ:
     case T_SLASHEQ: case T_PERCENTEQ: case T_OREQ:     case T_ANDEQ:
     case T_XOREQ:   case T_SHLEQ:     case T_SHREQ:
@@ -2245,7 +2241,7 @@ static Type *parse_type_base_only(unsigned int *pflags) {
     for (;;) {
         *pflags = sflags | (tflags << 16);
         unsigned int k;
-        switch (k = cur()->kind) {
+        switch (k = cur()) {
         case K_CONST:
         case K_VOLATILE:
         case K_AUTO:
@@ -2272,11 +2268,11 @@ static Type *parse_type_base_only(unsigned int *pflags) {
         default:
             if (t) return qualified_type(t, sflags & (HAS_CONST | HAS_VOLATILE));
             if (k == T_ID) {
-                atom_t name = toks[P].name;
+                atom_t name = P->name;
                 if (name == ID__ATTRIBUTE__) { parse_attributes(); continue; }
                 if ((t = find_typedef(name))) { tflags |= HAS_TYPE; P++; break; }
             }
-            error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
+            error(NULL, "expected type, got '%s'", token_str(P)); return 0;
         }
         switch (tflags) {
         case 0:                                                   break;  // no type yet
@@ -2319,7 +2315,7 @@ static Type *parse_type_base_only(unsigned int *pflags) {
 static Node *parse_designator(void) {
     Node *n = NULL;
     for (;;) {
-        switch (toks[P].kind) {
+        switch (cur()) {
         case T_LBRK: // array designator
             n = new_node1(N_DESIGNATOR, n); P++;
             n->cond = parse_const_expr();
@@ -2344,7 +2340,7 @@ static Node *parse_init(void) {
         Node **tailp = &n->rhs;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             Node *e;
-            switch (toks[P].kind) {
+            switch (cur()) {
             case T_LBRK: // array designator
             case T_DOT:  // member designator
                 n->flags |= HAS_DESIGNATOR;
@@ -2399,7 +2395,7 @@ static Node *parse_switch(void) {
 
 static Node *parse_case(NodeKind kind) {
     Node *sw = this_switch;
-    if (!sw) error(NULL, "'%s' outside a 'switch' statement", token_str(cur()));
+    if (!sw) error(NULL, "'%s' outside a 'switch' statement", token_str(P));
     Node *n = new_node(kind); P++;
     if (kind == N_CASE) {
         n->cond = parse_const_expr();
@@ -2427,7 +2423,7 @@ static Node *parse_case(NodeKind kind) {
 static Node *parse_stmt(void) {
     Node *n;
     parse_attributes();
-    switch (toks[P].kind) {
+    switch (cur()) {
     case T_LBRACE: return parse_block();
     case T_SEMI:   n = new_node(N_EMPTY); P++; return n;
     case K_IF:
@@ -2452,7 +2448,7 @@ static Node *parse_stmt(void) {
         n = new_node(N_FOR); P++; scope_push(n);
         expect(T_LP);
         parse_attributes();
-        if (is_type_start(cur())) n->finit = parse_declaration();      // consumes ';'
+        if (is_type_start(P)) n->finit = parse_declaration();      // consumes ';'
         else {
             if (!at(T_SEMI)) { n->finit = new_node(N_EXPR); n->finit->lhs = parse_expr(); }
             expect(T_SEMI);
@@ -2505,7 +2501,7 @@ static Node *parse_stmt(void) {
         }
         fallthrough;
     default:
-        if (is_type_start(cur())) return parse_declaration();
+        if (is_type_start(P)) return parse_declaration();
         n = new_node(N_EXPR); n->lhs = parse_expr();
         break;
     }
@@ -2764,7 +2760,7 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
         fn->body = parse_block();
         this_fn = NULL;
         fn->frame_size = frame_max;
-        fn->endloc = toks[P-1].loc;
+        fn->endloc = P[-1].loc;
     }
     scope_pop(&fun);
     return s;
@@ -5070,6 +5066,7 @@ int main(int argc, char **argv) {
         goto done;
     }
 
+    P = toks;
     while (!at(T_EOF)) parse_toplevel();
     check_used_func(ID_MAIN);
     if (!kernel_mode) check_used_func(ID__EXIT);
