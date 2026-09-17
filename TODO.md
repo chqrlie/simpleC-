@@ -42,8 +42,6 @@
 * fix complex designated initializers
 * structure assignment
 * structure passing and returning
-* accept `__attribute__` syntax
-* accept `[[ attribute-list ]]` syntax
 * better macro processing (single pass, token based)
 * accept more than 8 macro arguments
 * accept varargs macros

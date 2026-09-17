@@ -21,7 +21,7 @@
 #endif
 typedef struct nano_FILE { size_t pos, cap, size; unsigned char *buf; } nano_FILE;
 #define put1(c, fp)  ((fp->pos < fp->cap) ? fp->buf[fp->pos++] = (unsigned char)(c) : EOF)
-int snprintf(char *buf, size_t size, const char *fmt, ...) attr_printf(3, 4);
+int snprintf(char *buf, size_t size, const char *fmt, ...)  __attribute__((format(printf, 3, 4)));
 int vfprintf(nano_FILE *fp, const char *fmt, va_list ap);
 static long __fwrite(const void *p, size_t len, nano_FILE *fp) {
     size_t nw = fp->cap - fp->pos; if (nw > len) nw = len;

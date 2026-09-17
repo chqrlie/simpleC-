@@ -18,9 +18,6 @@
 #pragma GCC diagnostic ignored "-Wpragmas"
 #pragma GCC diagnostic ignored "-Wpre-c11-compat"
 #pragma GCC diagnostic ignored "-Wpre-c23-compat"
-#define attr_printf(a, b)  __attribute__((format(printf, a, b)))
-#else
-#define attr_printf(a, b)
 #endif
 
 //#if 1
@@ -36,14 +33,14 @@
 #undef snprintf
 #undef vfprintf
 //#define LIBSYM(sym)  nano_##sym
-#define ALT_FUNC  nano_snprintf
+#define ALT_FUNC       nano_snprintf
 #define ALT_FUNC_name  "nano_snprintf"
 #endif
 
 #if 0
 //#define LIBSYM(sym)  subc_##sym
 #include "printf.h"
-#define ALT_FUNC     subc_snprintf
+#define ALT_FUNC       subc_snprintf
 #define ALT_FUNC_name  "subc_snprintf"
 #endif
 
@@ -5186,7 +5183,7 @@ static _Noreturn void usage(const char *progname) {
     exit(1);
 }
 
-void pad_printf(FILE *fp, int width, const char *fmt, ...) attr_printf(3,4);
+void pad_printf(FILE *fp, int width, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 void pad_printf(FILE *fp, int width, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);

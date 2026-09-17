@@ -46,7 +46,6 @@ static void malloc_stats(void) {
 #pragma GCC diagnostic ignored "-Wpre-c23-compat"
 #pragma GCC diagnostic ignored "-Wfixed-enum-extension"
 #pragma GCC diagnostic ignored "-Wswitch-enum"
-#define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #if __has_attribute(__fallthrough__)
 # define fallthrough  __attribute__((__fallthrough__))
 #else
@@ -58,11 +57,11 @@ static void malloc_stats(void) {
 # include <stdcountof.h>
 #endif
 #else
-#define attr_printf(a, b)
 #define fallthrough
 #define SMALL
 #endif
 
+#define attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #define enum_type(type)  : type
 
 // ---------------------------------------------------------------------
@@ -417,6 +416,7 @@ typedef enum TokenKind enum_type(unsigned char) {
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
     K_INCLUDE, K_LINE, ID__FILE__, ID__LINE__, ID__COUNTER__,
+    ID__ATTRIBUTE__,
 
 #define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) <= ID_LABS)
     ID__BUILTIN_VA_START, ID_VA_START, ID__BUILTIN_VA_ARG, ID_VA_ARG,
@@ -448,6 +448,7 @@ static const char * const token_name[T_count] = {
     "switch", "case", "default", "goto", "static_assert",
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
     "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
+    "__attribute__",
     "__builtin_va_start", "va_start", "__builtin_va_arg", "va_arg",
     "__builtin_va_copy", "va_copy", "__builtin_va_end", "va_end",
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
@@ -521,8 +522,6 @@ static void def_macro(const char *name) {
 static void create_builtin_macros(void) {
     def_macro("__NANOCC__");
     macro_define(new_atom("__VERSION__"), 0, -1, NULL, 3, "0.1");
-    atom_t a = ID_MAIN;
-    macro_define(new_atom("__attribute__"), 0, 1, &a, 0, "");
     def_macro("__amd64");
     def_macro("__amd64__");
     def_macro("__x86_64");
@@ -1625,6 +1624,7 @@ static size_t P;                       // token cursor
 #define curloc()  (toks[P].loc)
 static Token *cur(void) { return &toks[P]; }
 static int at(int k)    { return toks[P].kind == k; }
+static int peek(int k)  { return toks[P+1].kind == k; }
 static int eat(int k)   { if (toks[P].kind == k) { P++; return 1; } return 0; }
 static void expect(int k) { if (!eat(k)) { error(NULL, "expected '%s', got '%s'", token_name[k], token_str(cur())); } }
 
@@ -1634,10 +1634,19 @@ static atom_t getid(void) {
 }
 
 static bool is_type_start(Token *t) {
-    int k = t->kind;
-    if (IS_TYPE(k)) return true;
-    if (k == T_ID && find_typedef(t->name)) return true;
-    return false;
+    switch (t->kind) {
+    case K_CONST ... K_UNION:
+        return true;
+    case T_ID:
+        // should infer typename if _id_ is followed by
+        // - another _id_
+        // - a qualifier `const`, `volatile`...
+        // - a `*`
+        // - a pointer indirection `(` `*`
+        return !!find_typedef(t->name);
+    default:
+        return false;
+    }
 }
 
 // ---- struct/union tag table ----
@@ -1668,7 +1677,7 @@ static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
 static Type *parse_type_base_only(unsigned int *flags);
-static Node *parse_decl_stmt(void);
+static Node *parse_declaration(void);
 static void add_label(Node *n);
 static Node *find_label(atom_t name);
 static Node *parse_const_expr(void);
@@ -1677,6 +1686,40 @@ static bool eval_expr(Node *n, Value *vp);
 static bool eval_const_expr(Node *n, Value *vp, const char *context);
 static void eval_static_assertion(Node *n);
 static Type *static_typeof(Node *n, Type *def);
+
+static void parse_attributes(void) {
+    // parse and consume an _attribute-specifier-sequence_
+    for (;;) {
+        if (at(T_ID) && toks[P].name == ID__ATTRIBUTE__) {
+            // scan and ignore `__attribute__` `(` _balanced-token-sequence_ `)`
+            P++; expect(T_LP);
+            for (size_t depth = 0;; P++) {
+                switch (cur()->kind) {
+                case T_EOF: break;
+                case T_LP: depth++; continue;
+                case T_RP: if (depth--) continue; else break;
+                default: continue;
+                }
+                expect(T_RP);
+                break;
+            }
+        } else
+        if (at(T_LBRK) && peek(T_LBRK)) {
+            // scan and ignore `[` `[` _attribute-list_ `]` `]`
+            for (P += 2;; P++) {
+                switch (cur()->kind) {
+                case T_EOF: break;
+                case T_RBRK: if (peek(T_RBRK)) break; fallthrough;
+                default: continue;
+                }
+                expect(T_RBRK); expect(T_RBRK);
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
 
 static bool eval_array_designator(Node *n, Value *v1, Value *v2) {
     if (!n->cond) error(n, "unexpected member designator in array initializer");
@@ -1709,6 +1752,7 @@ static unsigned initializer_length(Node *n) {
 
 static Type *parse_ptrs(Type *base, unsigned *flagsp) {
     while (eat(T_STAR)) {
+        parse_attributes();
         unsigned char qflags = 0;
         for (;;) {
             if (eat(K_CONST) && !(qflags & HAS_CONST))       { qflags |= HAS_CONST;    continue; }
@@ -1734,7 +1778,7 @@ static Type *parse_array(Type *base, unsigned char pflags) {
         if ((pflags & HAS_STATIC_LEN) || !at(T_RBRK)) len_expr = parse_const_expr();
         break;
     }
-    expect(T_RBRK);
+    expect(T_RBRK); parse_attributes();
     if (eat(T_LBRK)) base = parse_array(base, 0);
     return array_of(base, 0, len_expr, qflags, pflags);
 }
@@ -1752,6 +1796,7 @@ static void shift_members(Member *m) {
 // struct/union specifier:  (struct|union) [tag] [ { members } ]
 static Type *parse_struct(int kind) {
     srcloc_t loc = curloc(); P++;
+    parse_attributes();
     atom_t tag = at(T_ID) ? getid() : 0;
     Type *st = tag_get(tag, kind, loc);
     if (eat(T_LBRACE)) {                           // definition
@@ -1813,6 +1858,7 @@ static Type *parse_struct(int kind) {
 // enum specifier:  enum [tag] [ : impl-type] [ { members [= value], } ]
 static Type *parse_enum(void) {
     srcloc_t loc = curloc(); P++;
+    parse_attributes();
     atom_t tag = at(T_ID) ? getid() : 0;
     Type *et = NULL;
     if (eat(T_COLON)) {
@@ -1838,6 +1884,7 @@ static Type *parse_enum(void) {
             atom_t name = getid();
             Sym *s = add_sym(name, ploc, st, 0);
             s->kind = K_ENUM;
+            parse_attributes();
             if (eat(T_ASSIGN)) {
                 s->init = parse_const_expr();
                 eval_const_expr(s->init, &v, "enum value");
@@ -2221,9 +2268,14 @@ static Type *parse_type_base_only(unsigned int *pflags) {
         case K_ENUM:      if (t) goto invalid; t = parse_enum();            tflags |= HAS_TYPE; break;
         case K_STRUCT:    if (t) goto invalid; t = parse_struct(TY_STRUCT); tflags |= HAS_TYPE; break;
         case K_UNION:     if (t) goto invalid; t = parse_struct(TY_UNION);  tflags |= HAS_TYPE; break;
+        case T_LBRK:      if (peek(T_LBRK)) { parse_attributes(); continue; } fallthrough;
         default:
             if (t) return qualified_type(t, sflags & (HAS_CONST | HAS_VOLATILE));
-            if (k == T_ID && (t = find_typedef(toks[P].name))) { tflags |= HAS_TYPE; P++; break; }
+            if (k == T_ID) {
+                atom_t name = toks[P].name;
+                if (name == ID__ATTRIBUTE__) { parse_attributes(); continue; }
+                if ((t = find_typedef(name))) { tflags |= HAS_TYPE; P++; break; }
+            }
             error(NULL, "expected type, got '%s'", token_str(cur())); return 0;
         }
         switch (tflags) {
@@ -2374,6 +2426,7 @@ static Node *parse_case(NodeKind kind) {
 
 static Node *parse_stmt(void) {
     Node *n;
+    parse_attributes();
     switch (toks[P].kind) {
     case T_LBRACE: return parse_block();
     case T_SEMI:   n = new_node(N_EMPTY); P++; return n;
@@ -2398,7 +2451,8 @@ static Node *parse_stmt(void) {
     case K_FOR:
         n = new_node(N_FOR); P++; scope_push(n);
         expect(T_LP);
-        if (is_type_start(cur())) n->finit = parse_decl_stmt();      // consumes ';'
+        parse_attributes();
+        if (is_type_start(cur())) n->finit = parse_declaration();      // consumes ';'
         else {
             if (!at(T_SEMI)) { n->finit = new_node(N_EXPR); n->finit->lhs = parse_expr(); }
             expect(T_SEMI);
@@ -2440,7 +2494,7 @@ static Node *parse_stmt(void) {
         n = parse_static_assertion();
         break;
     case T_ID:
-        if (toks[P+1].kind == T_COLON) {
+        if (peek(T_COLON)) {
             n = new_node(N_LABEL);
             n->name = getid();
             if (find_label(n->name)) warning(n->loc, "duplicate label '%s'", atom_str(n->name));
@@ -2451,7 +2505,7 @@ static Node *parse_stmt(void) {
         }
         fallthrough;
     default:
-        if (is_type_start(cur())) return parse_decl_stmt();
+        if (is_type_start(cur())) return parse_declaration();
         n = new_node(N_EXPR); n->lhs = parse_expr();
         break;
     }
@@ -2675,10 +2729,11 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
     unsigned char np = 0;
     bool is_variadic = false;
     Sym **pp = &fn->params;
-    if (at(K_VOID) && toks[P+1].kind == T_RP) P++; // (void) -> ()
+    if (at(K_VOID) && peek(T_RP)) P++; // (void) -> ()
     while (!at(T_RP)) {
         if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
         if (np >= MAX_ARGS) error(NULL, "too many function arguments");
+        parse_attributes();
         unsigned int pflags;
         srcloc_t ploc = curloc();
         Type *pt = parse_ptrs(parse_type_base_only(&pflags), &pflags);
@@ -2695,6 +2750,7 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
         if (!eat(T_COMMA)) break;
     }
     expect(T_RP);
+    parse_attributes();
     if (has_prototype && (fn->nparams != np || fn->is_variadic != is_variadic)) {
         warning(curloc(), "argument count mismatch with prototype");
         warning(fn->loc, "function prototype is defined here");
@@ -2715,7 +2771,7 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
 }
 
 // a declaration inside a block: type declarator [= init] (, declarator [= init])* ;
-static Node *parse_decl_stmt(void) {
+static Node *parse_declaration(void) {
     unsigned int flags;
     srcloc_t loc = curloc();
     Type *base = parse_type_base_only(&flags);
@@ -2738,6 +2794,7 @@ static Node *parse_decl_stmt(void) {
         Type *t = parse_ptrs(base, &flags);
         srcloc_t nloc = curloc();
         atom_t name = getid();
+        parse_attributes();
         // XXX: should parse function pointers and such
         Sym *s = NULL;
         if (eat(T_LP)) {
@@ -3257,7 +3314,7 @@ static void emit_idiv_imod_imm(Register r, long val, bool save_rax, bool mod) {
     } else
     if (val > 0 && (val & (val - 1)) == 0) { // power of 2
         long adj = val - 1;
-        if ((unsigned long)adj <= INT_MAX) {
+        if ((int)adj == adj) {
             emit("lea rdx, [%s + %ld]", reg64[r], adj);
         } else {
             emit_mov_reg_imm(RDX, adj);
@@ -4267,7 +4324,7 @@ static Flow gen_switch(Node *n) {
             int lab = 0, emit_lab = 0;
             if (val != min_val) { // need to test lower bound
                 long adj = (long)-val;
-                if (adj == (int)adj) {  // branchless version
+                if (adj == (int)adj) {  // single test version
                     if (adj) {
                         emit("lea rcx, [rax %+ld]", adj);
                         emit_cmp_imm(RCX, (long)(val2 - val));

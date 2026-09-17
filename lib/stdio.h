@@ -3,9 +3,7 @@
 #ifndef NULL
 #define NULL  ((void*)0)
 #endif
-#ifndef attr_printf
-#define attr_printf(a, b)
-#endif
+#define __attr_printf(a, b)  __attribute__((format(printf, a, b)))
 #define _IOFBF   0
 #define _IOLBF   1
 #define _IONBF   2
@@ -39,9 +37,9 @@ int puts(const char *s);
 int fputs(const char *s, FILE *fp);
 size_t fwrite(const void *p, size_t size, size_t nmemb, FILE *fp);
 int fflush(FILE *fp);
-int printf(const char *fmt, ...) attr_printf(1, 2);
-int fprintf(FILE *fp, const char *fmt, ...) attr_printf(2, 3);
+int printf(const char *fmt, ...) __attr_printf(1, 2);
+int fprintf(FILE *fp, const char *fmt, ...) __attr_printf(2, 3);
 int vfprintf(FILE *fp, const char *fmt, va_list ap);
-int snprintf(char *buf, size_t size, const char *fmt, ...) attr_printf(3, 4);
+int snprintf(char *buf, size_t size, const char *fmt, ...) __attr_printf(3, 4);
 void perror(const char *s);
 #endif

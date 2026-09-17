@@ -3,7 +3,6 @@
 #ifndef NANO_LIBC_H
 #define NANO_LIBC_H
 
-#define attr_printf(a, b)
 #define fallthrough
 
 #include <sys/syscall.h>
