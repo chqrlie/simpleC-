@@ -19,7 +19,6 @@
 * optim bin/compare operations with fullwidth sym rhs -> skip RCX load_var
 * optim comparisons with const lhs -> swap and transpose
 * [20%] optimize <expr> = <const> and <expr> = <sym>
-* share code between `emit_idiv_imm` and `emit_imod_imm`
 * use common type for `N_TERNARY`
 * direct load and store
 * improve inc / dec
@@ -104,14 +103,12 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 * support _generic-selection_ (a _primary-expression_)
 * support _compound-literal_ (a _postfix-expression_)
 * parse _call-expression_ as a _postfix-expression_
-* parse other _unary-expression_:
-  - `alignof` `(` _type-name_ `)`
+* parse _alignment-specifier_:
+  - `alignas` `(` _type-name_ `)`
+  - `alignas` `(` _constant-expression_ `)`
 * support initialized `const` variables as _constant-expression_
 * support minimal `constexpr` semantics
 * use correct terms:
   - _type-qualifier_: `const`, `restrict`, `volatile`,
   - _function-specifier_: `inline`, `_Noreturn`
-  - _alignment-specifier_:
-    - `alignas` `(` _type-name_ `)`
-    - `alignas` `(` _constant-expression_ `)`
 * support `typeof` and `typeof_unqual`

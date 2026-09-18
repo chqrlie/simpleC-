@@ -402,7 +402,7 @@ typedef enum TokenKind enum_type(unsigned char) {
     T_LP, T_RP, T_LBRK, T_RBRK, T_LBRACE, T_RBRACE,
     T_SEMI, T_COMMA, T_QUESTION, T_COLON, T_DOT, T_ARROW, T_ELLIPSIS,
 
-#define IS_TYPE(k)    ((k) >= K_CONST && (k) < K_IF)
+#define IS_TYPE(k)    ((k) >= K_CONST && (k) <= K_UNION)
 #define IS_KEYWORD(k) ((k) >= K_CONST && (k) < K_IFDEF)
     K_CONST, K_VOLATILE, K_AUTO, K_STATIC, K_REGISTER, K_EXTERN,
     K_THREAD_LOCAL, K_TYPEDEF, K_INLINE, K_NORETURN,
@@ -412,6 +412,7 @@ typedef enum TokenKind enum_type(unsigned char) {
 
     K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
     K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF, K_COUNTOF, K__COUNTOF,
+    K_ALIGNOF, K__ALIGNOF,
     K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_STATIC_ASSERT,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ENDIF, K_DEFINE, K_UNDEF,
@@ -445,6 +446,7 @@ static const char * const token_name[T_count] = {
     "signed", "unsigned", "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
     "for", "do", "break", "continue", "sizeof", "countof", "_Countof",
+    "alignof", "_Alignof",
     "switch", "case", "default", "goto", "static_assert",
     "ifdef", "ifndef", "elif", "endif", "define", "undef",
     "include", "line", "__FILE__", "__LINE__", "__COUNTER__",
@@ -2105,11 +2107,11 @@ static Node *parse_static_assertion(void) {
 static Node *parse_unary(bool accept_cast) {
     Node *n;
     switch (cur()) {
-    //case K_ALIGNOF:  // alignof(type)
-    //case K_COUNTOF:
     case K_SIZEOF:
     case K_COUNTOF:
-    case K__COUNTOF: {
+    case K__COUNTOF:
+    case K_ALIGNOF:
+    case K__ALIGNOF: {
         n = new_node(N_SIZEOF);
         Type *t = NULL;
         if (at(T_LP) && is_type_start(P+1)) {
@@ -2547,7 +2549,9 @@ static bool eval_expr(Node *n, Value *vp) {
     case N_SIZEOF: {
         Type *t = n->type_arg ? n->type_arg : static_typeof(n->lhs, ty_long());
         value_init(&v1, ty_size_t(), ty_size(t));
-        if (n->op != K_SIZEOF) {
+        switch (n->op) {
+        case K_COUNTOF:
+        case K__COUNTOF:
             if (t->kind == TY_ARRAY) {
                 if (t->pflags & HAS_LEN) {
                     v1.uval = t->arr_len;
@@ -2557,6 +2561,13 @@ static bool eval_expr(Node *n, Value *vp) {
             } else {
                 error(n, "'countof' can only be applied to an array");
             }
+            break;
+        case K_ALIGNOF:
+        case K__ALIGNOF:
+            v1.uval = t->align;
+            break;
+        case K_SIZEOF: break;
+        default: break;
         }
         break;
     }
