@@ -100,6 +100,7 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 * `bool` type, `true` and `false` predefined constants
 * `nullptr_t` type and `nullptr` predefined constant
 # C grammar
+* support `offsetof`, `containerof`?
 * support _generic-selection_ (a _primary-expression_)
 * support _compound-literal_ (a _postfix-expression_)
 * parse _call-expression_ as a _postfix-expression_

@@ -479,11 +479,17 @@ static void lex_init(void) {
 // 1. PREPROCESSOR  ->  produces a single clean source buffer in SRC
 // =====================================================================
 
-// A macro is either object-like (#define PI 3) or function-like
-// (#define MAX(a,b) ((a)>(b)?(a):(b))).  For function-like macros we keep
-// the parameter names so expand_line() can substitute call arguments.
+#define MAX_MACRO_ARG  16
+
 typedef struct Macro {
-    atom_t name; srcloc_t loc; int nparams; unsigned len; atom_t params[8]; struct Macro *next; char def[8];
+    atom_t name; srcloc_t loc;
+#define M_HAS_PARAMS  1
+//#define M_VARARGS     2
+    unsigned short nparams, mflags;
+    unsigned len;
+    char *def;  // points after array of parameter names
+    struct Macro *next;
+    atom_t params[2];   // actually a flexible array
 } Macro;
 static Macro *macros;  // should use atoms symbol table
 
@@ -494,14 +500,21 @@ static Macro *macro_find(atom_t name) {
     return NULL;
 }
 static Macro *macro_define(atom_t name, srcloc_t loc, int nparams, atom_t *params,
-                           size_t len, const char *def) {
-    Macro *m = allocz(1, (size_t)(sizeof(Macro) - 8 + len + 1));
+                           size_t len, const char *def)
+{
+    size_t size = sizeof(Macro) - 2 * sizeof(atom_t);
+    if (nparams >= 0) { size += (size_t)nparams * sizeof(atom_t); }
+    Macro *m = allocz(1, size + len + 1);
     atom_flags(name) |= ATOM_MACRO;
     m->name = name;
     m->loc = loc;
     m->len = (unsigned)len;
-    m->nparams = nparams;
-    if (nparams > 0) memcpy(m->params, params, (unsigned)nparams * sizeof(atom_t));
+    m->def = (char*)m + size;
+    if (nparams >= 0) {
+        m->mflags |= M_HAS_PARAMS;
+        m->nparams = (unsigned short)nparams;
+        memcpy(m->params, params, (size_t)nparams * sizeof(*params));
+    }
     memcpy(m->def, def, len);
     m->def[len] = '\0';
     m->next = macros;
@@ -518,6 +531,12 @@ static void macro_undef(atom_t name) {
     }
 }
 
+static bool macro_is_same(Macro *m, int nparams, atom_t *params, size_t len, const char *def) {
+    if ((size_t)m->len != len || memcmp(m->def, def, len)) return false;
+    if (!(m->mflags & M_HAS_PARAMS)) return nparams < 0;
+    return (m->nparams == nparams && !memcmp(m->params, params, (size_t)nparams * sizeof(*params)));
+}
+
 static void def_macro(const char *name) {
     macro_define(new_atom(name), 0, -1, NULL, 1, "1");
 }
@@ -532,8 +551,8 @@ static void create_builtin_macros(void) {
 }
 
 typedef struct MacroArguments {
-    const char *argv[8];
-    size_t len[8];
+    const char *argv[MAX_MACRO_ARG];
+    size_t len[MAX_MACRO_ARG];
     int argc;
 } MacroArguments;
 
@@ -556,7 +575,7 @@ static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, ch
         else if (isdigit(vc)) { p += skip_pp_number(p); continue; }
         else if (isalpha((unsigned char)vc) || vc == '_') {
             k = skip_word(p);
-            if (!m || m->nparams <= 0 || !find_macro_param(m, new_atom_len(p, k), &pi)) { p += k; continue; }
+            if (!m || !m->nparams || !find_macro_param(m, new_atom_len(p, k), &pi)) { p += k; continue; }
             size_t i0 = (size_t)(p - q), i = i0; i -= trailing_blanks(q, i);
             if (i && q[i - 1] == '#') {
                 i--;
@@ -628,7 +647,7 @@ static void expand_line(const char *in, bool preproc, sbuf_t *sb, char *dest, si
                 const char *b = skip_blanks(p + k);
                 Macro *m = macro_find(name);
                 const char *def = m ? m->def : "";
-                if (!m || (m->nparams >= 0 && *b != '(')) {
+                if (!m || ((m->mflags & M_HAS_PARAMS) && *b != '(')) {
                     switch (name) {
                     case ID__FILE__: *buf = '"'; len = 1;
                                      len += pstrcpy(buf + 1, countof(buf) - 3, get_filename(src_loc));
@@ -642,7 +661,7 @@ static void expand_line(const char *in, bool preproc, sbuf_t *sb, char *dest, si
                 j += pmemcpy(out + j, LINE_LEN - j, q, (size_t)(p - q));
                 q = p += k;
                 MacroArguments ma; ma.argc = 0;
-                if (m && m->nparams >= 0) {
+                if (m && (m->mflags & M_HAS_PARAMS)) {
                     // XXX: This does not work if macro arguments span multiple lines
                     const char *e = q = p = skip_blanks(b + 1); // past blanks and '('
                     if (*p == ')') q = ++p;
@@ -892,7 +911,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                 if (skip) break;
                 srcloc_t loc = src_loc;
                 atom_t nm = parse_macro_name(dir, &p);
-                int nparams = -1; atom_t params[8]; for (size_t k = 0; k < 8; k++) params[k] = 0;
+                int nparams = -1; atom_t params[MAX_MACRO_ARG];
                 // function-like macro: '(' immediately after name (no space)
                 if (*p == '(') {
                     nparams = 0;
@@ -901,7 +920,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                         for (;;) {
                             size_t k = skip_word(p);
                             if (!k) die("expected parameter name for macro '%s'", atom_str(nm));
-                            if (nparams >= 8) die("too many macro parameters for '%s'", atom_str(nm));
+                            if (nparams >= MAX_MACRO_ARG) die("too many macro parameters for '%s'", atom_str(nm));
                             params[nparams++] = new_atom_len(p, k);
                             p = skip_blanks(p + k);
                             if (*p == ')') break;
@@ -917,8 +936,7 @@ static void process_text(const char *text, sbuf_t *sb) {
                 size_t len = (size_t)(p - def); len -= trailing_blanks(def, len); // trim trailing whitespace
                 Macro *m = macro_find(nm);
                 if (m) {  // if macro already exists, check if definition is identical
-                    if (m->nparams == nparams && !memcmp(m->params, params, sizeof(params))
-                    &&  (size_t)m->len == len && !memcmp(m->def, def, len)) break;
+                    if (macro_is_same(m, nparams, params, len, def)) break;
                     warning(loc, "macro '%s' redefinition is different", atom_str(nm));
                     macro_undef(nm);
                 }
@@ -1520,16 +1538,21 @@ static Type *array_of(Type *base, size_t len, Node *len_expr, unsigned char qfla
 
 // ---- symbols ----
 struct Sym {
-    // XXX: should store scope_depth to detect invalid redefinitions
-    TokenKind kind;
+    TokenKind kind; // 0 (global), K_AUTO, K_STATIC (static local),
+                    // K_REGISTER, K_TYPEDEF, K_ENUM
 //#define CONST_VAL     2  // symbol has constant value (enum value)
+//#define S_IS_TAG  4
     unsigned char flags;
     unsigned char sflags;  // QualifierFlags (some missing)
-    unsigned char is_tag;  // should use flag in `flags`
-    unsigned char scope_depth, is_reg, reg;
-    srcloc_t loc;
-    union { long ival; unsigned long uval; };
-    atom_t name; unsigned int offset; Type *type;
+    unsigned char scope_depth;
+    atom_t name; srcloc_t loc;
+    union {
+        unsigned long reg;    // K_REGISTER
+        unsigned int offset;  // K_AUTO
+        unsigned int num;     // K_STATIC
+        long ival;            // K_ENUM
+    };
+    Type *type;
     Node *init;
     Func *fn;        // XXX: share with init?
     Sym *next_decl;  // next sym in the N_DECL node
@@ -1544,6 +1567,7 @@ static Sym **scope_list;
 static size_t scope_cap;
 static unsigned scope_len;
 static unsigned char scope_depth;
+static unsigned int static_num;
 
 static Sym *sym_link(Sym *s, unsigned int sflags) {
     atom_t name = s->name;
@@ -1588,7 +1612,7 @@ static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) 
         // Do not test HAS_AUTO because `auto` now means infer type and can be applied to any storage class
         switch (sflags & (HAS_FUNCTION | HAS_EXTERN | HAS_TYPEDEF | HAS_STATIC)) {
         case 0:           s->kind = K_AUTO; set_local_offset(s); break; // should delay this until analysis to allocate registers
-        case HAS_STATIC:  s->kind = K_STATIC; break;
+        case HAS_STATIC:  s->kind = K_STATIC; s->num = static_num++; break;
         default:          break;
         }
         if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
@@ -1608,7 +1632,7 @@ static Node *scope_pop(Node *n) {
     while (scope_len > n->scope_len) {
         Sym *s = scope_list[--scope_len];
         sym_unlink(s);
-        frame_pos = s->offset;
+        if (s->kind == K_AUTO) frame_pos = s->offset;
     }
     if (!scope_depth--) error(n, "scope depth error");
     return n;
@@ -2124,7 +2148,7 @@ static Node *parse_primary(void) {
         }
         if (s && (s->flags & CONST_VAL)) {
             n->flags |= CONST_VAL;
-            n->uval |= s->uval;
+            n->ival |= s->ival;
             n->type = s->type;
         }
         return n;
@@ -2596,7 +2620,7 @@ static Sym *resolve_name(Node *n) {
     if (!s) {
         n->decl = s = lookup(n->name, n);
         n->flags |= s->flags & CONST_VAL;
-        n->uval |= s->uval;
+        n->ival |= s->ival;
         n->type = s->type;
     }
     return s;
@@ -3271,8 +3295,8 @@ static const char *make_address(char *dest, size_t size, Sym *s, unsigned offset
                      else        snprintf(dest, size, "[rip + %s]", atom_str(s->name));
                      return dest;
     case K_AUTO:                 snprintf(dest, size, "[rbp - %u]", s->offset - offset); return dest;
-    case K_STATIC:   if (offset) snprintf(dest, size, "[rip + %s_%u + %u]", atom_str(s->name), s->loc, offset);
-                     else        snprintf(dest, size, "[rip + %s_%u]", atom_str(s->name), s->loc);
+    case K_STATIC:   if (offset) snprintf(dest, size, "[rip + %s_%u + %u]", atom_str(s->name), s->num, offset);
+                     else        snprintf(dest, size, "[rip + %s_%u]", atom_str(s->name), s->num);
                      return dest;
     case K_REGISTER: return reg64[s->reg];
     case K_TYPEDEF:
@@ -4656,7 +4680,6 @@ static void gen_func(Func *fn) {
         for (Sym *s = fn->params; s && i < 6; s = s->next_decl, i++) {
             s->kind = K_REGISTER;
             s->reg = ARGREG1[i];
-            s->offset = 0;
         }
         if (i == fn->nparams && fn->frame_size == i * 8) {
             fn->flags &= ~HAS_FRAME;
