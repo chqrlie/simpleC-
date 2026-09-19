@@ -1545,24 +1545,27 @@ static size_t scope_cap;
 static unsigned scope_len;
 static unsigned char scope_depth;
 
-static Sym *sym_link(atom_t name, Sym *s) {
+static Sym *sym_link(Sym *s, unsigned int sflags) {
+    atom_t name = s->name;
     Sym *prev = atom_sym(name);
-    Sym *shadow = prev;
     // XXX: this test should be moved to the callers, should merge tags first
-    while (shadow) {
-        if (shadow->scope_depth == scope_depth) {
-            if ((shadow->sflags & HAS_EXTERN) || shadow->fn) {
-                // XXX: should check consistency with forward declaration
-                shadow = shadow->next_sym;
-                continue;
+    if (!(sflags & HAS_EXTERN)) {
+        Sym *shadow = prev;
+        while (shadow) {
+            if (shadow->scope_depth == scope_depth) {
+                if ((shadow->sflags & HAS_EXTERN) || shadow->fn) {
+                    // XXX: should check consistency with forward declaration
+                    shadow = shadow->next_sym;
+                    continue;
+                }
+                warning(s->loc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
+            } else {
+                if (get_fileflags(s->loc)) break;
+                warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
             }
-            warning(s->loc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
-        } else {
-            if (get_fileflags(s->loc)) break;
-            warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
+            note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
+            break;
         }
-        note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
-        break;
     }
     s->next_sym = prev;
     return atom_sym(name) = s;
@@ -1589,10 +1592,10 @@ static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) 
         default:          break;
         }
         if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
-        return scope_list[scope_len++] = sym_link(name, s);
+        return scope_list[scope_len++] = sym_link(s, sflags);
     } else {
         if (globals) globals_tail->next_decl = s; else globals = s;
-        return globals_tail = sym_link(name, s);
+        return globals_tail = sym_link(s, sflags);
     }
 }
 
@@ -5030,6 +5033,7 @@ static _Noreturn void usage(bool full) {
                 "  -time          show timings\n"
                 "  -E             output preprocessed test\n"
                 "  -ET            output preprocessed tokens\n"
+                "  -fsyntax-only  run preprocessor, parser and analyser, no output\n"
                 "  -I DIR         add DIR to the end of the include path\n"
                 "  --notabs       indent with spaces in output files"
                 "  -O             perform optimizations\n"
@@ -5121,7 +5125,8 @@ int main(int argc, char **argv) {
     int preprocess_mode = 0, timings = 0, rc = 0;
     bool kernel_mode = false, libc_mode = false, mem_stats = false;
     const char *inpath = NULL, *outpath = NULL;
-    unsigned long t0 = now();
+    unsigned long times[5], *tp = times;
+    *tp = now();
     strcpy(include_path, "lib/");   // should find nano_cc directory
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
@@ -5130,6 +5135,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "--libc")) libc_mode = true;
         else if (!strcmp(arg, "-E")) preprocess_mode = 1;
         else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
+        else if (!strcmp(arg, "-fsyntax-only")) preprocess_mode = 3;
         else if (!strcmp(arg, "-g")) { debug = out_comments = true; }
         else if (strstart(arg, "-I", NULL)) add_path(include_path, countof(include_path), arg[2] ? arg + 2 : argv[i++]);
         else if (!strcmp(arg, "-memory")) mem_stats = true;
@@ -5150,6 +5156,7 @@ int main(int argc, char **argv) {
 
     sbuf_t src[1]; sbuf_init(src, 128 * 1024);
     preprocess(inpath, false, src);
+    *++tp = now();
     // XXX: should include relevant library source files
     if (!kernel_mode && !libc_mode) process_include("nano-libc.h", true, src);
     if (preprocess_mode == 1) {
@@ -5159,8 +5166,8 @@ int main(int argc, char **argv) {
     }
     lex(sbuf_getptr(src));
     sbuf_deinit(src);
-
-    if (preprocess_mode) {
+    *++tp = now();
+    if (preprocess_mode == 2) {
         open_output(outpath, stdout);
         rc = output_tokens(fout, toks, ntok);
         goto done;
@@ -5170,15 +5177,27 @@ int main(int argc, char **argv) {
     while (!at(T_EOF)) parse_toplevel();
     check_used_func(ID_MAIN);
     if (!kernel_mode) check_used_func(ID__EXIT);
+    *++tp = now();
+    if (preprocess_mode == 3) goto done;
 
     if (!outpath) outpath = make_output_file(inpath, ".c", ".s");
     open_output(outpath, NULL);
     rc = emit_x86_intel(kernel_mode, libc_mode);
     if (fout != stdout) fclose(fout);
     // should invoke assembler / linker
+    *++tp = now();
     if (!rc && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
 done:
-    if (timings) { t0 = now() - t0; fprintf(stderr, "total time: %lu.%03lu ms\n", t0 / 1000, t0 % 1000); }
+    if (timings) {
+        fprintf(stderr, "total time: ");
+        const char *sep = "";
+        for (unsigned long *tt = times; tt < tp; tt++, sep = "+ ") {
+            unsigned long t = tt[1] - *tt;
+            fprintf(stderr, "%s%lu.%03lu ", sep, t / 1000, t % 1000);
+        }
+        unsigned long t = *tp - *times;
+        fprintf(stderr, "= %lu.%03lu ms\n", t / 1000, t % 1000);
+    }
     if (mem_stats) malloc_stats();
 #ifdef ATOM_STATS
     if (verbose) atom_stats();
