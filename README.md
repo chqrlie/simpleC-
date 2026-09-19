@@ -9,13 +9,11 @@ make -C kernel          # compile the kernel
 
 - **Preprocessor:**
   - no recursive macros
-  - no token pasting or stringization
   - only 8 macro arguments supported
   - no varargs macros
   - macro invocations cannot span multiple unescaped lines
 - **Types:**
   - no function pointers
-  - no designated initializers
   - no compound literals
   - no bit-fields
   - 2D arrays are defective
@@ -58,9 +56,10 @@ make -C kernel          # compile the kernel
 - keep it small, fast, performant and friendly, which requires it to produce efficient code :)
 - _small_ means less than 5K lines and less than 128KB binary
 - _fast_ means compile itself in less than 10ms on a laptop
-- _performant_ means the executables produced should be at most 50% slower than if compiled with `gcc -O2` or `clang -O2`
+- _performant_ means the executables produced should run at most 50% slower than if compiled with `gcc -O2` or `clang -O2`
 - _friendly_ means produce meaningful diagnostics and prevent stupid mistakes
-- incorporate a number of extensions to simplify the language and make it safer
+- incorporate a number of extensions to simplify the language and make it safer and more _enjoyable_: increase the C language expressivity and reduce programmers' headaches with powerful analysis.
+
 - at the user option, produce:
   - preprocessor output
   - assembly source code

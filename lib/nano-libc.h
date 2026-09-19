@@ -8,12 +8,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+thread_local int errno;
+
 _Noreturn void _exit(int code) {
 #ifdef LIB_STDIO_H
     fflush(NULL);
 #endif
     __syscall(SYS_exit, code);
-    while(1);
 }
 
 #ifdef LIB_STDIO_H
@@ -475,7 +476,6 @@ int isatty(int fd) {
 
 #ifdef LIB_ERRNO_H
 // sys_err.c
-thread_local int errno;
 const int sys_nerr = 35;
 const char * const sys_errlist[] = {
     "Success",
