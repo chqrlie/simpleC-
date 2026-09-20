@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 thread_local int errno;
+char **environ;
 
 _Noreturn void _exit(int code) {
 #ifdef LIB_STDIO_H
@@ -255,13 +256,14 @@ int puts(const char *s) {
     return len + 1;
 }
 
-#include "nano-printf.h"
+#include <nano-printf.h>
 
 #endif
 
 #ifdef LIB_STDLIB_H
 
 #include <ctype.h>
+#include <string.h>
 
 // stdlib.h
 static int _xdigit(int d) {
@@ -294,7 +296,20 @@ int atoi(const char *s) { return (int)strtol(s, 0, 0); }
 
 _Noreturn void exit(int code) { _exit(code); }
 
-#include "nano-malloc.h"
+/* 7.22.4.6 The getenv function */
+char *getenv(const char *name) {
+    char **p, *e;
+    size_t len = strlen(name);
+    if ((p = environ) != NULL) {
+        while ((e = *p++) != NULL) {
+            if (!strncmp(e, name, len) && e[len] == '=')
+                return e + len + 1;
+        }
+    }
+    return NULL;
+}
+
+#include <nano-malloc.h>
 #endif
 
 #ifdef LIB_STRING_H
@@ -391,6 +406,15 @@ int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
+int strncmp(const char *a, const char *b, size_t n) {
+    /* 7.24.4.4 The strncmp function */
+    while (n-- > 0) {
+        if (*a != *b) return (unsigned char)*a - (unsigned char)*b;
+        if (*a == '\0') break;
+        a++; b++;
+    }
+    return 0;
+}
 #endif
 
 #ifdef LIB_TIME_H
@@ -457,6 +481,12 @@ int ioctl(int fd, int cmd, ...) {
     return __syscall(SYS_ioctl, fd, cmd, arg1, arg2, arg3 /*, arg4*/);
 }
 
+pid_t fork(void) { return __syscall(SYS_fork); }
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    return __syscall(SYS_execve, path, argv, envp);
+}
+
 struct winsize {
     unsigned short ws_row;     // rows, in characters
     unsigned short ws_col;     // columns, in characters
@@ -471,6 +501,21 @@ int isatty(int fd) {
     if (r == 0) return 1;
     if (errno != EBADF) errno = ENOTTY;
     return 0;
+}
+#endif
+
+#ifdef LIB_SYS_WAIT_H
+pid_t wait(int *wstatus) {
+    return __syscall(SYS_wait4, -1, wstatus, 0, NULL);
+}
+pid_t wait3(int *wstatus, int options, struct rusage *rusage) {
+    return __syscall(SYS_wait4, -1, wstatus, options, rusage);
+}
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage) {
+    return __syscall(SYS_wait4, pid, wstatus, options, rusage);
+}
+pid_t waitpid(pid_t pid, int *wstatus, int options) {
+    return __syscall(SYS_wait4, pid, wstatus, options, NULL);
 }
 #endif
 

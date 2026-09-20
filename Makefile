@@ -72,12 +72,12 @@ endif
 # Full end-to-end demo: nano_cc compiles the C source, GNU as assembles it,
 # the linker produces a freestanding binary, and we run it.
 $(TMP)/%_prog: examples/%.c $(BIN) build Makefile
-	$(BIN) $(FLAGS) $< $@.s
+	$(BIN) $(FLAGS) -S $< -o $@.s
 	$(AS) $(NOPIE) -nostdlib -static $@.s -o $@
 	$(RUN) ./$@
 
 %: test/%.c $(BIN) Makefile
-	$(BIN) $(FLAGS) $< -o $(TMP)/$@.s
+	$(BIN) $(FLAGS) -S $< -o $(TMP)/$@.s
 	$(AS) $(NOPIE) -nostdlib -static $(TMP)/$@.s -o $(TMP)/$@
 	$(RUN) $(TMP)/$@
 
@@ -89,14 +89,14 @@ printf: $(TMP)/printf_prog
 switch: $(TMP)/switch_prog
 
 nano: $(BIN) build Makefile
-	$(BIN) $(FLAGS) $(SRC) -time -memory -o $(TMP)/nano.s
-	$(BIN) $(FLAGS) $(SRC) -time -g -o $(TMP)/nano_g.s
+	$(BIN) $(FLAGS) -S -time -memory -o $(TMP)/nano.s $(SRC)
+	$(BIN) $(FLAGS) -S -time -g -o $(TMP)/nano_g.s $(SRC)
 	$(AS) $(NOPIE) -nostdlib -static $(TMP)/nano.s   -o $(TMP)/nano_prog
 	$(AS) $(NOPIE) -nostdlib -static $(TMP)/nano_g.s -o $(TMP)/nano_prog_g -g
 	$(STRIP) $(BIN) $(TMP)/nano_prog
 	$(SIZE) $(BIN) $(wildcard $(TMP)/nano_prog)
-	$(RUN) $(TMP)/nano_prog $(FLAGS) $(SRC) -time -memory -o $(TMP)/nano2.s
-	$(RUN) $(TMP)/nano_prog $(FLAGS) $(SRC) -time -g -o $(TMP)/nano2_g.s
+	$(RUN) $(TMP)/nano_prog $(FLAGS) -S $(SRC) -time -memory -o $(TMP)/nano2.s
+	$(RUN) $(TMP)/nano_prog $(FLAGS) -S $(SRC) -time -g -o $(TMP)/nano2_g.s
 	$(RUN) diff $(TMP)/nano.s $(TMP)/nano2.s | head -50
 	$(RUN) diff $(TMP)/nano_g.s $(TMP)/nano2_g.s | head -50
 	@if [ '!' -f STATS.csv ] ; then echo "Source lines,Source bytes,Library lines,Library bytes,nano.s lines,nano.s bytes,nano_cc bytes,nano_prog bytes" > STATS.csv ; fi
@@ -115,7 +115,7 @@ test-printf: build Makefile
 
 # test nano-printf compiled by nano as part of its C library
 nano-printf: $(BIN) build Makefile
-	$(BIN) $(FLAGS) test/printf-test.c -o $(TMP)/printf-test_prog_g.s -g
+	$(BIN) $(FLAGS) -S test/printf-test.c -o $(TMP)/printf-test_prog_g.s -g
 	$(AS) $(NOPIE) -nostdlib -static $(TMP)/printf-test_prog_g.s -o $(TMP)/printf-test_prog_g
 	$(RUN) $(TMP)/printf-test_prog_g
 

@@ -27,6 +27,8 @@ typedef unsigned char bool;
 
 #define NULL  ((void*)0)
 
+char **environ;
+
 // errno.h
 thread_local int errno;
 enum {  // Linux error codes

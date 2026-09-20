@@ -19,7 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   // fork, execve
 #include <sys/time.h> // gettimeofday
+#include <sys/wait.h> // waitpid
 
 #if defined(__GNUC__) || defined(__TINYC__)
 #ifdef __APPLE__
@@ -84,7 +86,7 @@ static char include_path[1024];
 static srcloc_t src_loc;
 static unsigned char optimize;
 static unsigned char func_align = 1;
-static bool debug, verbose;
+static bool debug, verbose, no_pie, static_option;
 
 #define LOC_SHIFT  26
 #define MAKE_LOC(fn, lineno)  (((fn) << LOC_SHIFT) + (unsigned)lineno)
@@ -182,8 +184,10 @@ static size_t pmemcpy(char *dest, size_t size, const char *src, size_t n) {
     return n;
 }
 static bool strstart(const char *s, const char *p, size_t *pk) {
-    for (size_t k = 0; s[k] == p[k]; k++) if (!p[k]) { if (pk) *pk = k; return true; }
-    return false;
+    for (size_t k = 0;; k++) {
+        if (!p[k]) { if (pk) *pk = k; return true; }
+        if (s[k] != p[k]) return false;
+    }
 }
 static bool strend(const char *s, const char *p, size_t *pk) {
     size_t k = strlen(s), kp = strlen(p);
@@ -491,7 +495,7 @@ typedef struct Macro {
     struct Macro *next;
     atom_t params[2];   // actually a flexible array
 } Macro;
-static Macro *macros;  // should use atoms symbol table
+static Macro *macros, **macros_tailp;  // should use atoms symbol table
 
 static Macro *macro_find(atom_t name) {
     for (Macro *m = macros; m; m = m->next) {
@@ -517,17 +521,19 @@ static Macro *macro_define(atom_t name, srcloc_t loc, int nparams, atom_t *param
     }
     memcpy(m->def, def, len);
     m->def[len] = '\0';
-    m->next = macros;
-    return macros = m;
+    if (!macros_tailp) macros_tailp = &macros;
+    *macros_tailp = m; macros_tailp = &m->next;
+    return m;
 }
 static void macro_undef(atom_t name) {
     if (atom_flags(name) & ATOM_MACRO) {
+        atom_flags(name) &= ~ATOM_MACRO;
         Macro *m, **tailp = &macros;
         while ((m = *tailp) != NULL) {
-            if (m->name == name) { *tailp = m->next; free(m); break; }
-            tailp = &m->next;
+            if (m->name == name) { *tailp = m->next; free(m); if (*tailp) return; }
+            else tailp = &m->next;
         }
-        atom_flags(name) &= ~ATOM_MACRO;
+        macros_tailp = tailp;
     }
 }
 
@@ -548,6 +554,25 @@ static void create_builtin_macros(void) {
     def_macro("__amd64__");
     def_macro("__x86_64");
     def_macro("__x86_64__");
+}
+
+static void macro_listing(FILE *fp) {
+    for (Macro *m = macros; m; m = m->next) {
+        fprintf(fp, "#define %s", atom_str(m->name));
+        if (m->mflags & M_HAS_PARAMS) {
+            fputc('(', fp);
+            for (size_t i = 0; i < m->nparams; i++) {
+                if (i) fputc(',', fp);
+                fputs(atom_str(m->params[i]), fp);
+            }
+            fputc(')', fp);
+        }
+        if (m->len) {
+            fputc(' ', fp);
+            fputs(m->def, fp);
+        }
+        fputc('\n', fp);
+    }
 }
 
 typedef struct MacroArguments {
@@ -795,6 +820,7 @@ static const char *find_file(char *buf, size_t size, const char *name, const cha
         size_t k = skip_until(path, ':');
         if (k) {
             size_t pos = pmemcpy(buf, size, path, k);
+            if (buf[pos - 1] != '/' && pos < size) buf[pos++] = '/';
             pos += pstrcpy(buf + pos, size - pos, name);
             if (pos < size && can_read(buf)) return buf;
         }
@@ -1042,7 +1068,7 @@ typedef struct Token {
     };
 } Token;
 
-#define DEF_TOK_CAP 50000
+#define DEF_TOK_CAP 55000
 static Token *P;            // token cursor
 static Token *toks;
 static size_t toks_cap;
@@ -1228,6 +1254,124 @@ static size_t lex(const char *p) {
         warning(t->loc, "unknown character '%c' in source", c);
 #undef set_tok
     }
+}
+
+// =====================================================================
+// 2.1 Token output
+// =====================================================================
+
+// Pretty print the token list
+static bool separate_tokens(Token *t) {
+    // XXX need a fix for pointers in declarations
+    int t1 = t[-1].kind, t2 = t->kind, t3;
+    switch (t1) {
+    case T_LP:  case T_LBRK:   case T_DOT: case T_ARROW:
+    case T_NOT: case T_BITNOT: case T_ELLIPSIS:
+        return false;
+    case K_IF:  case K_WHILE: case K_FOR: case K_SWITCH:
+    case T_COMMA:
+        return true;
+    case T_SEMI:
+        return t2 != T_SEMI && t2 != T_RP;
+    case T_PLUS: case T_MINUS: case T_STAR: case T_AMP:
+    case T_INC:  case T_DEC:
+        t3 = t[-2].kind;
+        if (t3 >= T_PLUS && t3 <= K_GOTO && t3 != T_RBRK) return false;
+        break;
+    case T_RP:
+        t3 = t[-2].kind;
+        if (IS_TYPE(t3) || t3 == T_STAR) return false;
+        break;
+    }
+    switch (t2) {
+    case T_RP:   case T_LBRK:  case T_RBRK:
+    case T_SEMI: case T_COMMA: case T_DOT:  case T_ARROW:
+        return false;
+    case T_INC:  case T_DEC:
+        return t1 >= T_PLUS && t1 <= T_SHREQ;
+//    case T_NUM:  case T_STR:   case T_ID:   case K_SIZEOF:
+//        return (t1 != T_RP);
+    case T_LP:
+        return (t1 != T_RP && t1 != T_ID && t1 != K_SIZEOF);
+    }
+    return true;
+}
+
+static int output_token(FILE *fp, Token *t) {
+    char buf[8192], c;
+    const char *s = buf;
+    switch (t->kind) {
+    case T_NUM: {
+            char *p = buf + 68; *--p = '\0';
+            unsigned long val = t->uval;
+            unsigned char base = t->base;
+            if (t->is_unsigned) *--p = 'U';
+            if (t->is_long) *--p = 'L';
+            do { *--p = "0123456789abcdef"[val % base]; } while (val /= base);
+            switch (base) {
+            case 8:   if (*p != '0') *--p = '0'; break;
+            case 2:   *--p = 'b';    *--p = '0'; break;
+            case 16:  *--p = 'x';    *--p = '0'; break;
+            }
+            s = p; break;
+        }
+    case T_CHAR:  c = (char)t->ival; encode_string(buf, countof(buf), &c, 1, '\''); break;
+    case T_STR:   encode_string(buf, countof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
+    case T_ID:    s = atom_str(t->name); break;
+    default:      s = atom_str((atom_t)t->kind); break;
+    }
+    fputs(s, fp); return (int)strlen(s);
+}
+
+static int output_tokens(FILE *fp, Token *t, size_t n) {
+    int indent = 0, indent_col = 0, col = 0;
+    int paren_level = 0;
+    srcloc_t last_loc = 0;
+    bool has_label = false, bol = true;
+    for (size_t i = 0; i < n; i++, t++) {
+        srcloc_t loc = t->loc;
+        if (loc) {
+            if (get_filenum(last_loc) != get_filenum(loc) || loc < last_loc || loc - last_loc > 5) {
+                if (last_loc) putc('\n', fp);
+                fprintf(fp, "# %d \"%s\"\n", get_lineno(loc), get_filename(loc));
+                last_loc = loc; bol = true;
+            } else {
+                while (last_loc < loc) { putc('\n', fp); last_loc++; bol = true; }
+            }
+        }
+        int kind = t->kind;
+        if (kind == T_EOF) break;
+        if (bol) {
+            bol = false;
+            has_label = false;
+            if (kind == T_RBRACE) {
+                col = indent - 4;
+            } else
+            if ((kind == T_ID && t[1].kind == T_COLON)
+            ||  kind == K_CASE || kind == K_DEFAULT) {
+                col = indent - 2;
+            } else
+            if (paren_level && kind != T_ANDAND && kind != T_OROR) {
+                col = indent_col;
+            } else {
+                col = indent;
+            }
+            int j = 0;
+            while (j++ < col) putc(' ', fp);
+            col = j;
+        } else {
+            bool use_space = separate_tokens(t);
+            if (kind == T_COLON && has_label) has_label = use_space = false;
+            if (use_space) { putc(' ', fp); col++; }
+        }
+        if (kind == K_CASE || kind == K_DEFAULT) has_label = true;
+        if (kind == T_LBRACE) indent += 4;
+        if (kind == T_RBRACE && indent) indent -= 4;
+        if (kind == T_LP || kind == T_LBRK) { if (!paren_level++) indent_col = col; }
+        if (kind == T_RP || kind == T_RBRK) { if (!--paren_level) indent_col = 0; }
+        col += output_token(fp, t);
+    }
+    return 0;
 }
 
 // =====================================================================
@@ -4927,158 +5071,6 @@ zero:
     gen_init_zero(s, offset, sz);
 }
 
-// Pretty print the token list
-static bool separate_tokens(Token *t) {
-    // XXX need a fix for pointers in declarations
-    int t1 = t[-1].kind, t2 = t->kind, t3;
-    switch (t1) {
-    case T_LP:  case T_LBRK:   case T_DOT: case T_ARROW:
-    case T_NOT: case T_BITNOT: case T_ELLIPSIS:
-        return false;
-    case K_IF:  case K_WHILE: case K_FOR: case K_SWITCH:
-    case T_COMMA:
-        return true;
-    case T_SEMI:
-        return t2 != T_SEMI && t2 != T_RP;
-    case T_PLUS: case T_MINUS: case T_STAR: case T_AMP:
-    case T_INC:  case T_DEC:
-        t3 = t[-2].kind;
-        if (t3 >= T_PLUS && t3 <= K_GOTO && t3 != T_RBRK) return false;
-        break;
-    case T_RP:
-        t3 = t[-2].kind;
-        if (IS_TYPE(t3) || t3 == T_STAR) return false;
-        break;
-    }
-    switch (t2) {
-    case T_RP:   case T_LBRK:  case T_RBRK:
-    case T_SEMI: case T_COMMA: case T_DOT:  case T_ARROW:
-        return false;
-    case T_INC:  case T_DEC:
-        return t1 >= T_PLUS && t1 <= T_SHREQ;
-//    case T_NUM:  case T_STR:   case T_ID:   case K_SIZEOF:
-//        return (t1 != T_RP);
-    case T_LP:
-        return (t1 != T_RP && t1 != T_ID && t1 != K_SIZEOF);
-    }
-    return true;
-}
-
-static int output_token(FILE *fp, Token *t) {
-    char buf[8192], c;
-    const char *s = buf;
-    switch (t->kind) {
-    case T_NUM: {
-            char *p = buf + 68; *--p = '\0';
-            unsigned long val = t->uval;
-            unsigned char base = t->base;
-            if (t->is_unsigned) *--p = 'U';
-            if (t->is_long) *--p = 'L';
-            do { *--p = "0123456789abcdef"[val % base]; } while (val /= base);
-            switch (base) {
-            case 8:   if (*p != '0') *--p = '0'; break;
-            case 2:   *--p = 'b';    *--p = '0'; break;
-            case 16:  *--p = 'x';    *--p = '0'; break;
-            }
-            s = p; break;
-        }
-    case T_CHAR:  c = (char)t->ival; encode_string(buf, countof(buf), &c, 1, '\''); break;
-    case T_STR:   encode_string(buf, countof(buf), atom_str(t->str), atom_len(t->str), '"'); break;
-    case T_ID:    s = atom_str(t->name); break;
-    default:      s = atom_str((atom_t)t->kind); break;
-    }
-    fputs(s, fp); return (int)strlen(s);
-}
-
-static int output_tokens(FILE *fp, Token *t, size_t n) {
-    int indent = 0, indent_col = 0, col = 0;
-    int paren_level = 0;
-    srcloc_t last_loc = 0;
-    bool has_label = false, bol = true;
-    for (size_t i = 0; i < n; i++, t++) {
-        srcloc_t loc = t->loc;
-        if (loc) {
-            if (get_filenum(last_loc) != get_filenum(loc) || loc < last_loc || loc - last_loc > 5) {
-                if (last_loc) putc('\n', fp);
-                fprintf(fp, "# %d \"%s\"\n", get_lineno(loc), get_filename(loc));
-                last_loc = loc; bol = true;
-            } else {
-                while (last_loc < loc) { putc('\n', fp); last_loc++; bol = true; }
-            }
-        }
-        int kind = t->kind;
-        if (kind == T_EOF) break;
-        if (bol) {
-            bol = false;
-            has_label = false;
-            if (kind == T_RBRACE) {
-                col = indent - 4;
-            } else
-            if ((kind == T_ID && t[1].kind == T_COLON)
-            ||  kind == K_CASE || kind == K_DEFAULT) {
-                col = indent - 2;
-            } else
-            if (paren_level && kind != T_ANDAND && kind != T_OROR) {
-                col = indent_col;
-            } else {
-                col = indent;
-            }
-            int j = 0;
-            while (j++ < col) putc(' ', fp);
-            col = j;
-        } else {
-            bool use_space = separate_tokens(t);
-            if (kind == T_COLON && has_label) has_label = use_space = false;
-            if (use_space) { putc(' ', fp); col++; }
-        }
-        if (kind == K_CASE || kind == K_DEFAULT) has_label = true;
-        if (kind == T_LBRACE) indent += 4;
-        if (kind == T_RBRACE && indent) indent -= 4;
-        if (kind == T_LP || kind == T_LBRK) { if (!paren_level++) indent_col = col; }
-        if (kind == T_RP || kind == T_RBRK) { if (!--paren_level) indent_col = 0; }
-        col += output_token(fp, t);
-    }
-    return 0;
-}
-
-// =====================================================================
-// 8. MAIN
-// =====================================================================
-
-static _Noreturn void usage(bool full) {
-    fprintf(stderr, "Usage: %s [OPTIONS] <input.c> [<output.s]\n", progname);
-    if (full) {
-        fprintf(stderr,
-                "  --kernel       kernel mode (no bss, no _start/exit stub)\n"
-                "  --libc         hosted mode (no _start, link to the C library\n"
-                "  -g             add debug info in assembly source code\n"
-                "  -memory        show memory stats\n"
-                "  -time          show timings\n"
-                "  -E             output preprocessed test\n"
-                "  -ET            output preprocessed tokens\n"
-                "  -fsyntax-only  run preprocessor, parser and analyser, no output\n"
-                "  -I DIR         add DIR to the end of the include path\n"
-                "  --notabs       indent with spaces in output files"
-                "  -O             perform optimizations\n"
-                "  -o FILE        set the output filename\n"
-                "  -v  --verbose  output progress messages\n");
-    }
-    exit(1);
-}
-
-static _Noreturn void arg_error(const char *msg, const char *arg) {
-    fprintf(stderr, "%s: %s%s\n", progname, msg, arg);
-    usage(false);
-}
-
-static FILE *open_output(const char *path, FILE *def) {
-    if (!path) return fout = def;
-    if (!strcmp(path, "-")) return fout = stdout;
-    if ((fout = fopen(path, "w"))) return fout;
-    die("cannot open output file '%s': %s", path, strerror(errno));
-    return NULL;
-}
-
 static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
     emit(".intel_syntax noprefix");
     emit_section(".text", 0);
@@ -5091,6 +5083,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
         emit_comment("argc"); emit("mov rdi, [rsp]");
         emit_comment("argv"); emit("lea rsi, [rsp+8]");
         emit_comment("envp"); emit("lea rdx, [rsi+8*rdi+8]");
+        emit("mov environ, rdx");
         emit("call main");
         emit("mov rdi, rax");
         emit("call _exit");
@@ -5131,86 +5124,194 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
     return 0;
 }
 
+static int assemble(int stage, const char *asmfile, const char *outpath, char **envp) {
+    char path[256];
+    const char *asm_name = "gcc";
+    const char *asm_path = find_file(path, countof(path), asm_name, NULL, getenv("PATH"));
+    if (!asm_path) { fprintf(stderr, "%s: cannot find assembler %s\n", progname, asm_name); return 1; }
+    const char *args[10];
+    args[0] = "gcc";
+    args[1] = "-nostdlib";
+    args[2] = "-static";
+    const char **ap = &args[3];
+    if (no_pie) *ap++ = "-no-pie";
+    if (static_option) *ap++ = "-static";
+    if (debug) *ap++ = "-g";
+    if (stage == 6) *ap++ = "-c";
+    if (outpath) { *ap++ = "-o"; *ap++ = outpath; }
+    *ap++ = asmfile;
+    *ap = NULL;
+    if (verbose) {
+        int sep = 0;
+        for (ap = args; *ap; ap++, sep = ' ') {
+            if (sep) fputc(sep, stdout);
+            fputs(*ap, stdout);
+        }
+        fputc('\n', stdout);
+    }
+    int child = fork();
+    if (!child) {
+        execve(asm_path, (char **)(void *)args, envp);
+        return -1;
+    } else {
+        int state = 0;
+        pid_t pid = waitpid(child, &state, 0);
+        if (pid >= 0 && !(state & 0xff)) return (state >> 8) & 0xff;
+        return -1;
+    }
+}
+
+// =====================================================================
+// 8. MAIN
+// =====================================================================
+
+static _Noreturn void usage(bool full) {
+    fprintf(stderr, "Usage: %s [OPTIONS] filename ...\n", progname);
+    if (full) {
+        fprintf(stderr,
+                "  --help         display available options\n"
+                "  -E             output preprocessed test\n"
+                "  -ET            output preprocessed tokens\n"
+                "  -dM            output macro definitions\n"
+                "  -fsyntax-only  run preprocessor, parser and analyser, no output\n"
+                "  -S             produce assembly source code\n"
+                "  -c             produce an object file\n"
+                "  --kernel       kernel mode (no bss, no _start/exit stub)\n"
+                "  --libc         hosted mode (no _start, link to the C library\n"
+                "  -g             add debug info in assembly source code\n"
+                "  -nostdinc      remiove the standard include system directries\n"
+                "  -I DIR         add DIR to the end of the include path\n"
+                "  -memory        show memory stats\n"
+                "  -time          time compilation stages\n"
+                "  -no-pie        pass -no-pie to the assembler\n"
+                "  -static        use static linking\n"
+                "  --notabs       indent with spaces in output files"
+                "  -O             perform optimizations\n"
+                "  -o FILE        set the output filename\n"
+                "  -v  --verbose  output progress messages\n");
+    }
+    exit(1);
+}
+
+static _Noreturn void arg_error(const char *msg, const char *arg) {
+    fprintf(stderr, "%s: %s%s\n", progname, msg, arg);
+    usage(false);
+}
+
+static FILE *open_output(const char *path, FILE *def) {
+    if (!path) return fout = def;
+    if (!strcmp(path, "-")) return fout = stdout;
+    if ((fout = fopen(path, "w"))) return fout;
+    die("cannot open output file '%s': %s", path, strerror(errno));
+    return NULL;
+}
+
 static bool add_path(char *buf, size_t size, const char *path) {
     if (!path) arg_error("missing path argument", "");
     if (*buf) pstrcat(buf, size, ":");
-    size_t len = pstrcpy(buf, size, path);
-    if (buf[len - 1] != '/') len = pstrcat(buf, size, "/");
+    size_t len = pstrcat(buf, size, path);
     return len < size;
 }
 
-int main(int argc, char **argv) {
-    // Optional flags may precede the file names.  --kernel suppresses the
-    // Linux _start/_exit stub so a bare-metal boot stub can provide the entry
-    // point and simply call main() (no Linux syscalls exist in a kernel).
+static const char **input_files;
+static size_t input_len, input_cap;
+static bool add_file(const char *path) {
+    if (input_len >= input_cap) input_files = reallocate(input_files, &input_cap, sizeof(*input_files), 4);
+    input_files[input_len++] = path;
+    return true;
+}
+
+int main(int argc, char *argv[], char *envp[]) {
     progname = argv[0];
     if (argc == 1) usage(true);
-    int preprocess_mode = 0, timings = 0, rc = 0;
+    int stage = 7, timings = 0, rc = 0;
     bool kernel_mode = false, libc_mode = false, mem_stats = false;
-    const char *inpath = NULL, *outpath = NULL;
-    unsigned long times[5], *tp = times;
+    const char *outpath = NULL;
+    unsigned long times[6], *tp = times;
     *tp = now();
-    strcpy(include_path, "lib/");   // should find nano_cc directory
+    strcpy(include_path, "lib");   // should find nano_cc directory
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
-        if      (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
-        else if (!strcmp(arg, "--help") || !strcmp(arg, "-?")) usage(true);
+        if      (!strcmp(arg, "--help")) usage(true);
+        else if (!strcmp(arg, "--kernel") || !strcmp(arg, "-k")) kernel_mode = true;
         else if (!strcmp(arg, "--libc")) libc_mode = true;
-        else if (!strcmp(arg, "-E")) preprocess_mode = 1;
-        else if (!strcmp(arg, "-ET")) preprocess_mode = 2;
-        else if (!strcmp(arg, "-fsyntax-only")) preprocess_mode = 3;
+        else if (!strcmp(arg, "-E"))  stage = 1;
+        else if (!strcmp(arg, "-dM")) stage = 2;
+        else if (!strcmp(arg, "-ET")) stage = 3;
+        else if (!strcmp(arg, "-fsyntax-only")) stage = 4;
+        else if (!strcmp(arg, "-S"))  stage = 5;
+        else if (!strcmp(arg, "-c"))  stage = 6;
+        // should support -D, -U, -include
         else if (!strcmp(arg, "-g")) { debug = out_comments = true; }
+        else if (!strcmp(arg, "-nostdinc")) *include_path = '\0';
         else if (strstart(arg, "-I", NULL)) add_path(include_path, countof(include_path), arg[2] ? arg + 2 : argv[i++]);
         else if (!strcmp(arg, "-memory")) mem_stats = true;
+        else if (!strcmp(arg, "-time")) timings++;
+        else if (!strcmp(arg, "-no-pie")) no_pie = true;
+        else if (!strcmp(arg, "-static")) static_option = true;
         else if (!strcmp(arg, "--notabs")) no_tabs = true;
         else if (!strcmp(arg, "-O")) optimize++;
-        else if (!strcmp(arg, "-o")) { if (!argv[i+1]) arg_error("missing output filename", ""); outpath = argv[++i]; }
-        else if (!strcmp(arg, "-time")) timings++;
-        else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
+        else if (!strcmp(arg, "-o")) {
+            if (!argv[i+1]) arg_error("missing output filename", "");
+            if (outpath) arg_error("duplicate output file", argv[i+1]);
+            outpath = argv[++i];
+        } else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
         else if (*arg == '-' && arg[1]) arg_error("invalid option: ", arg);
-        else if (!inpath)  inpath  = arg;
-        else if (!outpath) outpath = arg;
-        else arg_error("too many arguments", "");
+        else add_file(arg);
     }
-    if (!inpath) arg_error("missing filename", "");
+    if (!input_len) arg_error("no input files", "");
+    const char *inpath = input_files[0];
 
-    lex_init();
-    create_builtin_macros();
+    for (;;) {
+        lex_init();
+        create_builtin_macros();
 
-    sbuf_t src[1]; sbuf_init(src, 128 * 1024);
-    preprocess(inpath, false, src);
-    *++tp = now();
-    // XXX: should include relevant library source files
-    if (!kernel_mode && !libc_mode) process_include("nano-libc.h", true, src);
-    if (preprocess_mode == 1) {
-        open_output(outpath, stdout);
-        fputs(sbuf_getptr(src), fout);
-        goto done;
+        sbuf_t src[1]; sbuf_init(src, 128 * 1024);
+        for (size_t i = 0; i < input_len; i++) {
+            // XXX: should separate static globals
+            preprocess(input_files[i], false, src);
+        }
+        *++tp = now();
+        if (stage <= 2) {
+            open_output(outpath, stdout);
+            if (stage == 1) fputs(sbuf_getptr(src), fout);
+            else macro_listing(fout);
+            break;
+        }
+        // XXX: should include relevant library source files
+        if (!kernel_mode && !libc_mode) process_include("nano-libc.h", true, src);
+        lex(sbuf_getptr(src));
+        sbuf_deinit(src);
+        *++tp = now();
+        if (stage == 3) {
+            open_output(outpath, stdout);
+            rc = output_tokens(fout, toks, ntok);
+            break;
+        }
+
+        P = toks;
+        while (!at(T_EOF)) parse_toplevel();
+        check_used_func(ID_MAIN);
+        if (!kernel_mode) check_used_func(ID__EXIT);
+        *++tp = now();
+        if (stage == 4) break;
+
+        const char *asmpath = (stage == 5) ? outpath : NULL;
+        if (!asmpath) asmpath = make_output_file(inpath, ".c", ".s");
+        open_output(asmpath, NULL);
+        rc = emit_x86_intel(kernel_mode, libc_mode);
+        if (fout != stdout) fclose(fout);
+        *++tp = now();
+        if (rc) break;
+
+        if (stage > 5) {
+            rc = assemble(stage, asmpath, outpath, envp);
+            *++tp = now();
+            if (rc) break;
+        }
+        if (verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
+        break;
     }
-    lex(sbuf_getptr(src));
-    sbuf_deinit(src);
-    *++tp = now();
-    if (preprocess_mode == 2) {
-        open_output(outpath, stdout);
-        rc = output_tokens(fout, toks, ntok);
-        goto done;
-    }
-
-    P = toks;
-    while (!at(T_EOF)) parse_toplevel();
-    check_used_func(ID_MAIN);
-    if (!kernel_mode) check_used_func(ID__EXIT);
-    *++tp = now();
-    if (preprocess_mode == 3) goto done;
-
-    if (!outpath) outpath = make_output_file(inpath, ".c", ".s");
-    open_output(outpath, NULL);
-    rc = emit_x86_intel(kernel_mode, libc_mode);
-    if (fout != stdout) fclose(fout);
-    // should invoke assembler / linker
-    *++tp = now();
-    if (!rc && verbose) fprintf(stderr, "Compiled %s -> %s%s\n", inpath, outpath, kernel_mode ? " (kernel mode)" : "");
-done:
     if (timings) {
         fprintf(stderr, "total time: ");
         const char *sep = "";
@@ -5221,6 +5322,7 @@ done:
         unsigned long t = *tp - *times;
         fprintf(stderr, "= %lu.%03lu ms\n", t / 1000, t % 1000);
     }
+    // should free memory
     if (mem_stats) malloc_stats();
 #ifdef ATOM_STATS
     if (verbose) atom_stats();

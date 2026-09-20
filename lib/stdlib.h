@@ -3,7 +3,9 @@
 #ifndef NULL
 #define NULL  ((void*)0)
 #endif
+extern char **environ;
 _Noreturn void exit(int code);
+char *getenv(const char *name);
 long strtol(const char *s, char **endp, int base);
 int atoi(const char *s);
 void *malloc(size_t size);

@@ -113,3 +113,14 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
   - _type-qualifier_: `const`, `restrict`, `volatile`,
   - _function-specifier_: `inline`, `_Noreturn`
 * support `typeof` and `typeof_unqual`
+
+# Options
+* should use `-ffreestanding` instead of `--kernel` and should accept memxxx functions
+* possibly accept `-fno-builtin` to disable some optimisations
+* support `-Os` and `-Oz`
+* `-Wa,<args>` Pass the comma separated arguments in args to the assembler.
+* `-Wl,<args>` Pass the comma separated arguments in args to the linker.
+* `-Xassembler <arg>` Pass arg to the assembler.
+* `-Xlinker <arg>` Pass arg to the linker.
+* `-time` should be `-ftime-report` ?
+* append `getenv("CPATH")` and `getenv("C_INCLUDE_PATH")`
