@@ -80,15 +80,15 @@ typedef struct Func Func;
 // Errors / allocation
 // ---------------------------------------------------------------------
 static const char *progname;
-static const char *src_name[64];
-static unsigned char src_flags[64];
+static const char *src_name[256];
+static unsigned char src_flags[256];
 static char include_path[1024];
 static srcloc_t src_loc;
 static unsigned char optimize;
 static unsigned char func_align = 1;
 static bool debug, verbose, no_pie, static_option;
 
-#define LOC_SHIFT  26
+#define LOC_SHIFT  24
 #define MAKE_LOC(fn, lineno)  (((fn) << LOC_SHIFT) + (unsigned)lineno)
 #define get_lineno(loc) (int)((loc) & ((1 << LOC_SHIFT) - 1))
 #define get_filenum(loc) ((loc) >> LOC_SHIFT)
@@ -302,6 +302,7 @@ static size_t encode_string(char *buf, size_t size, const char *str, size_t slen
 // =====================================================================
 
 typedef unsigned int atom_t;
+#define ATOM_NULL  0    // the empty string
 #define ATOM_MACRO       1
 #define ATOM_USED        2
 #define ATOM_SYS_HEADER  4
@@ -417,9 +418,11 @@ typedef enum TokenKind enum_type(unsigned char) {
     K_ALIGNOF, K__ALIGNOF,
     K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_STATIC_ASSERT,
 
-    K_IFDEF, K_IFNDEF, K_ELIF, K_ELIFDEF, K_ELIFNDEF, K_ENDIF,
-    K_DEFINE, K_UNDEF, K_INCLUDE, K_LINE, K_DEFINED,
-    K__HAS_ATTRIBUTE, K__HAS_C_ATTRIBUTE, K__HAS_INCLUDE, K__HAS_EMBED,
+    K_IFDEF, K_IFNDEF, K_ELIF, K_ELIFDEF, K_ELIFNDEF, K_ENDIF, K_DEFINE,
+    K_UNDEF, K_INCLUDE, K_INCLUDE_NEXT, K_LINE, K_DEFINED, K_ERROR,
+    K_WARNING, K_PRAGMA,
+    K__HAS_ATTRIBUTE, K__HAS_C_ATTRIBUTE, K__HAS_FEATURE, K__BUILDING_MODULE,
+    K__HAS_EMBED, K__HAS_INCLUDE, K__HAS_INCLUDE_NEXT,
     ID__FILE__, ID__LINE__, ID__COUNTER__, ID__ATTRIBUTE__,
 
 #define IS_BUILTIN(k) ((k) >= ID__BUILTIN_VA_START && (k) <= ID_LABS)
@@ -451,9 +454,11 @@ static const char * const token_name[T_count] = {
     "for", "do", "break", "continue", "sizeof", "countof", "_Countof",
     "alignof", "_Alignof",
     "switch", "case", "default", "goto", "static_assert",
-    "ifdef", "ifndef", "elif", "elifdef", "elifndef", "endif",
-    "define", "undef", "include", "line", "defined",
-    "__has_attribute", "__has_c_attribute", "__has_include", "__has_embed",
+    "ifdef", "ifndef", "elif", "elifdef", "elifndef", "endif", "define",
+    "undef", "include", "include_next", "line", "defined", "error",
+    "warning", "pragma",
+    "__has_attribute", "__has_c_attribute", "__has_feature", "__building_module",
+    "__has_embed", "__has_include", "__has_include_next",
     "__FILE__", "__LINE__", "__COUNTER__",
     "__attribute__",
     "__builtin_va_start", "va_start", "__builtin_va_arg", "va_arg",
@@ -488,7 +493,8 @@ static void lex_init(void) {
 typedef struct Macro {
     atom_t name; srcloc_t loc;
 #define M_HAS_PARAMS  1
-//#define M_VARARGS     2
+#define M_VA_ARGS     2
+#define M_VA_ARGS_2   4
     unsigned short nparams, mflags;
     unsigned len;
     char *def;  // points after array of parameter names
@@ -537,10 +543,10 @@ static void macro_undef(atom_t name) {
     }
 }
 
-static bool macro_is_same(Macro *m, int nparams, atom_t *params, size_t len, const char *def) {
+static bool macro_is_same(Macro *m, unsigned short mflags, int nparams, atom_t *params, size_t len, const char *def) {
+    if (m->mflags != mflags) return false;
     if ((size_t)m->len != len || memcmp(m->def, def, len)) return false;
-    if (!(m->mflags & M_HAS_PARAMS)) return nparams < 0;
-    return (m->nparams == nparams && !memcmp(m->params, params, (size_t)nparams * sizeof(*params)));
+    return (nparams < 0 || (m->nparams == nparams && !memcmp(m->params, params, (size_t)nparams * sizeof(*params))));
 }
 
 static void def_macro(const char *name) {
@@ -618,11 +624,94 @@ static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, ch
     }
 }
 
+
+static void preprocess(const char *path, bool sys, sbuf_t *sb);
+
+// XXX should use access
+static bool can_read(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return false;
+    fclose(fp); return true;
+}
+
+static bool set_parent(char *path) {
+    if (!*path) return false;
+    char *p = strchr(path, 0);
+    // ignore trailing /, scan for previous /, stop at path
+    while (p > path && (*--p != '/' || !p[1])) continue;
+    // parent of root is root
+    p += (*p == '/'); *p = '\0'; return true;
+}
+
+static const char *find_file(char *buf, size_t size, const char *name, const char *curfile, const char *path) {
+    if (*name == '/') return name;
+    if (curfile) {
+        pstrcpy(buf, size, curfile); set_parent(buf);
+        for (size_t k = 0;; name += k) {
+            if (strstart(name, "./", &k)) continue;
+            if (strstart(name, "../", &k) && set_parent(buf)) continue;
+            size_t pos = pstrcat(buf, size, name);
+            if (pos < size && can_read(buf)) return buf;
+            break;
+        }
+    }
+    while (path && *path) {
+        if (*path == ':') { path++; continue; }
+        size_t k = skip_until(path, ':');
+        if (k) {
+            size_t pos = pmemcpy(buf, size, path, k);
+            if (buf[pos - 1] != '/' && pos < size) buf[pos++] = '/';
+            pos += pstrcpy(buf + pos, size - pos, name);
+            if (pos < size && can_read(buf)) return buf;
+        }
+        path += k;
+    }
+    return NULL;
+}
+
+static atom_t find_include(const char *name, int sys) {
+    char path[256];
+    const char *ipath = include_path;
+    const char *curfile = get_filename(src_loc);
+    switch (sys) {
+    case 2:
+        while (ipath && *ipath) {
+            if (*ipath == ':') { ipath++; continue; }
+            size_t k = skip_until(ipath, ':');
+            bool found = k && strncmp(ipath, curfile, k) && curfile[k] == '/';
+            ipath += k;
+            if (found) break;
+        }
+        fallthrough;
+    case 1:
+        curfile = NULL; break;
+    }
+    const char *filename = find_file(path, countof(path), name, curfile, ipath);
+    if (filename) return new_atom(filename);
+    return ATOM_NULL;
+}
+
 static atom_t parse_macro_name(atom_t dir, const char **pp) {
     const char *p = *pp;
     size_t k = skip_word(p);
     if (!k) die("expected macro name after '#%s'", atom_str(dir));
     *pp = p + k;
+    return new_atom_len(p, k);
+}
+
+static atom_t parse_prep_argument(atom_t name, const char **pp, int *psys) {
+    const char *p = *pp;
+    if (*p != '(') error(NULL, "expected '(' after %s", atom_str(name));
+    p = skip_blanks(p + 1);
+    size_t k = skip_until(p, ')');
+    if (p[k] != ')') error(NULL, "expected ')' after %s argument", atom_str(name));
+    size_t b = trailing_blanks(p, k);
+    *pp = p + k + 1;
+    k -= b;
+    if (k > 2 && psys) {
+        if (*p == '"' && p[k - 1] == '"') { p++; k -= 2; }
+        else if (*p == '<' && p[k - 1] == '>') { p++; k -= 2; *psys = 1; }
+    }
     return new_atom_len(p, k);
 }
 
@@ -660,12 +749,19 @@ static void expand_line(const char *in, bool preproc, sbuf_t *sb, char *dest, si
                         }
                         if (atom_flags(name) & ATOM_MACRO) rep = "1 ";
                         break;
-                    case K__HAS_ATTRIBUTE: case K__HAS_C_ATTRIBUTE: case K__HAS_INCLUDE: case K__HAS_EMBED:
-                        if (*p == '(') {
-                            while (*p && *p++ != ')') {}
-                        }
+                    case K__HAS_ATTRIBUTE: case K__HAS_C_ATTRIBUTE: case K__HAS_EMBED:
+                    case K__HAS_FEATURE: case K__BUILDING_MODULE: {
+                        parse_prep_argument(name, &p, NULL);
                         break;
                     }
+                    case K__HAS_INCLUDE:
+                    case K__HAS_INCLUDE_NEXT: {
+                        int sys = 0;
+                        atom_t arg = parse_prep_argument(name, &p, &sys);
+                        if (name == K__HAS_INCLUDE_NEXT) sys = 2;
+                        if (find_include(atom_str(arg), sys)) rep = "1";
+                        break;
+                    }}
                     j += pstrcpy(out + j, LINE_LEN - j, rep);
                     q = p; continue;
                 }
@@ -787,58 +883,14 @@ static size_t strip_comments(char *s) {
     }
 }
 
-static void preprocess(const char *path, bool sys, sbuf_t *sb);
-
-static bool can_read(const char *path) {
-    FILE *fp = fopen(path, "r");
-    if (!fp) return false;
-    fclose(fp); return true;
-}
-
-static bool set_parent(char *path) {
-    if (!*path) return false;
-    char *p = strchr(path, 0);
-    // ignore trailing /, scan for previous /, stop at path
-    while (p > path && (*--p != '/' || !p[1])) continue;
-    // parent of root is root
-    p += (*p == '/'); *p = '\0'; return true;
-}
-
-static const char *find_file(char *buf, size_t size, const char *name, const char *curfile, const char *path) {
-    if (*name == '/') return name;
-    if (curfile) {
-        pstrcpy(buf, size, curfile); set_parent(buf);
-        for (size_t k = 0;; name += k) {
-            if (strstart(name, "./", &k)) continue;
-            if (strstart(name, "../", &k) && set_parent(buf)) continue;
-            size_t pos = pstrcat(buf, size, name);
-            if (pos < size && can_read(buf)) return buf;
-            break;
-        }
-    }
-    for (;;) {
-        size_t k = skip_until(path, ':');
-        if (k) {
-            size_t pos = pmemcpy(buf, size, path, k);
-            if (buf[pos - 1] != '/' && pos < size) buf[pos++] = '/';
-            pos += pstrcpy(buf + pos, size - pos, name);
-            if (pos < size && can_read(buf)) return buf;
-        }
-        path += k; if (!*path++) return NULL;
-    }
-}
-
-static void process_include(const char *name, bool sys, sbuf_t *sb) {
-    char path[256];
-    const char *curfile = sys ? NULL : get_filename(src_loc);
-    const char *filename = find_file(path, countof(path), name, curfile, include_path);
-    if (filename) {
-        atom_t a = new_atom(filename);
+static void process_include(const char *name, int sys, sbuf_t *sb) {
+    atom_t fname = find_include(name, sys);
+    if (fname) {
         if (sys) {
-            if (atom_flags(a) & ATOM_SYS_HEADER) return;
-            atom_flags(a) |= ATOM_SYS_HEADER;
+            if (atom_flags(fname) & ATOM_SYS_HEADER) return;
+            atom_flags(fname) |= ATOM_SYS_HEADER;
         }
-        preprocess(filename, sys, sb);
+        preprocess(atom_str(fname), sys, sb);
     } else {
         if (sys) warning(src_loc, "cannot find standard header <%s>", name);
         else warning(src_loc, "cannot find include file '%s'", name);
@@ -936,37 +988,47 @@ static void process_text(const char *text, sbuf_t *sb) {
             case K_DEFINE: {
                 if (skip) break;
                 srcloc_t loc = src_loc;
-                atom_t nm = parse_macro_name(dir, &p);
+                atom_t name = parse_macro_name(dir, &p);
+                unsigned short mflags = 0;
                 int nparams = -1; atom_t params[MAX_MACRO_ARG];
                 // function-like macro: '(' immediately after name (no space)
                 if (*p == '(') {
+                    mflags |= M_HAS_PARAMS;
                     nparams = 0;
                     p = skip_blanks(p + 1);
                     if (*p && *p != ')') {
                         for (;;) {
+                            if (*p == '.' && p[1] == '.' && p[2] == '.') {
+                                mflags |= M_VA_ARGS; skip_blanks(p + 3); goto next;
+                            }
                             size_t k = skip_word(p);
-                            if (!k) die("expected parameter name for macro '%s'", atom_str(nm));
-                            if (nparams >= MAX_MACRO_ARG) die("too many macro parameters for '%s'", atom_str(nm));
+                            if (!k) die("expected parameter name for macro '%s'", atom_str(name));
+                            if (nparams >= MAX_MACRO_ARG) die("too many macro parameters for '%s'", atom_str(name));
                             params[nparams++] = new_atom_len(p, k);
                             p = skip_blanks(p + k);
+                            if (*p == '.' && p[1] == '.' && p[2] == '.') {
+                                mflags |= M_VA_ARGS_2; p = skip_blanks(p + 3);
+                            }
+                        next:
                             if (*p == ')') break;
                             if (*p != ',') die("expected ',' or ')' after macro parameter name");
                             p = skip_blanks(p + 1);
                         }
                     }
-                    if (*p != ')') die("expected ')' after parameters of macro '%s'", atom_str(nm));
+                    if (*p != ')') die("expected ')' after parameters of macro '%s'", atom_str(name));
                     p++;
                 }
                 const char *def = p = skip_blanks(p);
                 p = line + li;
                 size_t len = (size_t)(p - def); len -= trailing_blanks(def, len); // trim trailing whitespace
-                Macro *m = macro_find(nm);
+                Macro *m = macro_find(name);
                 if (m) {  // if macro already exists, check if definition is identical
-                    if (macro_is_same(m, nparams, params, len, def)) break;
-                    warning(loc, "macro '%s' redefinition is different", atom_str(nm));
-                    macro_undef(nm);
+                    if (macro_is_same(m, mflags, nparams, params, len, def)) break;
+                    warning(loc, "macro '%s' redefinition is different", atom_str(name));
+                    note(m->loc, "previous definition of '%s' is here", atom_str(name));
+                    macro_undef(name);
                 }
-                macro_define(nm, loc, nparams, params, len, def);
+                macro_define(name, loc, nparams, params, len, def);
                 break;
             }
             case K_UNDEF: {
@@ -977,25 +1039,34 @@ static void process_text(const char *text, sbuf_t *sb) {
             case K_LINE:
                 if (skip) break;
                 sbuf_put(sb, "# ", 2); sbuf_put(sb, p, li - (size_t)(p - line)); break;
-            case K_INCLUDE: {
+            case K_INCLUDE:
+            case K_INCLUDE_NEXT: {
                 if (skip) break;
-                char sep = '"'; bool sys = false;
-                if (*p == '<') { sep = '>'; sys = true; }
-                if (*p == '"' || sys) {
-                    size_t k = skip_until(++p, sep);
-                    if (p[k] != sep) die("invalid include file name");
-                    atom_t name = new_atom_len(p, k);
+                char sep = '"'; int sys = 0;
+                switch (*p) {
+                case '"': break;
+                case '<': sep = '>'; sys = 1; break;
+                default: die("missing include file name");
+                }
+                if (dir == K_INCLUDE_NEXT) sys = 2;
+                size_t k = skip_until(++p, sep);
+                if (p[k] != sep) die("invalid include file name");
+                atom_t name = new_atom_len(p, k);
 #ifdef ATOM_STATS
-                    atom_flags(name) |= ATOM_STRING;
+                atom_flags(name) |= ATOM_STRING;
 #endif
-                    process_include(atom_str(name), sys, sb); p += k + 1;
-                } else { die("missing include file name"); }
+                process_include(atom_str(name), sys, sb); p += k + 1;
                 break;
             }
+            case K_ERROR:   if (!skip) error(NULL, "%s", p);      break;
+            case K_WARNING: if (!skip) warning(src_loc, "%s", p); break;
+            case K_PRAGMA:  break;  // ignore pragmas for now
+            case 0:         break;  // null-directive
             default:
                 if (skip) break;
                 if (isdigit((unsigned char)*p)) { sbuf_put(sb, line, li); break; }
                 // ignore other preprocessing directives
+                warning(src_loc, "unknown preprocessor directive %s", atom_str(dir));
                 break;
             }
         } else {
@@ -1009,7 +1080,9 @@ static void process_text(const char *text, sbuf_t *sb) {
 static srcloc_t update_loc(srcloc_t loc, const char *path, unsigned int lineno) {
     unsigned int fn = get_filenum(loc);
     if (path && *path) {
-        for (fn = 0; src_name[fn] && strcmp(src_name[fn], path); fn++) continue;
+        for (fn = 0; src_name[fn] && strcmp(src_name[fn], path); fn++) {
+            if (fn == countof(src_name) - 1) error(NULL, "too many files");
+        }
         src_name[fn] = atom_str(new_atom(path));
     }
     return MAKE_LOC(fn, lineno);
@@ -5210,6 +5283,7 @@ static bool add_path(char *buf, size_t size, const char *path) {
     if (!path) arg_error("missing path argument", "");
     if (*buf) pstrcat(buf, size, ":");
     size_t len = pstrcat(buf, size, path);
+    if (len && buf[len - 1] == '/') buf[--len] = '\0';
     return len < size;
 }
 
@@ -5279,7 +5353,7 @@ int main(int argc, char *argv[], char *envp[]) {
             break;
         }
         // XXX: should include relevant library source files
-        if (!kernel_mode && !libc_mode) process_include("nano-libc.h", true, src);
+        if (!kernel_mode && !libc_mode) process_include("nano-libc.h", 1, src);
         lex(sbuf_getptr(src));
         sbuf_deinit(src);
         *++tp = now();
