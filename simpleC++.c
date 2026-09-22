@@ -1453,7 +1453,7 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
 typedef enum TypeKind enum_type(unsigned char) {
     TY_INT, TY_SCHAR, TY_SHORT, TY_LONG, // signed types
     TY_UINT, TY_UCHAR, TY_USHORT, TY_ULONG, // unsigned types
-    TY_CHAR, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM
+    TY_CHAR, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM,
 } TypeKind;
 static const char * const type_name[] = {
     "int", "signed char", "short", "long",
@@ -1504,8 +1504,8 @@ struct Type {
     Type *next;
 };
 struct Member {
-    atom_t name; unsigned char align; unsigned offset, pad;
-    Type *type; Node *init; Member *next;
+    atom_t name; unsigned char align, bf_width, bf_shift; unsigned offset, pad;
+    Type *type; Node *bf_width_expr; Member *next;
 };
 
 static Type ty_char_s   = { TY_CHAR,   1, 0,           0, 0, {{ 1, 127 }},       NULL, NULL, NULL }; // should be unsigned
@@ -1997,7 +1997,7 @@ static Node *this_loop;
 static Node *parse_expr(void);
 static Node *parse_assign(void);
 static Node *parse_stmt(void);
-static Type *parse_type_base_only(unsigned int *flags);
+static Type *parse_declaration_specifiers(unsigned int *flags);
 static Node *parse_declaration(void);
 static void add_label(Node *n);
 static Node *find_label(atom_t name);
@@ -2071,7 +2071,7 @@ static unsigned initializer_length(Node *n) {
     return (unsigned)(max > len ? max : len);
 }
 
-static Type *parse_ptrs(Type *base, unsigned *flagsp) {
+static Type *parse_pointers(Type *base, unsigned *flagsp) {
     while (eat(T_STAR)) {
         parse_attributes();
         unsigned char qflags = 0;
@@ -2104,6 +2104,69 @@ static Type *parse_array(Type *base, unsigned char pflags) {
     return array_of(base, 0, len_expr, qflags, pflags);
 }
 
+// skip the inner part of a parenthesized declarator
+// return true if it is a parenthesized name
+static bool skip_inner_decl(atom_t *ap, srcloc_t *locp) {
+    // state:
+    // 0: not a simple parenthesized name
+    // 1: expecting opening parens or name
+    // 2: expecting closing parens
+    unsigned char state = 1;
+    for (size_t depth = 0;; P++) {
+        switch (cur()) {
+        case T_EOF:
+            expect(T_RP);
+            return false;
+        case T_LP:
+            if (state != 1) state = 0;
+            depth++;
+            continue;
+        case T_RP:
+            if (state != 2) state = 0;
+            if (depth--) continue;
+            return state == 2;
+        case T_ID:
+            if (state == 1) {
+                if (locp) *locp = P->loc;
+                if (ap) *ap = P->name;
+                state = 2;
+                continue;
+            }
+            state = 0;
+            continue;
+        default:
+            state = 0;
+            continue;
+        }
+    }
+}
+
+static Type *parse_type_suffix(Type *t, unsigned char fflags) {
+    // XXX: should parse function types
+    if (eat(T_LBRK)) t = parse_array(t, fflags);
+    parse_attributes();
+    return t;
+}
+
+static Type *parse_declarator(Type *t, atom_t *ap, srcloc_t *locp, unsigned int *flagsp, unsigned char fflags) {
+    t = parse_pointers(t, flagsp);
+    if (eat(T_LP)) {
+        Token *inner = P;
+        if (!skip_inner_decl(ap, locp)) {
+            t = parse_type_suffix(t, 0);
+            Token *outer = P;
+            P = inner;
+            t = parse_declarator(t, ap, locp, flagsp, fflags);
+            P = outer;
+            return t;
+        }
+    } else {
+        if (locp) *locp = curloc();
+        if (ap) *ap = at(T_ID) ? getid() : 0;
+    }
+    return parse_type_suffix(t, fflags);
+}
+
 static void shift_members(Member *m) {
     Type *mt = m->type;
     if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
@@ -2127,15 +2190,12 @@ static Type *parse_struct(int kind) {
         st->align = 1;
         while (!at(T_RBRACE) && !at(T_EOF)) {
             unsigned int flags;
-            Type *base = parse_type_base_only(&flags);
+            Type *base = parse_declaration_specifiers(&flags);
             for (;;) {
-                Type *mt = parse_ptrs(base, &flags);
                 atom_t name = 0;
-                if (at(T_ID)) {
-                    name = getid();
-                    if (eat(T_LBRK)) mt = parse_array(mt, 0);
-                } else {
-                    // accept unnamed members, must be untagged aggregate types (except bit-fields)
+                Type *mt = parse_declarator(base, &name, NULL, &flags, 0);
+                if (!name && !at(T_COLON)) {
+                    // accept unnamed members, must be untagged aggregate type or bit-field
                     if (!(mt->kind == TY_STRUCT || mt->kind == TY_UNION) && !mt->struct_tag)
                         error(NULL, "anonymous members must be untagged struct or union definitions");
                 }
@@ -2153,6 +2213,15 @@ static Type *parse_struct(int kind) {
                     head = m;
                 }
                 tail = m;
+                if (eat(T_COLON)) {
+                    switch (mt->kind) {
+                    case TY_VOID: case TY_PTR: case TY_ARRAY: case TY_STRUCT: case TY_UNION:
+                        error(NULL, "bitfield type must be an integer type");
+                        fallthrough;
+                    default: break;
+                    }
+                    m->bf_width_expr = parse_const_expr();
+                }
                 if (kind == TY_UNION) {
                     if (msz > maxsz) maxsz = msz;
                 } else {
@@ -2184,7 +2253,7 @@ static Type *parse_enum(void) {
     Type *et = NULL;
     if (eat(T_COLON)) {
         unsigned int flags;
-        et = parse_type_base_only(&flags);
+        et = parse_declaration_specifiers(&flags);
         if (et->kind >= TY_VOID) error(NULL, "invalid enum underlying type");
     }
     Type *st = tag_get(tag, TY_ENUM, loc);
@@ -2250,8 +2319,10 @@ static Type *parse_enum(void) {
 }
 
 // parse base type + pointer stars; returns Type*
-static Type *parse_type(unsigned int *flags) {
-    return parse_ptrs(parse_type_base_only(flags), flags);
+static Type *parse_type(void) {
+    unsigned int flags;
+    Type *base = parse_declaration_specifiers(&flags);
+    return parse_declarator(base, NULL, NULL, &flags, 0);
 }
 
 static Node *parse_string(void) {
@@ -2336,8 +2407,7 @@ static Node *parse_primary(void) {
             case ID__BUILTIN_VA_ARG:
             case ID_VA_ARG:
                 n->lhs = parse_assign();
-                unsigned int flags;
-                expect(T_COMMA); n->type = n->type_arg = parse_type(&flags);
+                expect(T_COMMA); n->type = n->type_arg = parse_type();
                 goto done_builtin;
             case ID__BUILTIN_VA_END:
             case ID_VA_END:
@@ -2440,8 +2510,7 @@ static Node *parse_unary(bool accept_cast) {
             // XXX: should accept `sizeof(char[xxx])`
             // Should support delayed type resolution and
             // dynamic type expressions: sizeof(char[expr])
-            unsigned int flags;
-            P++; n->type_arg = t = parse_type(&flags); expect(T_RP);
+            P++; n->type_arg = t = parse_type(); expect(T_RP);
         } else {
             n->lhs = parse_unary(false);
             t = static_typeof(n->lhs, NULL);
@@ -2464,8 +2533,7 @@ static Node *parse_unary(bool accept_cast) {
     case T_LP:
         if (accept_cast && is_type_start(P+1)) {
             n = new_node(N_CAST);
-            unsigned int flags;
-            n->type = parse_type(&flags);
+            n->type = parse_type();
             expect(T_RP);
             n->lhs = parse_cast_expression();
             return check_const_unary(n);
@@ -2557,7 +2625,7 @@ static Node *parse_expr(void) {
 }
 
 // parse just the base type (no trailing stars) — stars belong to each declarator
-static Type *parse_type_base_only(unsigned int *pflags) {
+static Type *parse_declaration_specifiers(unsigned int *pflags) {
     Type *t = NULL; unsigned int sflags = 0, tflags = 0;
     for (;;) {
         *pflags = sflags | (tflags << 16);
@@ -3076,11 +3144,10 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
         if (np >= MAX_ARGS) error(NULL, "too many function arguments");
         parse_attributes();
         unsigned int pflags;
-        srcloc_t ploc = curloc();
-        Type *pt = parse_ptrs(parse_type_base_only(&pflags), &pflags);
         atom_t pname = 0;
-        if (at(T_ID)) pname = getid();   // argument name is optional
-        if (eat(T_LBRK)) pt = parse_array(pt, IS_FUN_ARG);
+        srcloc_t ploc = curloc();
+        Type *base = parse_declaration_specifiers(&pflags);
+        Type *pt = parse_declarator(base, &pname, &loc, &pflags, IS_FUN_ARG);
         // XXX should not recreate arglist if has_prototype
         if (has_prototype && *pp && !same_type((*pp)->type, pt)) {
             warning(ploc, "type mismatch with prototype on argument %d", np + 1);
@@ -3115,7 +3182,7 @@ static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t lo
 static Node *parse_declaration(void) {
     unsigned int flags;
     srcloc_t loc = curloc();
-    Type *base = parse_type_base_only(&flags);
+    Type *base = parse_declaration_specifiers(&flags);
     Node *n = new_node(N_DECL); P--;
     n->loc = loc;
     n->decl_flags = flags;
@@ -3132,11 +3199,8 @@ static Node *parse_declaration(void) {
     }
     Sym **tailp = &n->decl;
     for (;;) {
-        Type *t = parse_ptrs(base, &flags);
-        srcloc_t nloc = curloc();
-        atom_t name = getid();
-        parse_attributes();
-        // XXX: should parse function pointers and such
+        atom_t name = 0; srcloc_t nloc = 0;
+        Type *t = parse_declarator(base, &name, &nloc, &flags, 0);
         Sym *s = NULL;
         if (eat(T_LP)) {
             s = parse_function(t, flags, name, nloc);
@@ -3148,7 +3212,6 @@ static Node *parse_declaration(void) {
             }
         } else {
             if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
-            if (eat(T_LBRK)) t = parse_array(t, 0);
             s = add_sym(name, nloc, t, flags);
             if (eat(T_ASSIGN)) {
                 Node *init = s->init = parse_init();
