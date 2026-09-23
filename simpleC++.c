@@ -2466,50 +2466,6 @@ static Node *parse_primary(void) {
         Node *n = new_node(N_VAR); n->name = name;
         Sym *s = lookup(name, NULL);
         n->decl = s;
-        // XXX: this is actually a postfix expression
-        if (eat(T_LP)) {  // function call
-            switch (name) { // check builtins
-            case ID__BUILTIN_VA_START:
-            case ID_VA_START:
-                // actual prototype is void va_start(va_list ap, ...)
-            case ID__BUILTIN_VA_COPY:
-            case ID_VA_COPY:
-                n->lhs = parse_assign();
-                expect(T_COMMA); n->rhs = parse_assign();
-                goto done_builtin;
-            case ID__BUILTIN_VA_ARG:
-            case ID_VA_ARG:
-                n->lhs = parse_assign();
-                expect(T_COMMA); n->type = n->type_arg = parse_type();
-                goto done_builtin;
-            case ID__BUILTIN_VA_END:
-            case ID_VA_END:
-            case ID__BUILTIN_BSWAP16:
-            case ID__BUILTIN_BSWAP32:
-            case ID__BUILTIN_BSWAP64:
-            case ID__BUILTIN_CLZ:
-            case ID__BUILTIN_CLZL:
-            case ID__BUILTIN_CTZ:
-            case ID__BUILTIN_CTZL:
-                n->lhs = parse_assign();
-            done_builtin:
-                n->kind = N_BUILTIN; expect(T_RP); return n;
-            }
-            if (IS_BUILTIN(name) || (s && s->type->kind == TY_FUNC)) {
-                n->kind = N_CALL;
-            } else {
-                P--; n = new_node1(N_CALL, n);
-            }
-            if (this_fn) this_fn->flags |= HAS_CALLS;
-            Node **ap = &n->rhs;
-            while (!at(T_RP)) {
-                if (n->nargs >= MAX_ARGS) error(NULL, "too many function arguments");
-                Node *arg = parse_assign();
-                *ap = arg; ap = &arg->next; n->nargs++;
-                if (!eat(T_COMMA)) break;
-            }
-            expect(T_RP); n->type = ty_long(); return n;    // XXX: type should be func return type
-        }
         if (s && (s->flags & CONST_VAL)) {
             n->flags |= CONST_VAL;
             n->ival |= s->ival;
@@ -2538,9 +2494,59 @@ static Node *parse_postfix(void) {
             n->lhs->rhs = parse_expr();
             expect(T_RBRK);
             break;
-        //case T_LP: call expression
-            // mutate n into a N_CALL or
+        case T_LP: { // call expression
+            if (n->kind == N_VAR) {
+                P++;
+                atom_t name = n->name;
+                Sym *s = n->decl;
+                switch (name) { // check builtins
+                case ID__BUILTIN_VA_START:
+                case ID_VA_START:
+                    // actual prototype is void va_start(va_list ap, ...)
+                case ID__BUILTIN_VA_COPY:
+                case ID_VA_COPY:
+                    n->lhs = parse_assign();
+                    expect(T_COMMA); n->rhs = parse_assign();
+                    goto done_builtin;
+                case ID__BUILTIN_VA_ARG:
+                case ID_VA_ARG:
+                    n->lhs = parse_assign();
+                    expect(T_COMMA); n->type = n->type_arg = parse_type();
+                    goto done_builtin;
+                case ID__BUILTIN_VA_END:
+                case ID_VA_END:
+                case ID__BUILTIN_BSWAP16:
+                case ID__BUILTIN_BSWAP32:
+                case ID__BUILTIN_BSWAP64:
+                case ID__BUILTIN_CLZ:
+                case ID__BUILTIN_CLZL:
+                case ID__BUILTIN_CTZ:
+                case ID__BUILTIN_CTZL:
+                    n->lhs = parse_assign();
+                done_builtin:
+                    n->kind = N_BUILTIN; expect(T_RP); goto again;
+                }
+                if (IS_BUILTIN(name) || (s && s->type->kind == TY_FUNC)) {
+                    n->kind = N_CALL;  // mutate n into a N_CALL
+                    goto next;
+                }
+                P--;
+            }
             // wrap it if n is not a global reference
+            n = new_node1(N_CALL, n);
+        next:
+            if (this_fn) this_fn->flags |= HAS_CALLS;
+            Node **ap = &n->rhs;
+            while (!at(T_RP)) {
+                if (n->nargs >= MAX_ARGS) error(NULL, "too many function arguments");
+                Node *arg = parse_assign();
+                *ap = arg; ap = &arg->next; n->nargs++;
+                if (!eat(T_COMMA)) break;
+            }
+            expect(T_RP); n->type = ty_long();
+        again:
+            break;
+        }
         case T_DOT:               // a.field
             n = new_node1(N_MEMBER, n);
             n->name = getid();
@@ -3345,31 +3351,35 @@ static bool check_rewrite(Node *n) {
 }
 
 static void check_used(Node *n);
-static void check_used_func(atom_t name) {
-    Sym *s = find_func(name);
-    if (!s) return;
-    Func *fn = s->fn;
+static void check_used_func(Func *fn) {
     if (fn && !fn->used) {
         fn->used = true;
         check_used(fn->body);
     }
+}
+static void check_used_func_name(atom_t name) {
+    Sym *s = find_func(name);
+    if (s) check_used_func(s->fn);
 }
 
 static void check_used(Node *n) {
     if (!n) return;
     // should test if node is elided
     switch (n->kind) {
-    case N_VAR: return; // XXX: should look up symbol and set used bit
+    case N_VAR: {
+        Sym *s = n->decl;
+        check_used_func(s->fn);
+        check_used(s->init);
+        return;
+    }
     case N_UNARY: case N_POST: case N_PRE: case N_CAST:
     case N_DEREF: case N_ADDR: case N_EXPR: case N_MEMBER: case N_RETURN:
         check_used(n->lhs); return;
-    case N_TERNARY:
-        check_used(n->cond); fallthrough;
     case N_ASSIGN: case N_BIN: case N_CMP: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
         check_used(n->lhs); check_used(n->rhs); return;
     case N_CALL:
         if (check_rewrite(n)) { check_used(n); return; }
-        if (!IS_BUILTIN(n->name)) check_used_func(n->name);
+        if (!IS_BUILTIN(n->name)) check_used_func_name(n->name);
         fallthrough;
     case N_BLOCK:
         for (Node *e = n->rhs; e; e = e->next) check_used(e); return;
@@ -3378,6 +3388,7 @@ static void check_used(Node *n) {
     case N_DESIGNATOR:
     case N_FOR:
         check_used(n->finit); fallthrough;
+    case N_TERNARY:
     case N_IF: case N_WHILE: case N_DOWHILE:
         check_used(n->cond);
         check_used(n->lhs);
@@ -4058,7 +4069,7 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
         emit_mov_reg_imm(ARGREG[1], 0);
         emit_mov_reg_imm(ARGREG[2], size);
         emit("call memset");
-        check_used_func(ID_MEMSET);
+        check_used_func_name(ID_MEMSET);
         return;
     }
     unsigned tail = 0;
@@ -5499,8 +5510,14 @@ int main(int argc, char *argv[], char *envp[]) {
 
         P = toks;
         while (!at(T_EOF)) parse_toplevel();
-        check_used_func(ID_MAIN);
-        if (!kernel_mode) check_used_func(ID__EXIT);
+        check_used_func_name(ID_MAIN);
+        if (!kernel_mode) check_used_func_name(ID__EXIT);
+        for (Sym *s = globals; s; s = s->next_decl) {
+            if (!(s->flags & HAS_STATIC) && s->init) {
+                check_used(s->init);
+            }
+        }
+
         *++tp = now();
         if (stage == 4) break;
 
