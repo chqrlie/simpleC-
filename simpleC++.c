@@ -1453,12 +1453,13 @@ static int output_tokens(FILE *fp, Token *t, size_t n) {
 typedef enum TypeKind enum_type(unsigned char) {
     TY_INT, TY_SCHAR, TY_SHORT, TY_LONG, // signed types
     TY_UINT, TY_UCHAR, TY_USHORT, TY_ULONG, // unsigned types
-    TY_CHAR, TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_ENUM,
+    TY_CHAR, TY_ENUM,
+    TY_VOID, TY_PTR, TY_ARRAY, TY_STRUCT, TY_UNION, TY_FUNC,
 } TypeKind;
 static const char * const type_name[] = {
     "int", "signed char", "short", "long",
     "unsigned int", "unsigned char", "unsigned short", "unsigned long",
-    "char", "void", "ptr", "array", "struct", "union", "enum"
+    "char", "enum", "void", "ptr", "array", "struct", "union", "func",
 };
 
 struct Type {
@@ -1480,12 +1481,6 @@ struct Type {
             int size_;
             unsigned long max;
         };
-        struct {                // TY_ENUM
-            unsigned enum_size;
-            atom_t enum_tag;
-            Type *enum_type;
-            Sym *enum_syms;
-        };
         struct {                // TY_ARRAY / TY_PTR
             unsigned arr_size;
             unsigned arr_len;
@@ -1497,6 +1492,18 @@ struct Type {
             atom_t struct_tag;
             Member *members;
         };
+        struct {                // TY_ENUM
+            unsigned enum_size;
+            atom_t enum_tag;
+            Type *enum_type;
+            Sym *enum_syms;
+        };
+        struct {                // TY_FUNC
+            unsigned func_size;
+            unsigned char is_variadic, np;
+            Type *rtype;
+            Sym *params;
+        };
         unsigned size;          // all types
     };
     Type *qtypes; // circular list of qualified types
@@ -1504,7 +1511,9 @@ struct Type {
     Type *next;
 };
 struct Member {
-    atom_t name; unsigned char align, bf_width, bf_shift; unsigned offset, pad;
+    atom_t name; srcloc_t loc;
+    unsigned char align, bf_width, bf_shift;
+    unsigned offset, pad;
     Type *type; Node *bf_width_expr; Member *next;
 };
 
@@ -1594,23 +1603,6 @@ static Type *ptrish_type(Type *base, TypeKind kind, size_t len, Node *len_expr, 
 static Type *ptr_to(Type *base, unsigned char qflags) {
     return ptrish_type(base, TY_PTR, 0, NULL, qflags, 0);
 }
-static bool same_type(Type *t1, Type *t2) {
-    // XXX: handle qualifiers and take `compatible` flag
-    if (t1 && t2) {
-        if (t1 == t2) return true;
-        if (t1->kind != t2->kind) return false;
-        switch (t1->kind) {
-        case TY_ARRAY: return t1->pflags == t2->pflags && t1->arr_len == t2->arr_len && same_type(t1->base, t2->base);
-        case TY_PTR:   return same_type(t1->base, t2->base);
-        case TY_STRUCT: case TY_UNION: case TY_ENUM:
-            // XXX: this is not strictly sufficient because of possible shadowing
-            // XXX: also this is incorrect if tag is 0
-            return t1->struct_tag == t2->struct_tag;
-        default: break;
-        }
-    }
-    return t1 == t2;
-}
 static Type *promoted_type(Type *t) {
     while (t) {
         switch (t->kind) {
@@ -1671,6 +1663,27 @@ enum QualifierFlags enum_type(unsigned) {  // sflags
     HAS_NORETURN = 1 << (K_NORETURN - K_CONST),
     HAS_FUNCTION = 2 << (K_NORETURN - K_CONST),
 };
+
+static Member *find_member(Member *m, atom_t name) {
+    for (; m; m = m->next) {
+        if (m->name == name) break;
+        if (!m->name) {
+            Type *mt = m->type;
+            if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
+                Member *mm = find_member(mt->members, name);
+                if (mm) return mm;
+            }
+        }
+    }
+    return m;
+}
+
+static Member *find_struct_member(Type *st, atom_t name, Node *n) {
+    if (st->kind == TY_PTR) st = st->base;
+    Member *m = find_member(st->members, name);
+    if (!m && n) error(n, "struct member '%s' not found", atom_str(name));
+    return m;
+}
 
 // =====================================================================
 // 4. AST
@@ -1754,9 +1767,13 @@ static Type *array_of(Type *base, size_t len, Node *len_expr, unsigned char qfla
 }
 
 // ---- symbols ----
+typedef enum SymKind enum_type(unsigned char) {
+    S_NONE, S_GLOBAL, S_AUTO, S_STATIC_LOCAL, S_REGISTER, S_TYPEDEF,
+    S_ENUM_VALUE,
+} SymKind;
+
 struct Sym {
-    TokenKind kind; // 0 (global), K_AUTO, K_STATIC (static local),
-                    // K_REGISTER, K_TYPEDEF, K_ENUM
+    SymKind kind;
 //#define CONST_VAL     2  // symbol has constant value (enum value)
 //#define S_IS_TAG  4
     unsigned char flags;
@@ -1786,58 +1803,53 @@ static unsigned scope_len;
 static unsigned char scope_depth;
 static unsigned int static_num;
 
-static Sym *sym_link(Sym *s, unsigned int sflags) {
-    atom_t name = s->name;
-    Sym *prev = atom_sym(name);
-    // XXX: this test should be moved to the callers, should merge tags first
-    if (!(sflags & HAS_EXTERN)) {
-        Sym *shadow = prev;
-        while (shadow) {
-            if (shadow->scope_depth == scope_depth) {
-                if ((shadow->sflags & HAS_EXTERN) || shadow->fn) {
-                    // XXX: should check consistency with forward declaration
-                    shadow = shadow->next_sym;
-                    continue;
-                }
-                warning(s->loc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
-            } else {
-                if (get_fileflags(s->loc)) break;
-                warning(s->loc, "symbol '%s' shadows previous definition", atom_str(name));
-            }
-            note(shadow->loc, "previous definition of '%s' is here", atom_str(name));
-            break;
-        }
-    }
-    s->next_sym = prev;
-    return atom_sym(name) = s;
+static Sym *sym_link(Sym *s) {
+    s->next_sym = atom_sym(s->name);
+    return atom_sym(s->name) = s;
 }
-static Sym *sym_unlink(Sym *s) { return atom_sym(s->name) = s->next_sym; }
+static Sym *sym_unlink(Sym *s) {
+    return atom_sym(s->name) = s->next_sym;
+}
 
 static void set_local_offset(Sym *s) {
-    if (s->kind != K_AUTO) return;
+    if (s->kind != S_AUTO) return;
     // Should allocate registers
     unsigned sz = ty_size(s->type); if (sz < 8) sz = 8; sz = (sz + 7) & ~7U;
     if ((s->offset = frame_pos += sz) > frame_max) frame_max = frame_pos;
 }
-static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) {
+static Sym *new_sym(atom_t name, srcloc_t loc, SymKind kind, Type *type, unsigned int sflags) {
     Sym *s = allocz(1, sizeof(Sym));
-    s->name = name; s->loc = loc; s->type = type; s->sflags = (unsigned char)sflags;
-    s->scope_depth = scope_depth;
-    if (sflags & HAS_TYPEDEF) s->kind = K_TYPEDEF;
+    s->kind = kind; s->sflags = (unsigned char)sflags;
+    s->name = name; s->loc = loc; s->type = type;
+    if (kind == S_STATIC_LOCAL) s->num = static_num++;
+    return s;
+}
+static Sym *scope_add_sym(Sym *s) {
     if (scope_depth) {
+        s->scope_depth = scope_depth;
+        if (s->kind == S_AUTO) set_local_offset(s); // should delay this until analysis to allocate registers
+        if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
+        return scope_list[scope_len++] = sym_link(s);
+    } else {
+        if (globals) globals_tail->next_decl = s; else globals = s;
+        return globals_tail = sym_link(s);
+    }
+}
+
+static Sym *add_sym(atom_t name, srcloc_t loc, Type *type, unsigned int sflags) {
+    SymKind kind = S_GLOBAL;
+    if (sflags & HAS_TYPEDEF) kind = S_TYPEDEF;
+    else if (scope_depth) {
         // XXX: should handle HAS_THREAD_LOCAL
         // Do not test HAS_AUTO because `auto` now means infer type and can be applied to any storage class
         switch (sflags & (HAS_FUNCTION | HAS_EXTERN | HAS_TYPEDEF | HAS_STATIC)) {
-        case 0:           s->kind = K_AUTO; set_local_offset(s); break; // should delay this until analysis to allocate registers
-        case HAS_STATIC:  s->kind = K_STATIC; s->num = static_num++; break;
+        case 0:           kind = S_AUTO; break;
+        case HAS_STATIC:  kind = S_STATIC_LOCAL; break;
         default:          break;
         }
-        if (scope_len == scope_cap) scope_list = reallocate(scope_list, &scope_cap, sizeof(Sym*), 64);
-        return scope_list[scope_len++] = sym_link(s, sflags);
-    } else {
-        if (globals) globals_tail->next_decl = s; else globals = s;
-        return globals_tail = sym_link(s, sflags);
     }
+    Sym *s = new_sym(name, loc, kind, type, sflags);
+    return scope_add_sym(s);
 }
 
 static Node *scope_push(Node *n) {
@@ -1849,7 +1861,7 @@ static Node *scope_pop(Node *n) {
     while (scope_len > n->scope_len) {
         Sym *s = scope_list[--scope_len];
         sym_unlink(s);
-        if (s->kind == K_AUTO) frame_pos = s->offset;
+        if (s->kind == S_AUTO) frame_pos = s->offset;
     }
     if (!scope_depth--) error(n, "scope depth error");
     return n;
@@ -1858,12 +1870,12 @@ static Node *scope_pop(Node *n) {
 static Sym *lookup(atom_t name, Node *n) {
     Sym *s = atom_sym(name);
     if (!s) { if (n) error(n, "undeclared identifier '%s'", atom_str(name)); }
-    else if (s->kind == K_STATIC) error(n, "static local definitions not supported");
+    else if (s->kind == S_STATIC_LOCAL) error(n, "static local definitions not supported");
     return s;
 }
 static Type *find_typedef(atom_t name) {
     Sym *s = lookup(name, NULL);
-    if (s && s->kind == K_TYPEDEF) return s->type;
+    if (s && s->kind == S_TYPEDEF) return s->type;
     switch (name) {
     case ID_SIZE_T:     return ty_size_t();
     case ID_SSIZE_T:
@@ -1871,6 +1883,32 @@ static Type *find_typedef(atom_t name) {
     case ID_VA_LIST:    return ty_long();
     }
     return NULL;
+}
+
+static bool same_type(Type *t1, Type *t2) {
+    // XXX: handle qualifiers and take `compatible` flag
+    if (t1 && t2) {
+        if (t1 == t2) return true;
+        if (t1->kind != t2->kind) return false;
+        switch (t1->kind) {
+        case TY_ARRAY: return t1->pflags == t2->pflags && t1->arr_len == t2->arr_len && same_type(t1->base, t2->base);
+        case TY_PTR:   return same_type(t1->base, t2->base);
+        case TY_STRUCT: case TY_UNION: case TY_ENUM:
+            // XXX: this is not strictly sufficient because of possible shadowing
+            // XXX: also this is incorrect if tag is 0
+            return t1->struct_tag == t2->struct_tag;
+        case TY_FUNC:
+            if (t1->is_variadic != t2->is_variadic
+            ||  t1->np != t2->np
+            ||  !same_type(t1->rtype, t2->rtype)) return false;
+            for (Sym *p1 = t1->params, *p2 = t2->params; p1; p1 = p1->next_decl, p2 = p2->next_decl) {
+                if (!same_type(p1->type, p2->type)) return false;
+            }
+            return true;
+        default: break;
+        }
+    }
+    return t1 == t2;
 }
 
 // ---- values ----
@@ -1934,7 +1972,7 @@ struct Func {
 #define HAS_FRAME  4  // function has a standard frame
     unsigned char nparams, flags; bool is_variadic, used;
     srcloc_t loc, endloc; unsigned decl_flags, frame_size, va_off;
-    Sym *params; Node *body; Type *rtype; Node *labels;
+    Sym *params; Node *body; Type *rtype; Type *type; Node *labels;
     struct Func *next;
 };
 
@@ -2124,6 +2162,7 @@ static bool skip_inner_decl(atom_t *ap, srcloc_t *locp) {
         case T_RP:
             if (state != 2) state = 0;
             if (depth--) continue;
+            P++;
             return state == 2;
         case T_ID:
             if (state == 1) {
@@ -2141,12 +2180,8 @@ static bool skip_inner_decl(atom_t *ap, srcloc_t *locp) {
     }
 }
 
-static Type *parse_type_suffix(Type *t, unsigned char fflags) {
-    // XXX: should parse function types
-    if (eat(T_LBRK)) t = parse_array(t, fflags);
-    parse_attributes();
-    return t;
-}
+static Sym *parse_function(Sym *s, unsigned int flags);
+static Type *parse_type_suffix(Type *base, unsigned char fflags);
 
 static Type *parse_declarator(Type *t, atom_t *ap, srcloc_t *locp, unsigned int *flagsp, unsigned char fflags) {
     t = parse_pointers(t, flagsp);
@@ -2165,6 +2200,34 @@ static Type *parse_declarator(Type *t, atom_t *ap, srcloc_t *locp, unsigned int 
         if (ap) *ap = at(T_ID) ? getid() : 0;
     }
     return parse_type_suffix(t, fflags);
+}
+static Type *parse_type_suffix(Type *base, unsigned char fflags) {
+    if (eat(T_LBRK)) base = parse_array(base, fflags);
+    else if (eat(T_LP)) { // parse function parameters
+        Type *t = allocz(1, sizeof(Type));
+        t->kind = TY_FUNC; t->align = 1;
+        t->rtype = base;
+        Sym **pp = &t->params;
+        if (at(K_VOID) && peek(T_RP)) P++; // (void) -> ()
+        while (!at(T_RP)) {
+            if (eat(T_ELLIPSIS)) { t->is_variadic = true; break; }   // printf(char *fmt, ...)
+            if (t->np >= MAX_ARGS) error(NULL, "too many function arguments");
+            parse_attributes();
+            unsigned int pflags;
+            atom_t pname = 0;
+            srcloc_t ploc = curloc();
+            Type *t1 = parse_declaration_specifiers(&pflags);
+            Type *pt = parse_declarator(t1, &pname, &ploc, &pflags, IS_FUN_ARG);
+            // no linking!
+            Sym *pv = new_sym(pname, ploc, S_AUTO, pt, pflags);
+            *pp = pv; pp = &pv->next_decl; t->np++;
+            if (!eat(T_COMMA)) break;
+        }
+        expect(T_RP);
+        base = t;
+    }
+    parse_attributes();
+    return base;
 }
 
 static void shift_members(Member *m) {
@@ -2193,8 +2256,20 @@ static Type *parse_struct(int kind) {
             Type *base = parse_declaration_specifiers(&flags);
             for (;;) {
                 atom_t name = 0;
-                Type *mt = parse_declarator(base, &name, NULL, &flags, 0);
-                if (!name && !at(T_COLON)) {
+                srcloc_t mloc = 0;
+                Type *mt = parse_declarator(base, &name, &mloc, &flags, 0);
+                if (name) {
+                    Member *mm = find_member(head, name);
+                    if (mm) {
+                        warning(mloc, "redefinition of member '%s'", atom_str(name));
+                        note(mm->loc, "previous definition of '%s' is here", atom_str(name));
+                    }
+                    if (mt->kind == TY_FUNC) {
+                        //if (at(T_LBRACE)) parse_function(s, flags);
+                        error(NULL, "member functions not supported yet");
+                    }
+                } else
+                if (!at(T_COLON)) {
                     // accept unnamed members, must be untagged aggregate type or bit-field
                     if (!(mt->kind == TY_STRUCT || mt->kind == TY_UNION) && !mt->struct_tag)
                         error(NULL, "anonymous members must be untagged struct or union definitions");
@@ -2203,7 +2278,7 @@ static Type *parse_struct(int kind) {
                 unsigned char align = mt->align;
                 if (align > st->align) st->align = align;
                 Member *m = allocz(1, sizeof(Member));
-                m->name = name; m->type = mt;
+                m->name = name; m->loc = mloc; m->type = mt;
                 if (tail) { // set padding bytes in previous element
                     unsigned off0 = off;
                     off = (off + align - 1) & ~(align - 1);
@@ -2214,11 +2289,8 @@ static Type *parse_struct(int kind) {
                 }
                 tail = m;
                 if (eat(T_COLON)) {
-                    switch (mt->kind) {
-                    case TY_VOID: case TY_PTR: case TY_ARRAY: case TY_STRUCT: case TY_UNION:
+                    if (mt->kind > TY_ENUM) {
                         error(NULL, "bitfield type must be an integer type");
-                        fallthrough;
-                    default: break;
                     }
                     m->bf_width_expr = parse_const_expr();
                 }
@@ -2254,7 +2326,7 @@ static Type *parse_enum(void) {
     if (eat(T_COLON)) {
         unsigned int flags;
         et = parse_declaration_specifiers(&flags);
-        if (et->kind >= TY_VOID) error(NULL, "invalid enum underlying type");
+        if (et->kind >= TY_ENUM) error(NULL, "invalid enum underlying type");
     }
     Type *st = tag_get(tag, TY_ENUM, loc);
     if (st->enum_type) {
@@ -2272,8 +2344,8 @@ static Type *parse_enum(void) {
         while (!at(T_RBRACE) && !at(T_EOF)) {
             srcloc_t ploc = curloc();
             atom_t name = getid();
-            Sym *s = add_sym(name, ploc, st, 0);
-            s->kind = K_ENUM;
+            Sym *s = new_sym(name, ploc, S_ENUM_VALUE, st, 0);
+            scope_add_sym(s);
             parse_attributes();
             if (eat(T_ASSIGN)) {
                 s->init = parse_const_expr();
@@ -2322,6 +2394,7 @@ static Type *parse_enum(void) {
 static Type *parse_type(void) {
     unsigned int flags;
     Type *base = parse_declaration_specifiers(&flags);
+    // XXX: should reject function types
     return parse_declarator(base, NULL, NULL, &flags, 0);
 }
 
@@ -2422,7 +2495,11 @@ static Node *parse_primary(void) {
             done_builtin:
                 n->kind = N_BUILTIN; expect(T_RP); return n;
             }
-            n->kind = N_CALL;
+            if (IS_BUILTIN(name) || (s && s->type->kind == TY_FUNC)) {
+                n->kind = N_CALL;
+            } else {
+                P--; n = new_node1(N_CALL, n);
+            }
             if (this_fn) this_fn->flags |= HAS_CALLS;
             Node **ap = &n->rhs;
             while (!at(T_RP)) {
@@ -3113,61 +3190,29 @@ static Sym *find_func(atom_t name) {
     return s && s->fn ? s : NULL;
 }
 
-static Sym *parse_function(Type *rtype, unsigned flags, atom_t name, srcloc_t loc) {
-    if (flags & HAS_TYPEDEF) error(NULL, "function typedefs not supported");
+static Sym *parse_function(Sym *s, unsigned int flags) {
+    Func *fn = s->fn = allocz(1, sizeof(Func));
+    Type *t = s->type;
+    fn->name = s->name;
+    fn->type = t;
+    fn->rtype = t->rtype;
+    fn->decl_flags = flags;
+
     frame_max = frame_pos = 0;
     Node fun = {};
-    bool has_prototype = false;
-    Func *fn;
-    Sym *s = find_func(name);
-    if (s) {
-        fn = s->fn;
-        has_prototype = true;
-        if (!same_type(fn->rtype, rtype)) {
-            warning(curloc(), "return type mismatch with '%s' function prototype", atom_str(name));
-        }
-    } else {
-        // type and flags are not correct yet
-        s = add_sym(name, loc, rtype, flags | HAS_FUNCTION);
-        s->fn = fn = allocz(1, sizeof(Func));
-        fn->name = name;
-        fn->rtype = rtype;
-        fn->decl_flags = flags;
-    }
     scope_push(&fun);
-    unsigned char np = 0;
-    bool is_variadic = false;
-    Sym **pp = &fn->params;
-    if (at(K_VOID) && peek(T_RP)) P++; // (void) -> ()
-    while (!at(T_RP)) {
-        if (eat(T_ELLIPSIS)) { is_variadic = true; break; }   // printf(char *fmt, ...)
-        if (np >= MAX_ARGS) error(NULL, "too many function arguments");
-        parse_attributes();
-        unsigned int pflags;
-        atom_t pname = 0;
-        srcloc_t ploc = curloc();
-        Type *base = parse_declaration_specifiers(&pflags);
-        Type *pt = parse_declarator(base, &pname, &loc, &pflags, IS_FUN_ARG);
-        // XXX should not recreate arglist if has_prototype
-        if (has_prototype && *pp && !same_type((*pp)->type, pt)) {
-            warning(ploc, "type mismatch with prototype on argument %d", np + 1);
-            warning((*pp)->loc, "function prototype is defined here");
-        }
-        Sym *pv = add_sym(pname, ploc, pt, pflags);
-        *pp = pv; pp = &pv->next_decl; np++;
-        if (!eat(T_COMMA)) break;
+    for (Sym *s1 = t->params; s1; s1 = s1->next_decl) {
+        // XXX check for shadowing
+        scope_add_sym(s1);
     }
-    expect(T_RP);
-    parse_attributes();
-    if (has_prototype && (fn->nparams != np || fn->is_variadic != is_variadic)) {
-        warning(curloc(), "argument count mismatch with prototype");
-        warning(fn->loc, "function prototype is defined here");
-    }
-    fn->is_variadic = is_variadic;
-    fn->nparams = np;
+
+    fn->is_variadic = t->is_variadic;
+    fn->nparams = t->np;
+    fn->params = t->params;
+
     if (at(T_LBRACE)) { // actual function definition
         if (fn->body) { error(NULL, "function '%s' already has a body", atom_str(fn->name)); }
-        fn->loc = loc;
+        fn->loc = t->loc;
         this_fn = fn;
         fn->body = parse_block();
         this_fn = NULL;
@@ -3201,27 +3246,43 @@ static Node *parse_declaration(void) {
     for (;;) {
         atom_t name = 0; srcloc_t nloc = 0;
         Type *t = parse_declarator(base, &name, &nloc, &flags, 0);
-        Sym *s = NULL;
-        if (eat(T_LP)) {
-            s = parse_function(t, flags, name, nloc);
-            if (s->fn->body) {
-                if (scope_depth) {
-                    warning(nloc, "local functions are not supported yet");
+        if (!name) { warning(curloc(), "unnamed declaration"); goto next; }
+        for (Sym *s = atom_sym(name); s; s = s->next_sym) {
+            bool is_same_type = same_type(s->type, t);
+            if (is_same_type) {
+                if (s->kind == S_TYPEDEF && (flags & HAS_TYPEDEF)) continue;
+                if ((flags & HAS_EXTERN) || t->kind == TY_FUNC
+                ||  (s->sflags & HAS_EXTERN) || s->type->kind == TY_FUNC) {
+                    continue;
                 }
+            }
+            if (s->scope_depth == scope_depth) {
+                warning(nloc, "redefinition of symbol '%s'", atom_str(name)); // this is an error
+            } else {
+                if (get_fileflags(nloc)) break;
+                warning(nloc, "symbol '%s' shadows previous definition", atom_str(name));
+            }
+            note(s->loc, "previous definition of '%s' is here", atom_str(name));
+        }
+        Sym *s = add_sym(name, nloc, t, flags);
+        if (t->kind == TY_FUNC) {  // only accept function prototype
+            if (at(T_LBRACE)) {
+                parse_function(s, flags);
+                if (scope_depth) warning(nloc, "local functions are not supported yet");
                 break;
             }
         } else {
             if (flags & (HAS_NORETURN | HAS_INLINE)) warning(loc, "inline or _Noreturn can only be applied to functions");
-            s = add_sym(name, nloc, t, flags);
             if (eat(T_ASSIGN)) {
                 Node *init = s->init = parse_init();
                 if (init->kind == N_BLOCK && t->kind == TY_ARRAY && !(t->pflags & HAS_LEN)) {
                     s->type = array_of(t->base, initializer_length(init->rhs), NULL, t->qflags, HAS_LEN);
-                    if (s->kind == K_AUTO) set_local_offset(s);
+                    if (s->kind == S_AUTO) set_local_offset(s);
                 }
             }
         }
         if (s) *tailp = s; tailp = &s->next_decl;
+    next:
         if (!eat(T_COMMA)) { expect(T_SEMI); break; }
     }
     return n;
@@ -3345,22 +3406,6 @@ static bool has_flow(Node *n) {
     //case N_EXPR:  // XXX: check for _Noreturn attribute if N_CALL
     default:        return true;
     }
-}
-
-static Member *find_member(Type *st, atom_t name, Node *n) {
-    if (st->kind == TY_PTR) st = st->base;
-    for (Member *m = st->members; m; m = m->next) {
-        if (m->name == name) return m;
-        if (!m->name) {
-            Type *mt = m->type;
-            if (mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
-                Member *mm = find_member(mt, name, NULL);
-                if (mm) return mm;
-            }
-        }
-    }
-    if (n) error(n, "struct member '%s' not found", atom_str(n->name));
-    return NULL;
 }
 
 // =====================================================================
@@ -3571,16 +3616,16 @@ static bool is_range_test(Node *lhs, Node *rhs) {
 
 static const char *make_address(char *dest, size_t size, Sym *s, unsigned offset, srcloc_t loc) {
     switch (s->kind) {
-    case 0:          if (offset) snprintf(dest, size, "[rip + %s + %u]", atom_str(s->name), offset);
-                     else        snprintf(dest, size, "[rip + %s]", atom_str(s->name));
+    case S_GLOBAL:   if (offset) snprintf(dest, size, "[rip + \"%s\" + %u]", atom_str(s->name), offset);
+                     else        snprintf(dest, size, "[rip + \"%s\"]", atom_str(s->name));
                      return dest;
-    case K_AUTO:                 snprintf(dest, size, "[rbp - %u]", s->offset - offset); return dest;
-    case K_STATIC:   if (offset) snprintf(dest, size, "[rip + %s_%u + %u]", atom_str(s->name), s->num, offset);
-                     else        snprintf(dest, size, "[rip + %s_%u]", atom_str(s->name), s->num);
+    case S_AUTO:                 snprintf(dest, size, "[rbp - %u]", s->offset - offset); return dest;
+    case S_STATIC_LOCAL: if (offset) snprintf(dest, size, "[rip + \"%s_%u\" + %u]", atom_str(s->name), s->num, offset);
+                     else        snprintf(dest, size, "[rip + \"%s_%u\"]", atom_str(s->name), s->num);
                      return dest;
-    case K_REGISTER: return reg64[s->reg];
-    case K_TYPEDEF:
-    case K_ENUM:
+    case S_REGISTER: return reg64[s->reg];
+    case S_TYPEDEF:
+    case S_ENUM_VALUE:
     default:         warning(loc, "not an lvalue"); return NULL;
     }
 }
@@ -3595,15 +3640,15 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     switch (n->kind) {
     case N_VAR: {
         Sym *s = resolve_name(n);
-        if (s->kind) emit_comment(atom_str(n->name));
+        if (s->kind != S_GLOBAL) emit_comment(atom_str(n->name));
         char buf[64]; const char *src = make_address(buf, countof(buf), s, offset, n->loc);
         switch (s->kind) {
-        case 0:
-        case K_AUTO:
-        case K_STATIC:   emit("lea %s, %s", reg64[r], src); break;
-        case K_REGISTER:
-        case K_TYPEDEF:
-        case K_ENUM:
+        case S_GLOBAL:
+        case S_AUTO:
+        case S_STATIC_LOCAL: emit("lea %s, %s", reg64[r], src); break;
+        case S_REGISTER:
+        case S_TYPEDEF:
+        case S_ENUM_VALUE:
         default:         error(n, "not an lvalue"); break;
         }
         return s->type;
@@ -3622,7 +3667,7 @@ static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     }
     case N_MEMBER: {   // &(s.field)
         Type *st = gen_addr(n->lhs, r, save_rax, offset); // reg = &struct
-        Member *m = find_member(st, n->name, n);
+        Member *m = find_struct_member(st, n->name, n);
         emit_comment(atom_str(n->name));
         if (m->offset) { emit_reg_imm("add", r, m->offset); }
         return m->type;
@@ -3641,11 +3686,12 @@ static Type *static_typeof(Node *n, Type *def) {
     case N_VAR:    { Sym *s = lookup(n->name, NULL); return s ? s->type : def; }
     case N_MEMBER: {
         Type *st = static_typeof(n->lhs, NULL); if (!st) return def;
-        Member *m = find_member(st, n->name, n);
+        Member *m = find_struct_member(st, n->name, n);
         return m ? m->type : def;
     }
     case N_DEREF:  { Type *t = static_typeof(n->lhs, NULL); return t && is_ptrish(t) ? t->base : def; } // should report error
     case N_ADDR:   { Type *t = static_typeof(n->lhs, NULL); return t ? ptr_to(t, 0) : def; }
+    case N_COMMA:  return static_typeof(n->rhs, def);
     default:       return def;
     }
 }
@@ -3917,27 +3963,30 @@ static Type *load_var(Node *n, Register r) {
     const char *reg = reg64[r];
     Sym *s = resolve_name(n);
     Type *t = s->type;
-    if (s->kind) emit_comment(atom_str(n->name));
+    if (s->kind != S_GLOBAL) emit_comment(atom_str(n->name));
     if (s->flags & CONST_VAL) { emit_mov_reg_imm(r, s->ival); return t; }
     char buf[64]; const char *src = make_address(buf, countof(buf), s, 0, n->loc);
     switch (t->kind) {
+    case TY_FUNC:
+        emit("lea %s, %s", reg, src);
+        break;
     case TY_ARRAY: case TY_STRUCT: case TY_UNION:  // arrays and structs are used by-address (decay); scalars are loaded
         switch (s->kind) {
-        case 0:
-        case K_AUTO:
-        case K_STATIC:   emit("lea %s, %s", reg, src); break;
-        case K_REGISTER: error(n, "invalid type for a register variable"); break;
-        case K_TYPEDEF:
-        case K_ENUM:
+        case S_GLOBAL:
+        case S_AUTO:
+        case S_STATIC_LOCAL: emit("lea %s, %s", reg, src); break;
+        case S_REGISTER: error(n, "invalid type for a register variable"); break;
+        case S_TYPEDEF:
+        case S_ENUM_VALUE:
         default:         break;  // error
         }
         break;
     default: {
         const char *mov = ty_is_unsigned(t) ? "movzx" : "movsx";
         switch (s->kind) {
-        case 0:
-        case K_AUTO:
-        case K_STATIC:
+        case S_GLOBAL:
+        case S_AUTO:
+        case S_STATIC_LOCAL:
             switch (ty_size(t)) {
             case 1:  emit("%s %s, byte ptr %s", mov, reg, src); break;
             case 2:  emit("%s %s, word ptr %s", mov, reg, src); break;
@@ -3946,7 +3995,7 @@ static Type *load_var(Node *n, Register r) {
             default: emit("mov %s, %s", reg, src); break;
             }
             break;
-        case K_REGISTER:
+        case S_REGISTER:
             switch (ty_size(t)) {
             case 1:  emit("%s %s, %s", mov, reg, reg8[s->reg]); break;
             case 2:  emit("%s %s, %s", mov, reg, reg16[s->reg]); break;
@@ -3955,8 +4004,8 @@ static Type *load_var(Node *n, Register r) {
             default: emit("mov %s, %s", reg, src); break;
             }
             break;
-        case K_TYPEDEF:  // error
-        case K_ENUM:     // never here, should be resolved as a constant already
+        case S_TYPEDEF:  // error
+        case S_ENUM_VALUE:  // never here, should be resolved as a constant already
         default:     break;
         }
         break;
@@ -3976,8 +4025,8 @@ static Type *store_var(Sym *s, srcloc_t loc, unsigned offset, Type *t, Register 
         warning(loc, "structure assignment not supported yet");
         break;
     default:
-        if (s->kind) emit_comment(atom_str(s->name));
-        if (s->kind == K_REGISTER) { emit("mov %s, %s", dest, reg64[r]); break; }
+        if (s->kind != S_GLOBAL) emit_comment(atom_str(s->name));
+        if (s->kind == S_REGISTER) { emit("mov %s, %s", dest, reg64[r]); break; }
         return store_mem_reg(t, dest, r);
     }
     return t;
@@ -3999,7 +4048,7 @@ static void store_var_zero(Sym *s, srcloc_t loc, unsigned offset, unsigned size)
     char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     if (!dest) return;
     if (!check_const(s, loc)) return;
-    if (s->kind == K_REGISTER) {
+    if (s->kind == S_REGISTER) {
         // should deal with offset and size
         emit_reg_reg("xor", s->reg, s->reg);
         return;
@@ -4033,8 +4082,8 @@ static Type *store_var_imm(Sym *s, srcloc_t loc, unsigned offset, Type *t, long 
     char buf[64]; const char *dest = make_address(buf, countof(buf), s, offset, loc);
     if (!dest) return t;
     if (!check_const(s, loc)) return t;
-    if (s->kind) emit_comment(atom_str(s->name));
-    if (s->kind == K_REGISTER) {
+    if (s->kind != S_GLOBAL) emit_comment(atom_str(s->name));
+    if (s->kind == S_REGISTER) {
         // should deal with offset and size?
         emit_mov_reg_imm(s->reg, val);
         return t;
@@ -4236,7 +4285,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     case N_MEMBER: {
         if (n->lhs->kind == N_DEREF) { // optimize p->member -> *((*p).member)
             Type *lt = gen_addr(n->lhs, r, save_rax, 0);
-            Member *m = find_member(lt, n->name, n);
+            Member *m = find_struct_member(lt, n->name, n);
             emit_comment(atom_str(n->name));
             Type *mt = m->type;
             if (mt->kind == TY_ARRAY || mt->kind == TY_STRUCT || mt->kind == TY_UNION) {
@@ -4477,7 +4526,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             emit_reg_imm("cmp", RAX, -4095);  // test for range [-4K+1 ... -1]
             emit_jmp(n, "jb", 1);
             emit("neg rax");
-            emit("mov [rip + errno], eax");
+            emit("mov [rip + \"errno\"], eax");
             emit("xor rax, rax");
             emit("dec rax");    // return -1 on error
             emit_label(1);
@@ -4504,17 +4553,32 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         default: break;
         }
         if (save_rax) emit("push rax");
-        // XXX: should look up symbol instead of global function to handle function pointers
-        Sym *s = find_func(n->name);
+        Type *ft = NULL;
         Func *fn = NULL;
-        if (s) {
-            fn = s->fn;
-            if (fn->nparams != n->nargs && (!fn->is_variadic || fn->nparams > n->nargs)) {
-                warning(n->loc, "argument count mismatch '%s' expects %d, got %d",
-                        atom_str(n->name), fn->nparams, n->nargs);
+        if (n->name) {
+            // XXX: should look up symbol instead of global function to handle function pointers
+            Sym *s = find_func(n->name);
+            if (s) {
+                fn = s->fn;
+                ft = s->type;
+                if (fn->nparams != n->nargs && (!fn->is_variadic || fn->nparams > n->nargs)) {
+                    warning(n->loc, "argument count mismatch '%s' expects %d, got %d",
+                            atom_str(n->name), fn->nparams, n->nargs);
+                }
+            } else
+            if (!n->lhs) {
+                warning(n->loc, "call to an undeclared function '%s'", atom_str(n->name));
             }
-        } else {
-            warning(n->loc, "call to an undeclared function '%s'", atom_str(n->name));
+        }
+        if (!fn && n->lhs) {
+            // indirect call: n->lhs should be a pointer to function
+            // XXX: should get the type to check arguments
+            Type *t = gen_expr(n->lhs, RAX, false);
+            if (t->kind == TY_PTR) ft = t->base;
+            if (!ft || ft->kind != TY_FUNC) {
+                error(n, "call expression is not a function type");
+            }
+            emit("push rax");
         }
         // XXX: should check and convert arguments according to prototype
         // XXX: here we could support default argument values
@@ -4532,10 +4596,15 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             while (i-- > 0) emit("pop %s", reg64[ARGREG[i]]);
         }
         if (!fn || fn->is_variadic) emit("xor eax, eax"); // variadic-safe; harmless otherwise
-        emit("call \"%s\"", atom_str(n->name));
+        if (!fn && n->lhs) {
+            emit("pop r11");
+            emit("call r11");
+        } else {
+            emit("call \"%s\"", atom_str(n->name));
+        }
         emit_mov_reg_reg(r, RAX);
         if (save_rax) emit("pop rax");
-        if (fn) return fn->rtype;
+        if (ft) return ft->rtype;
         warning(n->loc, "function not found '%s'", atom_str(n->name));
         return ty_long();
     }
@@ -4958,7 +5027,7 @@ static void gen_func(Func *fn) {
         // simple function: keep the arguments in appropriate registers
         unsigned i = 0;
         for (Sym *s = fn->params; s && i < 6; s = s->next_decl, i++) {
-            s->kind = K_REGISTER;
+            s->kind = S_REGISTER;
             s->reg = ARGREG1[i];
         }
         if (i == fn->nparams && fn->frame_size == i * 8) {
@@ -4976,7 +5045,7 @@ static void gen_func(Func *fn) {
     }
     unsigned int i = 0;
     for (Sym *s = fn->params; s && i < 6; s = s->next_decl, i++) {
-        if (s->kind == K_REGISTER) {
+        if (s->kind == S_REGISTER) {
             if (s->reg != ARGREG[i]) {
                 emit_comment(atom_str(s->name));
                 emit_reg_reg("mov", s->reg, ARGREG[i]);
@@ -5071,7 +5140,7 @@ static Node *get_member_initializer(Type *t, Node *n, Member *m1) {
         if (n->kind == N_DESIGNATOR) {
             if (n->cond) error(n, "unexpected array designator in struct initializer");
             if (!m || n->name != m->name) {
-                m = find_member(t, n->name, NULL);
+                m = find_struct_member(t, n->name, NULL);
             }
         }
         if (m == m1) found = n;
@@ -5088,7 +5157,7 @@ static void gen_init_struct(Type *t, Node *init, Sym *s, unsigned offset) {
             if (n->kind != N_DESIGNATOR) { e = n; m = t->members; }
             for (; n; n = n->next) {
                 if (n->kind == N_DESIGNATOR) {
-                    Member *m1 = find_member(t, n->name, NULL);
+                    Member *m1 = find_struct_member(t, n->name, NULL);
                     if (m1) { m = m1; e = n->finit; }
                 }
             }
@@ -5132,6 +5201,7 @@ static void gen_init(Type *t, atom_t name, Node *init, Member *m, Sym *s, unsign
         Value v;
         switch (t->kind) {
         case TY_VOID:
+        case TY_FUNC:
             break;
         case TY_INT: case TY_SCHAR: case TY_SHORT: case TY_LONG:
         case TY_UINT: case TY_UCHAR: case TY_USHORT: case TY_ULONG:
@@ -5219,7 +5289,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
         emit_comment("argc"); emit("mov rdi, [rsp]");
         emit_comment("argv"); emit("lea rsi, [rsp+8]");
         emit_comment("envp"); emit("lea rdx, [rsi+8*rdi+8]");
-        emit("mov environ, rdx");
+        emit("mov [rip + environ], rdx");
         emit("call main");
         emit("mov rdi, rax");
         emit("call _exit");
@@ -5228,7 +5298,7 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
 
     for (Sym *s = globals; s; s = s->next_decl) {
         Func *fn = s->fn;
-        if (fn && fn->used) gen_func(fn);
+        if (fn && fn->used && fn->body) gen_func(fn);
     }
 
     // Globals.  Hosted mode puts them in .bss (zeroed by the loader).  Kernel
@@ -5241,8 +5311,9 @@ static int emit_x86_intel(bool kernel_mode, bool libc_mode) {
     // - uninitialized data in .bss sections
     emit_section(".data", 0);
     for (Sym *s = globals; s; s = s->next_decl) {
-        if (s->kind) continue;
+        if (s->kind != S_GLOBAL) continue;
         if (s->fn) continue;
+        if (s->type->kind == TY_FUNC) continue;
         if (s->sflags & HAS_EXTERN) continue;
         if (!kernel_mode && !s->init) {
             if (s->sflags & HAS_STATIC) emit(".local %s", atom_str(s->name));

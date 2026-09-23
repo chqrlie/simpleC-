@@ -123,7 +123,7 @@ examples: test demo structs bitwise printf switch hello
 test-all: examples test-printf nano-printf nano
 
 clean:
-	rm -rf build $(BIN) *_g *_g.s *_prog *_prog.s nano*.s a.out *.dSYM
+	rm -rf build $(BIN) *_g *_g.s *_prog *_prog.s nano*.s a.out *.dSYM perf.data
 
 distclean: clean
 	rm -f $(BIN) $(BIN)_g

@@ -1,7 +1,10 @@
 # TODO list
 
 * merge upstream
-* support function pointers
+* parse calls as postfix expressions
+* flag used globals, locals and function refered only indirectly
+* check and convert function arguments according to prototype
+* split calls and builtins
 * add analysis pass:
   - late constant folding
   - automatic library fetch
@@ -31,7 +34,6 @@
 * [95%] optimize code gen for condition expressions
 * [50%] complete support for short/int/long semantics
 * [50%] complete support of unsigned semantics
-* check and convert function arguments according to prototype
 * fix bogus 2D array handling
 * accept more than 6 function arguments
 * simplify varargs API: all optional arguments on the stack
@@ -57,7 +59,6 @@
 * split long strings on `\n` in assembly, using `.ascii`
 * further reduce `Node` size, distinguish `SNode` and `ENode`?
 * [/] proper structure alignment, layout and size (mostly done)
-* support bit-field syntax
 * support bit-field semantics
 * support bit-field proper layout
 * `expect_id()`, `expect_string()`: check kind, increment `P`, return data
