@@ -457,20 +457,40 @@ int open(const char *path, int flags, ...) {
 #ifdef LIB_UNISTD_H
 #include <sys/syscall.h>
 #include <stdarg.h>
-// --- POSIX wrappers ---
+int access(const char *name, int flags) { return __syscall(SYS_access, name, flags); }
+int chdir(const char* path) { return __syscall(SYS_chdir, path); }
+int chown(const char* path, uid_t owner, gid_t group) { return __syscall(SYS_chown, path, owner, group); }
+int close(int fd) { return __syscall(SYS_close, fd); }
+int dup(int oldfd) { return __syscall(SYS_dup, oldfd); }
+int dup2(int oldfd, int newfd) { return __syscall(SYS_dup2, oldfd, newfd); }
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    return __syscall(SYS_execve, path, argv, envp);
+}
+pid_t fork(void) { return __syscall(SYS_fork); }
+char* getcwd(char *buf, size_t size) { return __syscall(SYS_getcwd, buf, size); }
+pid_t getpid(void) { return __syscall(SYS_getpid); }
+int link(const char* from, const char* to) { return __syscall(SYS_link, from, to); }
+off_t lseek(int fd, off_t offset, int whence) { return __syscall(SYS_lseek, fd, offset, whence); }
+int pipe(int* pipedes) { return __syscall(SYS_pipe, pipedes); }
 ssize_t read(int fd, void *buf, size_t len) {
     for (;;) {
         ssize_t n = __syscall(SYS_read, fd, buf, len);
         if (n >= 0 || errno != EINTR) return n;
     }
 }
+int rmdir(const char* path) { return __syscall(SYS_rmdir, path); }
+unsigned sleep(unsigned seconds) { return __syscall(SYS_sleep, seconds); }
+void sync(void) { return __syscall(SYS_sync); }
+int truncate(const char* path, off_t offset) { return __syscall(SYS_truncate, path, offset); }
+int unlink(const char* name) { return __syscall(SYS_unlink, name); }
+int usleep(useconds_t useconds) { return __syscall(SYS_usleep, useconds); }
 ssize_t write(int fd, const void *buf, size_t len) {
     for (;;) {
         ssize_t n = __syscall(SYS_write, fd, buf, len);
         if (n >= 0 || errno != EINTR) return n;
     }
 }
-int close(int fd) { return __syscall(SYS_close, fd); }
+
 int ioctl(int fd, int cmd, ...) {
     va_list ap; va_start(ap, flags);
     unsigned long arg1 = va_arg(ap, unsigned long);
@@ -479,12 +499,6 @@ int ioctl(int fd, int cmd, ...) {
     //unsigned long arg4 = va_arg(ap, unsigned long);
     va_end(ap);
     return __syscall(SYS_ioctl, fd, cmd, arg1, arg2, arg3 /*, arg4*/);
-}
-
-pid_t fork(void) { return __syscall(SYS_fork); }
-
-int execve(const char *path, char *const argv[], char *const envp[]) {
-    return __syscall(SYS_execve, path, argv, envp);
 }
 
 struct winsize {

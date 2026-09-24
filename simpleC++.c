@@ -206,8 +206,9 @@ static void *allocz(size_t nelems, size_t size) {
     if (!ptr) die("out of memory");
     return ptr;
 }
-static void *reallocate(void *ptr, size_t *nelems, size_t size, size_t min) {
-    size_t new_nelems = *nelems + (*nelems >> 1) + min; // min must be non-zero
+static void *reallocate(void *ptr, size_t *nelems, size_t size, size_t min_cap) {
+    if (!min_cap) min_cap = 16;
+    size_t new_nelems = *nelems + (*nelems >> 1) + min_cap;
 #ifndef NO_REALLOC    // use realloc if available
     void *new_ptr = realloc(ptr, new_nelems * size);
     if (!new_ptr) die("out of memory");
@@ -415,7 +416,7 @@ typedef enum TokenKind enum_type(unsigned char) {
 
     K_IF, K_ELSE, K_WHILE, K_RETURN, K_ASM, K__ASM__,
     K_FOR, K_DO, K_BREAK, K_CONTINUE, K_SIZEOF, K_COUNTOF, K__COUNTOF,
-    K_ALIGNOF, K__ALIGNOF,
+    K_ALIGNOF, K__ALIGNOF, K_GENERIC,
     K_SWITCH, K_CASE, K_DEFAULT, K_GOTO, K_STATIC_ASSERT,
 
     K_IFDEF, K_IFNDEF, K_ELIF, K_ELIFDEF, K_ELIFNDEF, K_ENDIF, K_DEFINE,
@@ -452,7 +453,7 @@ static const char * const token_name[T_count] = {
     "signed", "unsigned", "enum", "struct", "union",
     "if", "else", "while", "return", "asm", "__asm__",
     "for", "do", "break", "continue", "sizeof", "countof", "_Countof",
-    "alignof", "_Alignof",
+    "alignof", "_Alignof", "_Generic",
     "switch", "case", "default", "goto", "static_assert",
     "ifdef", "ifndef", "elif", "elifdef", "elifndef", "endif", "define",
     "undef", "include", "include_next", "line", "defined", "error",
@@ -624,10 +625,8 @@ static size_t macro_expand(const Macro *m, MacroArguments *ma, const char *p, ch
     }
 }
 
-
 static void preprocess(const char *path, bool sys, sbuf_t *sb);
 
-// XXX should use access
 static bool can_read(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return false;
@@ -1689,7 +1688,8 @@ static Member *find_struct_member(Type *st, atom_t name, Node *n) {
 // 4. AST
 // =====================================================================
 typedef enum NodeKind enum_type(unsigned char) {
-    N_NUM, N_STR, N_VAR, N_BUILTIN, N_CALL, N_ASSIGN, N_BIN, N_CMP, N_COMMA,
+    N_NUM, N_STR, N_COMP, N_VAR, N_GENERIC, N_BUILTIN, N_CALL,
+    N_ASSIGN, N_BIN, N_CMP, N_COMMA,
     N_UNARY, N_POST, N_PRE, N_CAST, N_DEREF, N_ADDR, N_LOGAND, N_LOGOR,
     N_MEMBER, N_SIZEOF, N_TERNARY, N_EMPTY, N_BLOCK, N_DECL, N_EXPR,
     N_IF, N_WHILE, N_FOR, N_DOWHILE, N_SWITCH, N_CASE, N_DEFAULT, N_LABEL,
@@ -1720,10 +1720,10 @@ struct Node {
     };
     union {
         atom_t str;         // N_STR, N_ASM decoded text
-        atom_t name;        // N_VAR / N_BUILTIN / N_CALL / N_MEMBER
+        atom_t name;        // N_VAR / N_COMP / N_BUILTIN / N_CALL / N_MEMBER
     };
     union {
-        int offset;         // N_VAR (stack pos)
+        int offset;         // N_VAR / N_COMP (stack pos)
         unsigned scope_len; // N_BLOCK, N_FOR (initial scope_len)
     };
     union {
@@ -1734,8 +1734,8 @@ struct Node {
     Node *rhs;              // binary E-nodes, N_IF, N_WHILE, N_FOR, N_DOWHILE, N_LABEL list
     union {
         Node *cond;         // ternary E-nodes, N_IF, N_FOR, N_DOWHILE, N_SWITCH, N_CASE
-        Type *type_arg;     // N_SIZEOF, N_BUILTIN (va_arg)
-        Sym *decl;          // N_VAR
+        Type *type_arg;     // N_SIZEOF, N_BUILTIN (va_arg), N_GENERIC, N_CASE, N_COMP
+        Sym *decl;          // N_VAR, N_COMP
     };
     Node *next;
 };
@@ -1802,6 +1802,7 @@ static size_t scope_cap;
 static unsigned scope_len;
 static unsigned char scope_depth;
 static unsigned int static_num;
+static unsigned int compound_num;
 
 static Sym *sym_link(Sym *s) {
     s->next_sym = atom_sym(s->name);
@@ -2442,9 +2443,30 @@ static Node *check_const_logical(Node *n) {
     return n;
 }
 
-//static Node *parse_generic(void) {
-//    // static Node *parse_primary(void) {
-//}
+// _generic-selection_: `_Generic` `(` _generic-controlling-operand_, _generic-assoc-list_ `)`
+// _generic-controlling-operand_: _assignment-expression_ | _type-name_
+// _generic-assoc-list_: _generic-association_ | _generic-assoc-list_ `,` _generic-association_
+// _generic-association_: _type-name_ `:` _assignment-expression_ | `default` `:` _assignment-expression_
+static Node *parse_generic(void) {
+    Node *n = new_node(N_GENERIC);
+    expect(T_LP);
+    if (is_type_start(P)) n->type_arg = parse_type();
+    else n->lhs = parse_assign();
+    expect(T_COMMA);
+    Node **tailp = &n->rhs;
+    for (;;) {
+        Node *n1; Type *t = NULL;
+        if (!eat(K_DEFAULT)) t = parse_type();
+        if (!at(T_COLON)) expect(T_COLON);
+        n1 = new_node(N_CASE);
+        n1->type_arg = t;
+        n1->rhs = parse_assign();
+        *tailp = n1; tailp = &n1->next;
+        if (!eat(T_COMMA)) break;
+    }
+    expect(T_RP);
+    return n;
+}
 
 static Node *parse_primary(void) {
     switch (cur()) {
@@ -2475,9 +2497,10 @@ static Node *parse_primary(void) {
     }
     case T_LP: {
         P++; Node *n = parse_expr(); expect(T_RP);
-        n->flags |= HAS_PAREN; return n;
+        n->flags |= HAS_PAREN;
+        return n;
     }
-    //case K_GENERIC: error(NULL, "_Generic selection not supported");
+    case K_GENERIC: return parse_generic();
     default:
         error(NULL, "expected expression, got '%s'", token_str(P)); return 0;
     }
@@ -2486,6 +2509,7 @@ static Node *parse_primary(void) {
 // postfix: primary ( [expr] | ++ | -- )*
 static Node *parse_postfix(void) {
     Node *n = parse_primary();
+    if (n->kind == N_COMP) return n;
     for (;;) {
         switch (cur()) {
         case T_LBRK:              // a[i]  ->  *(a + i)
@@ -2559,7 +2583,6 @@ static Node *parse_postfix(void) {
         case T_INC: case T_DEC:
             n = new_node1(N_POST, n);
             break;
-        // case T_LP: check for compound literal
         default:
             return n;
         }
@@ -2616,8 +2639,17 @@ static Node *parse_unary(bool accept_cast) {
     case T_LP:
         if (accept_cast && is_type_start(P+1)) {
             n = new_node(N_CAST);
-            n->type = parse_type();
+            n->type = parse_type(); // XXX: should get sflags too
             expect(T_RP);
+            if (at(T_LBRACE)) { // compound literal
+                char buf[32];
+                snprintf(buf, countof(buf), "_cp_%u", compound_num++);
+                n->name = new_atom(buf);
+                n->kind = N_COMP; // same layout as N_VAR
+                n->decl = add_sym(n->name, n->loc, n->type, 0);
+                n->lhs = parse_init();
+                return n;
+            }
             n->lhs = parse_cast_expression();
             return check_const_unary(n);
         }
@@ -2983,13 +3015,15 @@ static Node *parse_stmt(void) {
 
 // 5.1 Constant expression evaluator
 
-static Sym *resolve_name(Node *n) {
+static Sym *resolve_var(Node *n) {
     Sym *s = n->decl;
     if (!s) {
         n->decl = s = lookup(n->name, n);
-        n->flags |= s->flags & CONST_VAL;
-        n->ival |= s->ival;
         n->type = s->type;
+        if (s->flags & CONST_VAL) { // enum constant
+            n->flags |= CONST_VAL;
+            n->ival = s->ival;
+        }
     }
     return s;
 }
@@ -3003,7 +3037,7 @@ static bool eval_expr(Node *n, Value *vp) {
         break;
     //case N_NUM: value_init(&v1, n->type, n->ival); break; // always has CONST_VAL
     case N_VAR: {
-        Sym *s = resolve_name(n);
+        Sym *s = resolve_var(n);
         // const qualified variables should be accepted too
         if (!(s->flags & CONST_VAL)) return false;
 #if 0 // XXX: done at parse time for now and should be done at analysis time otherwise
@@ -3372,7 +3406,7 @@ static void check_used(Node *n) {
         check_used(s->init);
         return;
     }
-    case N_UNARY: case N_POST: case N_PRE: case N_CAST:
+    case N_UNARY: case N_POST: case N_PRE: case N_CAST: case N_COMP:
     case N_DEREF: case N_ADDR: case N_EXPR: case N_MEMBER: case N_RETURN:
         check_used(n->lhs); return;
     case N_ASSIGN: case N_BIN: case N_CMP: case N_COMMA: case N_LOGAND: case N_LOGOR: case N_BUILTIN:
@@ -3646,11 +3680,41 @@ static bool check_const(Sym *s, srcloc_t loc) {
     return true;
 }
 
+static void gen_string_def(atom_t a) {
+    char buf[8192];
+    encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
+    int col = fprintf(fout, ".LC%u:", atom_id(a));
+    emit_indent(col, 8);
+    fprintf(fout, ".string %s\n", buf);
+}
+
+static Type *load_string(Node *n, Register r) {
+    atom_t a = n->str;
+    if (out_comments) {
+        char buf[37];
+        size_t len = encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
+        if (len > 32) pstrcpy(buf + 32, countof(buf) - 32, "...\"");
+        emit_comment(buf);
+    }
+    emit("lea %s, [rip + .LC%u]", reg64[r], atom_id(a));
+    atom_flags(a) |= ATOM_USED;
+    return n->type;
+}
+
+static void gen_comp_init(Node *n) {
+    Sym *s = n->decl;
+    gen_init(s->type, s->name, n->lhs, NULL, s, 0);
+}
+
 // leave the ADDRESS of an lvalue node in reg, return the lvalue type
 static Type *gen_addr(Node *n, Register r, bool save_rax, unsigned offset) {
     switch (n->kind) {
+    case N_STR: return load_string(n, r);
+    case N_COMP:
+        gen_comp_init(n);
+        fallthrough;
     case N_VAR: {
-        Sym *s = resolve_name(n);
+        Sym *s = resolve_var(n);
         if (s->kind != S_GLOBAL) emit_comment(atom_str(n->name));
         char buf[64]; const char *src = make_address(buf, countof(buf), s, offset, n->loc);
         switch (s->kind) {
@@ -3693,6 +3757,7 @@ static Type *static_typeof(Node *n, Type *def) {
     switch (n->kind) {
     case N_NUM:    return n->type ? n->type : def;
     case N_STR:    return array_of(qualified_type(ty_char(), HAS_CONST), atom_len(n->str) + 1, NULL, 0, HAS_LEN);
+    case N_COMP:
     case N_CAST:   return n->type;
     case N_VAR:    { Sym *s = lookup(n->name, NULL); return s ? s->type : def; }
     case N_MEMBER: {
@@ -3705,27 +3770,6 @@ static Type *static_typeof(Node *n, Type *def) {
     case N_COMMA:  return static_typeof(n->rhs, def);
     default:       return def;
     }
-}
-
-static void gen_string_def(atom_t a) {
-    char buf[8192];
-    encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
-    int col = fprintf(fout, ".LC%u:", atom_id(a));
-    emit_indent(col, 8);
-    fprintf(fout, ".string %s\n", buf);
-}
-
-static Type *load_string(Node *n, Register r) {
-    atom_t a = n->str;
-    if (out_comments) {
-        char buf[37];
-        size_t len = encode_string(buf, countof(buf), atom_str(a), atom_len(a), '"');
-        if (len > 32) pstrcpy(buf + 32, countof(buf) - 32, "...\"");
-        emit_comment(buf);
-    }
-    emit("lea %s, [rip + .LC%u]", reg64[r], atom_id(a));
-    atom_flags(a) |= ATOM_USED;
-    return n->type;
 }
 
 static void emit_imul_imm(Register r, long val) {
@@ -3972,7 +4016,7 @@ static Type *gen_bin_imm(Node *n, TokenKind op, Type *lt, Register r, bool save_
 
 static Type *load_var(Node *n, Register r) {
     const char *reg = reg64[r];
-    Sym *s = resolve_name(n);
+    Sym *s = resolve_var(n);
     Type *t = s->type;
     if (s->kind != S_GLOBAL) emit_comment(atom_str(n->name));
     if (s->flags & CONST_VAL) { emit_mov_reg_imm(r, s->ival); return t; }
@@ -4292,6 +4336,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
     has_num:
     case N_NUM:  emit_mov_reg_imm(r, n->ival); return n->type ? n->type : ty_long();
     case N_STR:  return load_string(n, r);
+    case N_COMP: gen_comp_init(n); fallthrough;
     case N_VAR:  return load_var(n, r);
     case N_MEMBER: {
         if (n->lhs->kind == N_DEREF) { // optimize p->member -> *((*p).member)
@@ -4331,7 +4376,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         Type *lt; Node *lhs = n->lhs;
         if (n->op == T_ASSIGN) {
             if (lhs->kind == N_VAR) {
-                Sym *s = resolve_name(lhs);
+                Sym *s = resolve_var(lhs);
                 lt = s->type;
                 if ((n->flags & DISCARD) && (n->rhs->flags & CONST_VAL)) {
                     store_var_imm(s, n->loc, 0, lt, n->rhs->ival);
@@ -4386,7 +4431,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
         Node *lhs = n->lhs;
         char buf[64]; const char *dest = "[rdx]";
         if (lhs->kind == N_VAR) {
-            Sym *s = resolve_name(lhs);
+            Sym *s = resolve_var(lhs);
             Type *lt = s->type;
             dest = make_address(buf, countof(buf), s, 0, n->loc);
             if (!dest) return lt;
@@ -4457,7 +4502,7 @@ static Type *gen_expr(Node *n, Register r, bool save_rax) {
             }
             emit_comment("va_start");
             if (lhs->kind == N_VAR) {
-                Sym *s = resolve_name(lhs);
+                Sym *s = resolve_var(lhs);
                 emit("lea %s, [rbp - %u]", reg, this_fn->va_off);
                 store_var(s, n->loc, 0, s->type, r);
                 return ty_void();
@@ -5432,11 +5477,14 @@ static bool add_path(char *buf, size_t size, const char *path) {
     return len < size;
 }
 
-static const char **input_files;
-static size_t input_len, input_cap;
-static bool add_file(const char *path) {
-    if (input_len >= input_cap) input_files = reallocate(input_files, &input_cap, sizeof(*input_files), 4);
-    input_files[input_len++] = path;
+typedef struct StringVector {
+    const char **arr;
+    size_t len, cap, min_cap;
+} StringVector;
+
+static bool add_string(StringVector *sp, const char *s) {
+    if (sp->len >= sp->cap) sp->arr = reallocate(sp->arr, &sp->cap, sizeof(*sp->arr), sp->min_cap);
+    sp->arr[sp->len++] = s;
     return true;
 }
 
@@ -5449,6 +5497,7 @@ int main(int argc, char *argv[], char *envp[]) {
     unsigned long times[6], *tp = times;
     *tp = now();
     strcpy(include_path, "lib");   // should find nano_cc directory
+    StringVector files = { NULL, 0, 0, 4 };
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
         if      (!strcmp(arg, "--help")) usage(true);
@@ -5476,19 +5525,19 @@ int main(int argc, char *argv[], char *envp[]) {
             outpath = argv[++i];
         } else if (!strcmp(arg, "--verbose") || !strcmp(arg, "-v")) verbose = true;
         else if (*arg == '-' && arg[1]) arg_error("invalid option: ", arg);
-        else add_file(arg);
+        else add_string(&files, arg);
     }
-    if (!input_len) arg_error("no input files", "");
-    const char *inpath = input_files[0];
+    if (!files.len) arg_error("no input files", "");
+    const char *inpath = files.arr[0];
 
     for (;;) {
         lex_init();
         create_builtin_macros();
 
         sbuf_t src[1]; sbuf_init(src, 128 * 1024);
-        for (size_t i = 0; i < input_len; i++) {
+        for (size_t i = 0; i < files.len; i++) {
             // XXX: should separate static globals
-            preprocess(input_files[i], false, src);
+            preprocess(files.arr[i], false, src);
         }
         *++tp = now();
         if (stage <= 2) {

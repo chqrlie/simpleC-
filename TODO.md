@@ -1,7 +1,7 @@
 # TODO list
 
+* `bool` type and semantics, `true` and `false` predefined constants
 * merge upstream
-* parse calls as postfix expressions
 * flag used globals, locals and function refered only indirectly
 * check and convert function arguments according to prototype
 * split calls and builtins
@@ -38,7 +38,6 @@
 * accept more than 6 function arguments
 * simplify varargs API: all optional arguments on the stack
 * add builtins for `memcpy`, `memset`, `strcpy`, `strlen`
-* compound literals
 * fix unstructured initializers
 * fix complex designated initializers
 * structure assignment
@@ -98,12 +97,9 @@ for (int i = 0; i < len; i++) hash = __builtin_rotate_left(hash, 5) + (str[i] & 
 * += should not push previous value
 * support `\uxxxx`, `\Uxxxxxxxx`, `\u{x+}`, `\U{x+}`,
   `\x{x+}`, `\o{o+}` in strings and character constants
-* `bool` type, `true` and `false` predefined constants
 * `nullptr_t` type and `nullptr` predefined constant
 # C grammar
 * support `offsetof`, `__builtin_offsetof`, `containerof`?
-* support _generic-selection_ (a _primary-expression_)
-* support _compound-literal_ (a _postfix-expression_)
 * parse _call-expression_ as a _postfix-expression_
 * parse _alignment-specifier_:
   - `alignas` `(` _type-name_ `)`
