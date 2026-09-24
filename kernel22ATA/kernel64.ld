@@ -6,5 +6,9 @@ SECTIONS {
     .rodata : { *(.rodata) }
     .data   : { *(.data) }
     .bss    : { *(.bss) *(COMMON) }
+    /* Where the kernel image ends, so the frame allocator knows which physical
+       memory is already spoken for. */
+    . = ALIGN(4096);
+    _kernel_end = .;
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame) }
 }

@@ -11,7 +11,7 @@
  */
 .code64
 
-# placed first by the linker script so its address is exactly 0x101000 
+/* placed first by the linker script so its address is exactly 0x101000 */
 .section .text.entry, "ax"
 .globl long_mode_start
 long_mode_start:
@@ -21,7 +21,7 @@ long_mode_start:
     mov %ax, %ss
     mov %ax, %fs
     mov %ax, %gs
-    mov $0x90000, %rsp          # stack in free low RAM 
+    mov $0x90000, %rsp          /* stack in free low RAM */
 
     call main
 .halt:
@@ -29,7 +29,7 @@ long_mode_start:
     jmp .halt
 
 .section .text
-# int  inb(int port)          SysV: port in edi, return in eax 
+/* int  inb(int port)          SysV: port in edi, return in eax */
 .globl inb
 inb:
     mov %edi, %edx
@@ -37,7 +37,7 @@ inb:
     in  %dx, %al
     ret
 
-# void outb(int port, int val) SysV: port in edi, value in esi 
+/* void outb(int port, int val) SysV: port in edi, value in esi */
 .globl outb
 outb:
     mov %edi, %edx
@@ -50,7 +50,7 @@ outb:
  * ports; doing either a byte at a time does not work, because the device sees
  * one access, not two halves of one. */
 
-# int inw(int port) 
+/* int inw(int port) */
 .globl inw
 inw:
     mov %edi, %edx
@@ -58,7 +58,7 @@ inw:
     in  %dx, %ax
     ret
 
-# void outw(int port, int val) 
+/* void outw(int port, int val) */
 .globl outw
 outw:
     mov %edi, %edx
@@ -75,7 +75,7 @@ inl:
     in  %dx, %eax
     ret
 
-# void outl(int port, long val) 
+/* void outl(int port, long val) */
 .globl outl
 outl:
     mov %edi, %edx
@@ -93,7 +93,7 @@ mmio_write32:
     mov %eax, (%rdi)
     ret
 
-# long mmio_read32(long addr) 
+/* long mmio_read32(long addr) */
 .globl mmio_read32
 mmio_read32:
     xor %eax, %eax
@@ -185,7 +185,7 @@ kernel_end_addr:
 .globl multiboot_info_addr
 multiboot_info_addr:
     mov $0x7000, %rax
-    mov (%rax), %eax            # zero-extends: it is a 32-bit address 
+    mov (%rax), %eax            /* zero-extends: it is a 32-bit address */
     ret
 
 /* void tlb_invlpg(long virt) — drop one page's cached translation.
@@ -200,7 +200,7 @@ tlb_invlpg:
     invlpg (%rdi)
     ret
 
-# void tlb_flush(void) — reload CR3, dropping every non-global entry. 
+/* void tlb_flush(void) — reload CR3, dropping every non-global entry. */
 .globl tlb_flush
 tlb_flush:
     mov %cr3, %rax
@@ -263,18 +263,18 @@ enable_write_protect:
  * of failing, and its EDX would be read as if it meant something. */
 .globl enable_nx
 enable_nx:
-    push %rbx                   # cpuid clobbers it, and it is callee-saved 
+    push %rbx                   /* cpuid clobbers it, and it is callee-saved */
     mov $0x80000000, %eax
     cpuid
     cmp $0x80000001, %eax
-    jb .Lno_nx                  # the leaf that reports NX does not exist 
+    jb .Lno_nx                  /* the leaf that reports NX does not exist */
     mov $0x80000001, %eax
     cpuid
-    test $(1 << 20), %edx       # EDX.NX 
+    test $(1 << 20), %edx       /* EDX.NX */
     jz .Lno_nx
-    mov $0xC0000080, %ecx       # IA32_EFER 
+    mov $0xC0000080, %ecx       /* IA32_EFER */
     rdmsr
-    or $(1 << 11), %eax         # NXE 
+    or $(1 << 11), %eax         /* NXE */
     wrmsr
     mov $1, %rax
     pop %rbx

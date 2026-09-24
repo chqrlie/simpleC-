@@ -12,6 +12,20 @@
 extern int  inb(int port);
 extern void outb(int port, int val);
 
+// ---------- reading physical memory a field at a time ----------
+// Everything below 4 GiB is identity-mapped, so a physical address can be
+// dereferenced directly. These exist because nano_cc has no 16- or 32-bit
+// integer type: firmware tables are laid out in 1, 2, 4 and 8-byte fields and
+// the only way to read them correctly is a byte at a time.
+long mem8(long addr) {
+    char *p;
+    p = (char *)addr;
+    return p[0] & 255;
+}
+long mem16(long addr) { return mem8(addr) | (mem8(addr + 1) << 8); }
+long mem32(long addr) { return mem16(addr) | (mem16(addr + 2) << 16); }
+long mem64(long addr) { return mem32(addr) | (mem32(addr + 4) << 32); }
+
 // ---------- VGA text mode: 80x25 cells at physical 0xB8000 ----------
 int vga_row;
 int vga_col;
@@ -64,10 +78,25 @@ void serial_put(int c) {
 }
 
 // ---------- combined character / string output ----------
+//
+// Where the characters go depends on whether a framebuffer console exists.
+// Include nano-fb.h BEFORE this file and text goes to the framebuffer; include
+// this file alone and it goes to VGA text mode at 0xB8000. The test for that
+// is the include guard, so the order matters and is checked at compile time
+// rather than producing a link error.
+//
+// The serial mirror is unconditional either way, because that is what the
+// headless tests read.
+int g_have_fb;      // set to 1 once a framebuffer console is up
+
 void putc(int c) {
     if (c == '\n') serial_put('\r');     // CR so serial terminals advance
     serial_put(c);
+#ifdef NANO_FB_H
+    if (g_have_fb) fb_putc(c); else vga_put(c);
+#else
     vga_put(c);
+#endif
 }
 
 void puts(char *s) {
@@ -82,6 +111,67 @@ void print_int(long n) {
     i = 0;
     while (n > 0) { buf[i] = '0' + (n % 10); i = i + 1; n = n / 10; }
     while (i > 0) { i = i - 1; putc(buf[i]); }
+}
+
+// The handful of string and memory routines the kernel needs. nano-base.h has
+// the same set for the hosted side; they are duplicated rather than shared
+// because that file also drags in Linux syscalls, which mean nothing here.
+long strlen(char *s) { long n; n = 0; while (s[n]) n = n + 1; return n; }
+
+void *memcpy(void *d, void *s, long n) {
+    char *a; char *b;
+    a = (char *)d; b = (char *)s;
+    while (n > 0) { *a = *b; a = a + 1; b = b + 1; n = n - 1; }
+    return d;
+}
+
+// Overlap-safe, unlike memcpy. The filesystem shuffles directory entries
+// within one block, which is exactly the overlapping case.
+void *memmove(void *d, void *s, long n) {
+    char *a; char *b;
+    a = (char *)d; b = (char *)s;
+    if (a == b || n <= 0) return d;
+    if (a < b) { while (n > 0) { *a = *b; a = a + 1; b = b + 1; n = n - 1; } return d; }
+    a = a + n; b = b + n;
+    while (n > 0) { a = a - 1; b = b - 1; *a = *b; n = n - 1; }
+    return d;
+}
+
+void *memset(void *d, int c, long n) {
+    char *a;
+    a = (char *)d;
+    while (n > 0) { *a = (char)c; a = a + 1; n = n - 1; }
+    return d;
+}
+
+int memcmp(void *p, void *q, long n) {
+    char *a; char *b;
+    a = (char *)p; b = (char *)q;
+    while (n > 0) {
+        int d;
+        d = (*a & 255) - (*b & 255);
+        if (d) return d;
+        a = a + 1; b = b + 1; n = n - 1;
+    }
+    return 0;
+}
+
+char *strcpy(char *d, char *s) {
+    char *r;
+    r = d;
+    while (*s) { *d = *s; d = d + 1; s = s + 1; }
+    *d = 0;
+    return r;
+}
+
+int strncmp(char *a, char *b, long n) {
+    while (n > 0) {
+        int d;
+        d = (*a & 255) - (*b & 255);
+        if (d || !*a) return d;
+        a = a + 1; b = b + 1; n = n - 1;
+    }
+    return 0;
 }
 
 int strcmp(char *a, char *b) {
@@ -104,7 +194,14 @@ void _put_uint(long n, int base) {
     while (i > 0) { i = i - 1; putc(buf[i]); }
 }
 
-// printf straight to the VGA screen (and serial mirror).  %d %x %c %s %%.
+// printf straight to the framebuffer or VGA screen (and the serial mirror).
+//
+// %d %x %c %s and %% ONLY -- no flags, no field width, no precision. Writing
+// "%-9s" here does not pad, it prints "%-9s" literally and then reads the NEXT
+// argument for the following conversion, so every column after it is one
+// argument out. If you want columns, pad them yourself. nano-libc.h has the
+// full formatter; this one is deliberately small because it is what the kernel
+// uses before there is a heap.
 void printf(char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -138,9 +235,17 @@ void printf(char *fmt, ...) {
 // ---------- PS/2 keyboard ----------
 // US-QWERTY scancode set 1 -> ASCII, built once into a .bss table.
 char g_keymap[128];
+char g_shiftmap[128];
+long g_shift_down;
+
+// Scancodes for the two shift keys. A press is the code; a release is the same
+// code with bit 7 set, which is how the driver knows shift went back up.
+#define SC_LSHIFT 0x2A
+#define SC_RSHIFT 0x36
 
 void kbd_init() {
     int i;
+    g_shift_down = 0;
     i = 0;
     while (i < 128) { g_keymap[i] = 0; i = i + 1; }
     g_keymap[0x02] = '1'; g_keymap[0x03] = '2'; g_keymap[0x04] = '3';
@@ -160,6 +265,38 @@ void kbd_init() {
     g_keymap[0x39] = ' ';       // space
     g_keymap[0x1C] = '\n';      // enter
     g_keymap[0x0E] = '\b';      // backspace
+
+    // Punctuation. Without these a shell cannot type a path: `/` alone makes
+    // the difference between a usable prompt and one that can only name things
+    // in the current directory.
+    g_keymap[0x0C] = '-'; g_keymap[0x0D] = '=';
+    g_keymap[0x1A] = '['; g_keymap[0x1B] = ']';
+    g_keymap[0x27] = ';'; g_keymap[0x28] = '\'';
+    g_keymap[0x29] = '`'; g_keymap[0x2B] = '\\';
+    g_keymap[0x33] = ','; g_keymap[0x34] = '.';
+    g_keymap[0x35] = '/'; g_keymap[0x0F] = ' ';    // tab behaves as a space
+
+    // The shifted table. Built here rather than by adding 32 to a letter,
+    // because the symbol row does not follow that rule at all.
+    i = 0;
+    while (i < 128) { g_shiftmap[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < 128) {
+        char c;
+        c = g_keymap[i];
+        if (c >= 'a' && c <= 'z') g_shiftmap[i] = c - 32;
+        else g_shiftmap[i] = c;
+        i = i + 1;
+    }
+    g_shiftmap[0x02] = '!'; g_shiftmap[0x03] = '@'; g_shiftmap[0x04] = '#';
+    g_shiftmap[0x05] = '$'; g_shiftmap[0x06] = '%'; g_shiftmap[0x07] = '^';
+    g_shiftmap[0x08] = '&'; g_shiftmap[0x09] = '*'; g_shiftmap[0x0A] = '(';
+    g_shiftmap[0x0B] = ')'; g_shiftmap[0x0C] = '_'; g_shiftmap[0x0D] = '+';
+    g_shiftmap[0x1A] = '{'; g_shiftmap[0x1B] = '}';
+    g_shiftmap[0x27] = ':'; g_shiftmap[0x28] = '"';
+    g_shiftmap[0x29] = '~'; g_shiftmap[0x2B] = '|';
+    g_shiftmap[0x33] = '<'; g_shiftmap[0x34] = '>';
+    g_shiftmap[0x35] = '?';
 }
 
 // Block until a key is pressed; return its ASCII value.  A genuine hardware
@@ -171,9 +308,11 @@ char keyboard_getchar() {
     for (;;) {
         while ((inb(0x64) & 1) == 0) { }    // wait for a byte
         sc = inb(0x60);
+        if (sc == SC_LSHIFT || sc == SC_RSHIFT) { g_shift_down = 1; continue; }
+        if (sc == (SC_LSHIFT | 128) || sc == (SC_RSHIFT | 128)) { g_shift_down = 0; continue; }
         if (sc < 128) {                     // press (not release)
             char ch;
-            ch = g_keymap[sc];
+            ch = g_shift_down ? g_shiftmap[sc] : g_keymap[sc];
             if (ch != 0) return ch;
         }
     }

@@ -1332,12 +1332,17 @@ long gears_pair_us(long mode) {
         // B: the same frame with one stage removed -- or, for mode 4, the
         // same frame drawn the other way, which is the only comparison in
         // here where BOTH sides produce a picture and the pictures match.
-        if (mode == 4) { }
+        if (mode == 4 || mode == 5) { }
         else if (mode == 0) { save = g_gl.lighting; g_gl.lighting = 0; }
         else if (mode == 1) { save = g_gl.wire; g_gl.wire = 1; }
         else if (mode == 2) { save = g_gl.xformonly; g_gl.xformonly = 1; }
         else if (mode == 3) { save = g_gl.twodiv; g_gl.twodiv = 1; }
         if (mode == 4) draw_frame_vbo(ang);
+        else if (mode == 5) {
+            save = g_buf_nocache; g_buf_nocache = 1;
+            draw_frame_vbo(ang);
+            g_buf_nocache = save;
+        }
         else draw_frame(ang);
         if (mode == 0) g_gl.lighting = save;
         else if (mode == 1) g_gl.wire = save;
@@ -1425,6 +1430,8 @@ void frame_cost_report() {
     long div_d;
     long fa4;
     long vbo_t;
+    long fa5;
+    long nocache_t;
 
     draw_frame(0);
     gl_flush(&g_gl);
@@ -1466,6 +1473,9 @@ void frame_cost_report() {
     fa3 = gears_pair_us(3); div_d = g_ab - fa3;
     // Display lists against vertex buffers, same picture both sides.
     fa4 = gears_pair_us(4); vbo_t = g_ab;
+    // The same vertex-buffer frame with the cache forced off, so what the
+    // cache is worth is a measurement and not an argument.
+    fa5 = gears_pair_us(5); nocache_t = g_ab;
     frame = fa2;
 
     // The same frame with the lighting turned off. Not a proposal to turn it
@@ -1527,6 +1537,7 @@ void frame_cost_report() {
     printf("  display lists %d us vs vertex buffers %d us, saving %d us (%d%%)\n",
            fa4, vbo_t, fa4 - vbo_t,
            fa4 > 0 ? ((fa4 - vbo_t) * 100) / fa4 : 0);
+    printf("  vertex buffers with the cache OFF: %d us\n", nocache_t);
     dv = list_distinct_verts(g_gear1, &dsub);
     printf("  gear 1 list: %d vertex commands, %d distinct positions\n", dsub, dv);
 }
@@ -1634,8 +1645,8 @@ int main() {
     run_tests();
 
     test_vbo_gears();
-   // if (acpi_pm_tmr) frame_cost_report();
-   // puts("gears running; the machine is now interactive\n");
+    if (acpi_pm_tmr) frame_cost_report();
+    puts("gears running; the machine is now interactive\n");
     spin_forever();
     return 0;
 }

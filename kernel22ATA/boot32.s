@@ -12,8 +12,8 @@
 
 .set PML4, 0x1000
 .set PDPT, 0x2000
-.set PD,   0x3000          # four consecutive PDs: 0x3000..0x6fff 
-.set MBINFO, 0x7000        # where we park the Multiboot info pointer 
+.set PD,   0x3000          /* four consecutive PDs: 0x3000..0x6fff */
+.set MBINFO, 0x7000        /* where we park the Multiboot info pointer */
 .set KERNEL64, 0x101000
 
 .section .multiboot, "a"
@@ -65,10 +65,10 @@ _start:
        must be zero or the CPU will follow garbage) */
     xor %eax, %eax
     mov $PML4, %edi
-    mov $1024, %ecx         # 2 pages * 512 dwords 
+    mov $1024, %ecx         /* 2 pages * 512 dwords */
     rep stosl
 
-    # PML4[0] = PDPT | present|write 
+    /* PML4[0] = PDPT | present|write */
     movl $(PDPT | 0x3), PML4
 
     /* PDPT[0..3] -> four page directories, i.e. identity-map the first FOUR
@@ -86,7 +86,7 @@ _start:
     or  $0x3, %ebx
     mov %ebx, (%edi)
     movl $0, 4(%edi)
-    add $0x1000, %eax       # next page directory 
+    add $0x1000, %eax       /* next page directory */
     add $8, %edi
     inc %ecx
     cmp $4, %ecx
@@ -98,33 +98,33 @@ _start:
     mov $PD, %edi
 .fill_pd:
     mov %ecx, %eax
-    shl $21, %eax           # low 32 bits of i * 2 MiB 
+    shl $21, %eax           /* low 32 bits of i * 2 MiB */
     or  $0x83, %eax
     mov %eax, (%edi)
     mov %ecx, %eax
-    shr $11, %eax           # high 32 bits: i * 2 MiB >> 32 
+    shr $11, %eax           /* high 32 bits: i * 2 MiB >> 32 */
     mov %eax, 4(%edi)
     add $8, %edi
     inc %ecx
     cmp $2048, %ecx
     jne .fill_pd
 
-    # CR3 = PML4 
+    /* CR3 = PML4 */
     mov $PML4, %eax
     mov %eax, %cr3
 
-    # CR4.PAE = 1 
+    /* CR4.PAE = 1 */
     mov %cr4, %eax
     or  $(1 << 5), %eax
     mov %eax, %cr4
 
-    # EFER.LME = 1 
+    /* EFER.LME = 1 */
     mov $0xC0000080, %ecx
     rdmsr
     or  $(1 << 8), %eax
     wrmsr
 
-    # CR0.PG = 1 (also keep PE) 
+    /* CR0.PG = 1 (also keep PE) */
     mov %cr0, %eax
     or  $(1 << 31), %eax
     mov %eax, %cr0
@@ -136,8 +136,8 @@ _start:
 .align 8
 gdt64:
     .quad 0
-    .quad 0x00AF9A000000FFFF    # 0x08: 64-bit code, L=1 
-    .quad 0x00AF92000000FFFF    # 0x10: data 
+    .quad 0x00AF9A000000FFFF    /* 0x08: 64-bit code, L=1 */
+    .quad 0x00AF92000000FFFF    /* 0x10: data */
 gdt64_pointer:
     .word gdt64_pointer - gdt64 - 1
     .long gdt64

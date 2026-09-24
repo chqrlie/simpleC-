@@ -61,16 +61,16 @@ shell.s: shell.c nano-kernel.h $(NANO)
 
 # 2) assemble + link the 64-bit kernel at 0x101000 (long_mode_start first)
 kernel64.bin: boot64.s shell.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c shell.s  -o shell.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o kernel64.elf boot64.o shell.o
+	as --64 boot64.s -o boot64.o
+	as --64 shell.s  -o shell.o
+	ld -T kernel64.ld -o kernel64.elf boot64.o shell.o
 	objcopy -O binary kernel64.elf kernel64.bin
 
 # 3) wrap it in a 32-bit Multiboot stub QEMU can load
 kernel.elf: boot32.s blob.s kernel64.bin final.ld
-	as -arch x86 boot32.s -o boot32.o
-	as -arch x86 blob.s   -o blob.o
-	clang --target=x86-elf -T final.ld -o kernel.elf boot32.o blob.o
+	as --32 boot32.s -o boot32.o
+	as --32 blob.s   -o blob.o
+	ld -m elf_i386 -T final.ld -o kernel.elf boot32.o blob.o
 	@grub-file --is-x86-multiboot kernel.elf && echo "kernel.elf: valid Multiboot image" || true
 
 # Interactive boot with a VGA window (needs a display).
@@ -112,9 +112,9 @@ gfx.s: gfx.c nano-kernel.h nano-fb.h $(NANO)
 	$(NANO) --kernel gfx.c gfx.s
 
 gfx64.bin: boot64.s gfx.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c gfx.s    -o gfx.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o gfx64.elf boot64.o gfx.o
+	as --64 boot64.s -o boot64.o
+	as --64 gfx.s    -o gfx.o
+	ld -T kernel64.ld -o gfx64.elf boot64.o gfx.o
 	objcopy -O binary gfx64.elf gfx64.bin
 
 # .incbin needs a literal file name, so each image gets its own one-line
@@ -124,9 +124,9 @@ blob-gfx.s:
 	@printf '.section .blob, "a"\n.incbin "gfx64.bin"\n' > $@
 
 gfx.elf: boot32.s blob-gfx.s gfx64.bin final.ld
-	as -arch x86 boot32.s   -o boot32.o
-	as -arch x86 blob-gfx.s -o blob-gfx.o
-	clang --target=x86-elf -T final.ld -o gfx.elf boot32.o blob-gfx.o
+	as --32 boot32.s   -o boot32.o
+	as --32 blob-gfx.s -o blob-gfx.o
+	ld -m elf_i386 -T final.ld -o gfx.elf boot32.o blob-gfx.o
 
 gfx: gfx.elf
 
@@ -171,19 +171,19 @@ wm.s: wm.c nano-kernel.h nano-int.h nano-fb.h nano-font.h nano-mm.h nano-wm.h $(
 # isr.s carries the interrupt stubs and irq_save/irq_restore, which the heap
 # uses as its lock -- one CPU, so masking interrupts is the lock.
 wm64.bin: boot64.s isr.s wm.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c wm.s     -o wm.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o wm64.elf boot64.o isr.o wm.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 wm.s     -o wm.o
+	ld -T kernel64.ld -o wm64.elf boot64.o isr.o wm.o
 	objcopy -O binary wm64.elf wm64.bin
 
 blob-wm.s:
 	@printf '.section .blob, "a"\n.incbin "wm64.bin"\n' > $@
 
 wm.elf: boot32.s blob-wm.s wm64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-wm.s -o blob-wm.o
-	clang --target=x86-elf -T final.ld -o wm.elf boot32.o blob-wm.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-wm.s -o blob-wm.o
+	ld -m elf_i386 -T final.ld -o wm.elf boot32.o blob-wm.o
 
 wm: wm.elf
 
@@ -227,19 +227,19 @@ wmin.s: wmin.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel wmin.c wmin.s
 
 wmin64.bin: boot64.s isr.s wmin.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c wmin.s   -o wmin.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o wmin64.elf boot64.o isr.o wmin.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 wmin.s   -o wmin.o
+	ld -T kernel64.ld -o wmin64.elf boot64.o isr.o wmin.o
 	objcopy -O binary wmin64.elf wmin64.bin
 
 blob-wmin.s:
 	@printf '.section .blob, "a"\n.incbin "wmin64.bin"\n' > $@
 
 wmin.elf: boot32.s blob-wmin.s wmin64.bin final.ld
-	as -arch x86 boot32.s    -o boot32.o
-	as -arch x86 blob-wmin.s -o blob-wmin.o
-	clang --target=x86-elf -T final.ld -o wmin.elf boot32.o blob-wmin.o
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-wmin.s -o blob-wmin.o
+	ld -m elf_i386 -T final.ld -o wmin.elf boot32.o blob-wmin.o
 
 wmin: wmin.elf
 
@@ -309,10 +309,10 @@ sse.s: sse.c nano-kernel.h nano-int.h $(NANO)
 	$(NANO) --kernel sse.c sse.s
 
 sse64.bin: boot64.s isr.s sse.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c sse.s    -o sse.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o sse64.elf boot64.o isr.o sse.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 sse.s    -o sse.o
+	ld -T kernel64.ld -o sse64.elf boot64.o isr.o sse.o
 	objcopy -O binary sse64.elf sse64.bin
 
 # The #UD handler steps the saved RIP forward by a hard-coded 4 bytes, which is
@@ -332,9 +332,9 @@ blob-sse.s:
 	@printf '.section .blob, "a"\n.incbin "sse64.bin"\n' > $@
 
 sse.elf: boot32.s blob-sse.s sse64.bin final.ld
-	as -arch x86 boot32.s   -o boot32.o
-	as -arch x86 blob-sse.s -o blob-sse.o
-	clang --target=x86-elf -T final.ld -o sse.elf boot32.o blob-sse.o
+	as --32 boot32.s   -o boot32.o
+	as --32 blob-sse.s -o blob-sse.o
+	ld -m elf_i386 -T final.ld -o sse.elf boot32.o blob-sse.o
 
 sse: sse.elf
 
@@ -363,20 +363,20 @@ gfxshell.s: gfxshell.c nano-kernel.h nano-fb.h nano-font.h nano-int.h \
 	$(NANO) --kernel gfxshell.c gfxshell.s
 
 gshell64.bin: boot64.s isr.s gfxshell.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
-	clang --target=x86_64-elf -c boot64.s   -o boot64.o
-	clang --target=x86_64-elf -c isr.s      -o isr.o
-	clang --target=x86_64-elf -c gfxshell.s -o gfxshell.o
-	clang --target=x86_64-elf -c progs.s    -o progs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o gshell64.elf boot64.o isr.o gfxshell.o progs.o
+	as --64 boot64.s   -o boot64.o
+	as --64 isr.s      -o isr.o
+	as --64 gfxshell.s -o gfxshell.o
+	as --64 progs.s    -o progs.o
+	ld -T kernel64.ld -o gshell64.elf boot64.o isr.o gfxshell.o progs.o
 	objcopy -O binary gshell64.elf gshell64.bin
 
 blob-gshell.s:
 	@printf '.section .blob, "a"\n.incbin "gshell64.bin"\n' > $@
 
 gshell.elf: boot32.s blob-gshell.s gshell64.bin final.ld
-	as -arch x86 boot32.s      -o boot32.o
-	as -arch x86 blob-gshell.s -o blob-gshell.o
-	clang --target=x86-elf -T final.ld -o gshell.elf boot32.o blob-gshell.o
+	as --32 boot32.s      -o boot32.o
+	as --32 blob-gshell.s -o blob-gshell.o
+	ld -m elf_i386 -T final.ld -o gshell.elf boot32.o blob-gshell.o
 
 gshell: gshell.elf
 
@@ -490,19 +490,19 @@ intr.s: intr.c nano-kernel.h nano-int.h $(NANO)
 	$(NANO) --kernel intr.c intr.s
 
 intr64.bin: boot64.s isr.s intr.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c intr.s   -o intr.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o intr64.elf boot64.o isr.o intr.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 intr.s   -o intr.o
+	ld -T kernel64.ld -o intr64.elf boot64.o isr.o intr.o
 	objcopy -O binary intr64.elf intr64.bin
 
 blob-intr.s:
 	@printf '.section .blob, "a"\n.incbin "intr64.bin"\n' > $@
 
 intr.elf: boot32.s blob-intr.s intr64.bin final.ld
-	as -arch x86 boot32.s    -o boot32.o
-	as -arch x86 blob-intr.s -o blob-intr.o
-	clang --target=x86-elf -T final.ld -o intr.elf boot32.o blob-intr.o
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-intr.s -o blob-intr.o
+	ld -m elf_i386 -T final.ld -o intr.elf boot32.o blob-intr.o
 
 intr: intr.elf
 
@@ -536,19 +536,19 @@ acpi.s: acpi.c nano-kernel.h nano-int.h nano-acpi.h $(NANO)
 	$(NANO) --kernel acpi.c acpi.s
 
 acpi64.bin: boot64.s isr.s acpi.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c acpi.s   -o acpi.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o acpi64.elf boot64.o isr.o acpi.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 acpi.s   -o acpi.o
+	ld -T kernel64.ld -o acpi64.elf boot64.o isr.o acpi.o
 	objcopy -O binary acpi64.elf acpi64.bin
 
 blob-acpi.s:
 	@printf '.section .blob, "a"\n.incbin "acpi64.bin"\n' > $@
 
 acpi.elf: boot32.s blob-acpi.s acpi64.bin final.ld
-	as -arch x86 boot32.s    -o boot32.o
-	as -arch x86 blob-acpi.s -o blob-acpi.o
-	clang --target=x86-elf -T final.ld -o acpi.elf boot32.o blob-acpi.o
+	as --32 boot32.s    -o boot32.o
+	as --32 blob-acpi.s -o blob-acpi.o
+	ld -m elf_i386 -T final.ld -o acpi.elf boot32.o blob-acpi.o
 
 acpi: acpi.elf
 
@@ -577,19 +577,19 @@ mm.s: mm.c nano-kernel.h nano-int.h nano-mm.h $(NANO)
 	$(NANO) --kernel mm.c mm.s
 
 mm64.bin: boot64.s isr.s mm.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c mm.s     -o mm.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o mm64.elf boot64.o isr.o mm.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 mm.s     -o mm.o
+	ld -T kernel64.ld -o mm64.elf boot64.o isr.o mm.o
 	objcopy -O binary mm64.elf mm64.bin
 
 blob-mm.s:
 	@printf '.section .blob, "a"\n.incbin "mm64.bin"\n' > $@
 
 mm.elf: boot32.s blob-mm.s mm64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-mm.s -o blob-mm.o
-	clang --target=x86-elf -T final.ld -o mm.elf boot32.o blob-mm.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-mm.s -o blob-mm.o
+	ld -m elf_i386 -T final.ld -o mm.elf boot32.o blob-mm.o
 
 mm: mm.elf
 
@@ -625,19 +625,19 @@ threads.s: threads.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h $(NANO)
 	$(NANO) --kernel threads.c threads.s
 
 threads64.bin: boot64.s isr.s threads.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s  -o boot64.o
-	clang --target=x86_64-elf -c isr.s     -o isr.o
-	clang --target=x86_64-elf -c threads.s -o threads.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o threads64.elf boot64.o isr.o threads.o
+	as --64 boot64.s  -o boot64.o
+	as --64 isr.s     -o isr.o
+	as --64 threads.s -o threads.o
+	ld -T kernel64.ld -o threads64.elf boot64.o isr.o threads.o
 	objcopy -O binary threads64.elf threads64.bin
 
 blob-threads.s:
 	@printf '.section .blob, "a"\n.incbin "threads64.bin"\n' > $@
 
 threads.elf: boot32.s blob-threads.s threads64.bin final.ld
-	as -arch x86 boot32.s       -o boot32.o
-	as -arch x86 blob-threads.s -o blob-threads.o
-	clang --target=x86-elf -T final.ld -o threads.elf boot32.o blob-threads.o
+	as --32 boot32.s       -o boot32.o
+	as --32 blob-threads.s -o blob-threads.o
+	ld -m elf_i386 -T final.ld -o threads.elf boot32.o blob-threads.o
 
 threads: threads.elf
 
@@ -669,19 +669,19 @@ srv.s: srv.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-srv.h $(NANO)
 	$(NANO) --kernel srv.c srv.s
 
 srv64.bin: boot64.s isr.s srv.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c srv.s    -o srv.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o srv64.elf boot64.o isr.o srv.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 srv.s    -o srv.o
+	ld -T kernel64.ld -o srv64.elf boot64.o isr.o srv.o
 	objcopy -O binary srv64.elf srv64.bin
 
 blob-srv.s:
 	@printf '.section .blob, "a"\n.incbin "srv64.bin"\n' > $@
 
 srv.elf: boot32.s blob-srv.s srv64.bin final.ld
-	as -arch x86 boot32.s   -o boot32.o
-	as -arch x86 blob-srv.s -o blob-srv.o
-	clang --target=x86-elf -T final.ld -o srv.elf boot32.o blob-srv.o
+	as --32 boot32.s   -o boot32.o
+	as --32 blob-srv.s -o blob-srv.o
+	ld -m elf_i386 -T final.ld -o srv.elf boot32.o blob-srv.o
 
 srv: srv.elf
 
@@ -709,23 +709,90 @@ srvtest: srv.elf
 # Filesystem: a RAM disk, a Unix-shaped layout (superblock, bitmaps, inodes,
 # directory entries), and the operations the shell tools need.
 # ---------------------------------------------------------------------------
+# fsdisk -- the filesystem on a real ATA disk. Built like every other image,
+# but it is the only one that needs a DRIVE attached, and the only one whose
+# result depends on what a previous run left behind.
+fsdisk.s: fsdisk.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h nano-ata.h $(NANO)
+	$(NANO) --kernel fsdisk.c fsdisk.s
+
+fsdisk64.bin: boot64.s isr.s fsdisk.s kernel64.ld
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 fsdisk.s -o fsdisk.o
+	ld -T kernel64.ld -o fsdisk64.elf boot64.o isr.o fsdisk.o
+	objcopy -O binary fsdisk64.elf fsdisk64.bin
+
+blob-fsdisk.s:
+	@printf '.section .blob, "a"\n.incbin "fsdisk64.bin"\n' > $@
+
+fsdisk.elf: boot32.s blob-fsdisk.s fsdisk64.bin final.ld
+	as --32 boot32.s      -o boot32.o
+	as --32 blob-fsdisk.s -o blob-fsdisk.o
+	ld -m elf_i386 -T final.ld -o fsdisk.elf boot32.o blob-fsdisk.o
+
+fsdisk: fsdisk.elf
+
+# A blank 8 MiB drive. Deleting this file is what "start again" means.
+nano-disk.img:
+	dd if=/dev/zero of=nano-disk.img bs=1M count=8 2>/dev/null
+
+fsdiskrun: fsdisk.elf nano-disk.img
+	$(QEMU) -kernel fsdisk.elf -no-reboot \
+	  -drive file=nano-disk.img,format=raw,if=ide
+
+# THE TEST, and the reason it is two runs: the first formats a blank drive and
+# the second has to find what the first one wrote. A single run proves nothing
+# about durability -- it is the reboot that is the feature.
+fsdisktest: fsdisk.elf
+	@rm -f nano-disk.img fsdisk-boot1.log fsdisk-boot2.log fsdisk-boot3.log
+	@dd if=/dev/zero of=nano-disk.img bs=1M count=8 2>/dev/null
+	@echo "--- boot 1: blank disk, should format and write"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot1.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 2: same disk, should mount and read back"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot2.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@echo "--- boot 3: again, to exercise syncing a MOUNTED filesystem"
+	@timeout 220 $(QEMU) -kernel fsdisk.elf -no-reboot -display none \
+	   -serial file:fsdisk-boot3.log \
+	   -drive file=nano-disk.img,format=raw,if=ide >/dev/null 2>&1; true
+	@tr -d '\r' < fsdisk-boot1.log
+	@tr -d '\r' < fsdisk-boot2.log
+	@tr -d '\r' < fsdisk-boot3.log
+	@echo "--- the sequence itself, which only the harness can check"
+	@# The image cannot know it is the second boot -- it has nothing to know it
+	@# with except the disk, which is the thing under test. So the ORDER is
+	@# asserted here. Without this, a broken fs_sync makes boot 2 find a blank
+	@# disk, take the format branch, and pass every check it runs.
+	@fail=0; \
+	grep -q "FIRST BOOT" fsdisk-boot1.log || { echo "FAIL: boot 1 did not format a blank disk"; fail=1; }; \
+	grep -q "LATER BOOT" fsdisk-boot2.log || { echo "FAIL: boot 2 did not MOUNT -- nothing survived"; fail=1; }; \
+	grep -q "LATER BOOT" fsdisk-boot3.log || { echo "FAIL: boot 3 did not MOUNT"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot1.log && { echo "FAIL: boot 1 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot2.log && { echo "FAIL: boot 2 had failures"; fail=1; }; \
+	grep -q "CHECKS FAILED" fsdisk-boot3.log && { echo "FAIL: boot 3 had failures"; fail=1; }; \
+	if [ $$fail -eq 0 ]; then echo "PASS: formatted once, mounted twice, every byte intact"; \
+	else echo "FSDISK SEQUENCE FAILED"; exit 1; fi
+
 fs.s: fs.c nano-kernel.h nano-mm.h nano-thread.h nano-int.h nano-fs.h $(NANO)
 	$(NANO) --kernel fs.c fs.s
 
 fs64.bin: boot64.s isr.s fs.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c fs.s     -o fs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o fs64.elf boot64.o isr.o fs.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 fs.s     -o fs.o
+	ld -T kernel64.ld -o fs64.elf boot64.o isr.o fs.o
 	objcopy -O binary fs64.elf fs64.bin
 
 blob-fs.s:
 	@printf '.section .blob, "a"\n.incbin "fs64.bin"\n' > $@
 
 fs.elf: boot32.s blob-fs.s fs64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-fs.s -o blob-fs.o
-	clang --target=x86-elf -T final.ld -o fs.elf boot32.o blob-fs.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-fs.s -o blob-fs.o
+	ld -m elf_i386 -T final.ld -o fs.elf boot32.o blob-fs.o
 
 fs: fs.elf
 
@@ -760,7 +827,7 @@ fstest: fs.elf
 # and a 4 KiB program asks the loader for six megabytes of frames.
 # ---------------------------------------------------------------------------
 user/ustart.o: user/ustart.s
-	clang --target=x86_64-elf -c user/ustart.s -o user/ustart.o
+	as --64 user/ustart.s -o user/ustart.o
 
 # One recipe from .c to .elf rather than a .s and a .o step.
 #
@@ -775,8 +842,8 @@ user/ustart.o: user/ustart.s
 # findable from inside that directory.
 user/%.elf: user/%.c user/nano-user.h user/ustart.o user/user.ld $(NANO)
 	cd user && ../$(NANO) --kernel --bss $*.c $*.s
-	clang --target=x86_64-elf -c user/$*.s -o user/$*.o
-	clang --target=x86_64-elf -fuse-ld=lld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/$*.o
+	as --64 user/$*.s -o user/$*.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/$*.o
 
 # The compiler itself, as a program for this OS.
 #
@@ -797,8 +864,8 @@ user/cc.elf: ../simpleC++.c ../nano-libc.h user/os-base.h user/ustart.o user/use
 	@cp ../nano-libc.h user/ccbuild/
 	@cp user/os-base.h user/ccbuild/nano-base.h
 	cd user/ccbuild && ../../$(NANO) --kernel --bss cc.c cc.s
-	clang --target=x86_64-elf -c user/ccbuild/cc.s -o user/ccbuild/cc.o
-	clang --target=x86_64-elf -fuse-ld=lld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/ccbuild/cc.o
+	as --64 user/ccbuild/cc.s -o user/ccbuild/cc.o
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/ustart.o user/ccbuild/cc.o
 	@echo "   $$(stat -c%s $@) bytes on disk, $$(readelf -lW $@ | awk '/RW /{print strtonum($$6)}') bytes of memory"
 
 # The assembler, as a program for this OS.
@@ -814,8 +881,8 @@ user/cc.elf: ../simpleC++.c ../nano-libc.h user/os-base.h user/ustart.o user/use
 # is where nano-os user memory starts, and names _start as the entry point.
 user/as.elf: user/as/miniasm.asm tools/nasm2gas.py user/user.ld
 	python3 tools/nasm2gas.py user/as/miniasm.asm > user/as/miniasm.s
-	clang --target=x86_64-elf -c -o user/as/miniasm.o user/as/miniasm.s
-	clang --target=x86_64-elf -fuse-ld=lld -T user/user.ld -z max-page-size=0x1000 -o $@ user/as/miniasm.o
+	as --64 -o user/as/miniasm.o user/as/miniasm.s
+	ld -T user/user.ld -z max-page-size=0x1000 -o $@ user/as/miniasm.o
 	@echo "   $$(stat -c%s $@) bytes on disk, $$(readelf -lW $@ | awk '/RW /{print strtonum($$6)}') bytes of memory"
 
 # Regenerate the vendored assembler and require it to match, so the copy in
@@ -844,20 +911,20 @@ elf.s: elf.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-in
 	$(NANO) --kernel elf.c elf.s
 
 elf64.bin: boot64.s isr.s elf.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c elf.s    -o elf.o
-	clang --target=x86_64-elf -c progs.s  -o progs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o elf64.elf boot64.o isr.o elf.o progs.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 elf.s    -o elf.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o elf64.elf boot64.o isr.o elf.o progs.o
 	objcopy -O binary elf64.elf elf64.bin
 
 blob-elf.s:
 	@printf '.section .blob, "a"\n.incbin "elf64.bin"\n' > $@
 
 elfk.elf: boot32.s blob-elf.s elf64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-elf.s -o blob-elf.o
-	clang --target=x86-elf -T final.ld -o elfk.elf boot32.o blob-elf.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-elf.s -o blob-elf.o
+	ld -m elf_i386 -T final.ld -o elfk.elf boot32.o blob-elf.o
 
 elf: elfk.elf
 
@@ -892,20 +959,20 @@ cc.s: cc.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nano-int.
 	$(NANO) --kernel cc.c cc.s
 
 cc64.bin: boot64.s isr.s cc.s progs.s $(UPROGS) src/demo.c src/util.h src/prog.c kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c cc.s     -o cck.o
-	clang --target=x86_64-elf -c progs.s  -o progs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o cc64.elf boot64.o isr.o cck.o progs.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 cc.s     -o cck.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o cc64.elf boot64.o isr.o cck.o progs.o
 	objcopy -O binary cc64.elf cc64.bin
 
 blob-cc.s:
 	@printf '.section .blob, "a"\n.incbin "cc64.bin"\n' > $@
 
 cck.elf: boot32.s blob-cc.s cc64.bin final.ld
-	as -arch x86 boot32.s -o boot32.o
-	as -arch x86 blob-cc.s -o blob-cc.o
-	clang --target=x86-elf -T final.ld -o cck.elf boot32.o blob-cc.o
+	as --32 boot32.s -o boot32.o
+	as --32 blob-cc.s -o blob-cc.o
+	ld -m elf_i386 -T final.ld -o cck.elf boot32.o blob-cc.o
 
 cc: cck.elf
 
@@ -952,20 +1019,20 @@ chain.s: chain.c nano-kernel.h nano-mm.h nano-thread.h nano-fs.h nano-proc.h nan
 	$(NANO) --kernel chain.c chain.s
 
 chain64.bin: boot64.s isr.s chain.s progs.s $(UPROGS) src/prog.c kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c chain.s  -o chaink.o
-	clang --target=x86_64-elf -c progs.s  -o progs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o chain64.elf boot64.o isr.o chaink.o progs.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 chain.s  -o chaink.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o chain64.elf boot64.o isr.o chaink.o progs.o
 	objcopy -O binary chain64.elf chain64.bin
 
 blob-chain.s:
 	@printf '.section .blob, "a"\n.incbin "chain64.bin"\n' > $@
 
 chaink.elf: boot32.s blob-chain.s chain64.bin final.ld
-	as -arch x86 boot32.s -o boot32.o
-	as -arch x86 blob-chain.s -o blob-chain.o
-	clang --target=x86-elf -T final.ld -o chaink.elf boot32.o blob-chain.o
+	as --32 boot32.s -o boot32.o
+	as --32 blob-chain.s -o blob-chain.o
+	ld -m elf_i386 -T final.ld -o chaink.elf boot32.o blob-chain.o
 
 chain: chaink.elf
 
@@ -985,7 +1052,7 @@ chainrun: chaink.elf
 user/as/hostas: user/as/miniasm.asm user/as/target-linux.inc tools/retarget.py tools/nasm2gas.py
 	python3 tools/retarget.py user/as/miniasm.asm user/as/target-linux.inc > user/as/hostas.asm
 	python3 tools/nasm2gas.py user/as/hostas.asm > user/as/hostas.s
-	clang --target=x86_64-elf -c -o user/as/hostas.o user/as/hostas.s
+	as --64 -o user/as/hostas.o user/as/hostas.s
 	ld -o $@ user/as/hostas.o
 
 chaintest: chaink.elf $(NANO) user/as.elf user/as/hostas
@@ -1031,19 +1098,19 @@ gears.s: gears.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel gears.c gears.s
 
 gears64.bin: boot64.s isr.s gears.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c gears.s  -o gearsk.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o gears64.elf boot64.o isr.o gearsk.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gears.s  -o gearsk.o
+	ld -T kernel64.ld -o gears64.elf boot64.o isr.o gearsk.o
 	objcopy -O binary gears64.elf gears64.bin
 
 blob-gears.s:
 	@printf '.section .blob, "a"\n.incbin "gears64.bin"\n' > $@
 
 gears.elf: boot32.s blob-gears.s gears64.bin final.ld
-	as -arch x86 boot32.s     -o boot32.o
-	as -arch x86 blob-gears.s -o blob-gears.o
-	clang --target=x86-elf -T final.ld -o gears.elf boot32.o blob-gears.o
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-gears.s -o blob-gears.o
+	ld -m elf_i386 -T final.ld -o gears.elf boot32.o blob-gears.o
 
 gears: gears.elf
 
@@ -1084,19 +1151,19 @@ glapi.s: glapi.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel glapi.c glapi.s
 
 glapi64.bin: boot64.s isr.s glapi.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c glapi.s  -o glapik.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o glapi64.elf boot64.o isr.o glapik.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 glapi.s  -o glapik.o
+	ld -T kernel64.ld -o glapi64.elf boot64.o isr.o glapik.o
 	objcopy -O binary glapi64.elf glapi64.bin
 
 blob-glapi.s:
 	@printf '.section .blob, "a"\n.incbin "glapi64.bin"\n' > $@
 
 glapi.elf: boot32.s blob-glapi.s glapi64.bin final.ld
-	as -arch x86 boot32.s     -o boot32.o
-	as -arch x86 blob-glapi.s -o blob-glapi.o
-	clang --target=x86-elf -T final.ld -o glapi.elf boot32.o blob-glapi.o
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-glapi.s -o blob-glapi.o
+	ld -m elf_i386 -T final.ld -o glapi.elf boot32.o blob-glapi.o
 
 glapi: glapi.elf
 
@@ -1160,19 +1227,19 @@ gltex.s: gltex.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel gltex.c gltex.s
 
 gltex64.bin: boot64.s isr.s gltex.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c gltex.s  -o gltexk.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o gltex64.elf boot64.o isr.o gltexk.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gltex.s  -o gltexk.o
+	ld -T kernel64.ld -o gltex64.elf boot64.o isr.o gltexk.o
 	objcopy -O binary gltex64.elf gltex64.bin
 
 blob-gltex.s:
 	@printf '.section .blob, "a"\n.incbin "gltex64.bin"\n' > $@
 
 gltex.elf: boot32.s blob-gltex.s gltex64.bin final.ld
-	as -arch x86 boot32.s     -o boot32.o
-	as -arch x86 blob-gltex.s -o blob-gltex.o
-	clang --target=x86-elf -T final.ld -o gltex.elf boot32.o blob-gltex.o
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-gltex.s -o blob-gltex.o
+	ld -m elf_i386 -T final.ld -o gltex.elf boot32.o blob-gltex.o
 
 gltex: gltex.elf
 
@@ -1234,20 +1301,20 @@ oswin.s: oswin.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel oswin.c oswin.s
 
 oswin64.bin: boot64.s isr.s oswin.s progs.s $(UPROGS) src/wingl.c src/winbad.c src/gears.c nano-gl.h nano-glapi.h kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c oswin.s  -o oswink.o
-	clang --target=x86_64-elf -c progs.s  -o progs.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o oswin64.elf boot64.o isr.o oswink.o progs.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 oswin.s  -o oswink.o
+	as --64 progs.s  -o progs.o
+	ld -T kernel64.ld -o oswin64.elf boot64.o isr.o oswink.o progs.o
 	objcopy -O binary oswin64.elf oswin64.bin
 
 blob-oswin.s:
 	@printf '.section .blob, "a"\n.incbin "oswin64.bin"\n' > $@
 
 oswin.elf: boot32.s blob-oswin.s oswin64.bin final.ld
-	as -arch x86 boot32.s     -o boot32.o
-	as -arch x86 blob-oswin.s -o blob-oswin.o
-	clang --target=x86-elf -T final.ld -o oswin.elf boot32.o blob-oswin.o
+	as --32 boot32.s     -o boot32.o
+	as --32 blob-oswin.s -o blob-oswin.o
+	ld -m elf_i386 -T final.ld -o oswin.elf boot32.o blob-oswin.o
 
 oswin: oswin.elf
 
@@ -1287,19 +1354,19 @@ linebench.s: linebench.c nano-kernel.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel linebench.c linebench.s
 
 linebench64.bin: boot64.s isr.s linebench.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s   -o boot64.o
-	clang --target=x86_64-elf -c isr.s      -o isr.o
-	clang --target=x86_64-elf -c linebench.s -o linebenchk.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o linebench64.elf boot64.o isr.o linebenchk.o
+	as --64 boot64.s   -o boot64.o
+	as --64 isr.s      -o isr.o
+	as --64 linebench.s -o linebenchk.o
+	ld -T kernel64.ld -o linebench64.elf boot64.o isr.o linebenchk.o
 	objcopy -O binary linebench64.elf linebench64.bin
 
 blob-linebench.s:
 	@printf '.section .blob, "a"\n.incbin "linebench64.bin"\n' > $@
 
 linebench.elf: boot32.s blob-linebench.s linebench64.bin final.ld
-	as -arch x86 boot32.s         -o boot32.o
-	as -arch x86 blob-linebench.s -o blob-linebench.o
-	clang --target=x86-elf -T final.ld -o linebench.elf boot32.o blob-linebench.o
+	as --32 boot32.s         -o boot32.o
+	as --32 blob-linebench.s -o blob-linebench.o
+	ld -m elf_i386 -T final.ld -o linebench.elf boot32.o blob-linebench.o
 
 linebench: linebench.elf
 
@@ -1378,19 +1445,19 @@ ui.s: ui.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel ui.c ui.s
 
 ui64.bin: boot64.s isr.s ui.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c ui.s     -o uik.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o ui64.elf boot64.o isr.o uik.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 ui.s     -o uik.o
+	ld -T kernel64.ld -o ui64.elf boot64.o isr.o uik.o
 	objcopy -O binary ui64.elf ui64.bin
 
 blob-ui.s:
 	@printf '.section .blob, "a"\n.incbin "ui64.bin"\n' > $@
 
 ui.elf: boot32.s blob-ui.s ui64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-ui.s -o blob-ui.o
-	clang --target=x86-elf -T final.ld -o ui.elf boot32.o blob-ui.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-ui.s -o blob-ui.o
+	ld -m elf_i386 -T final.ld -o ui.elf boot32.o blob-ui.o
 
 ui: ui.elf
 
@@ -1449,19 +1516,19 @@ gl.s: gl.c nano-kernel.h nano-mouse.h nano-int.h nano-fb.h nano-font.h \
 	$(NANO) --kernel gl.c gl.s
 
 gl64.bin: boot64.s isr.s gl.s kernel64.ld
-	clang --target=x86_64-elf -c boot64.s -o boot64.o
-	clang --target=x86_64-elf -c isr.s    -o isr.o
-	clang --target=x86_64-elf -c gl.s     -o glk.o
-	clang --target=x86_64-elf -fuse-ld=lld -T kernel64.ld -o gl64.elf boot64.o isr.o glk.o
+	as --64 boot64.s -o boot64.o
+	as --64 isr.s    -o isr.o
+	as --64 gl.s     -o glk.o
+	ld -T kernel64.ld -o gl64.elf boot64.o isr.o glk.o
 	objcopy -O binary gl64.elf gl64.bin
 
 blob-gl.s:
 	@printf '.section .blob, "a"\n.incbin "gl64.bin"\n' > $@
 
 gl.elf: boot32.s blob-gl.s gl64.bin final.ld
-	as -arch x86 boot32.s  -o boot32.o
-	as -arch x86 blob-gl.s -o blob-gl.o
-	clang --target=x86-elf -T final.ld -o gl.elf boot32.o blob-gl.o
+	as --32 boot32.s  -o boot32.o
+	as --32 blob-gl.s -o blob-gl.o
+	ld -m elf_i386 -T final.ld -o gl.elf boot32.o blob-gl.o
 
 gl: gl.elf
 
