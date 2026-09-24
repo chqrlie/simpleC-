@@ -334,12 +334,64 @@ typedef struct {
     int   pos;           // offset into SRC, for error messages
 } Token;
 
+/* A Token is ~288 bytes, almost all of it the 256-byte identifier field, so
+   this array IS the compiler's memory footprint. Raising it is a real trade,
+   not a free one; the bounds check below is what makes hitting it survivable.
+
+   Raised from 60000 once the check existed, because the check immediately
+   fired on kernel/glapi.c -- a file that has been BUILDING IN THIS TREE ALL
+   ALONG. It was over the limit and add_tok was writing past the end of the
+   array into whatever static followed it, and the resulting binary happened
+   to work. That is what the silent ceiling has been: not a wall, a quiet
+   corruption that sometimes produces a working program.
+
+   Set NANO_CC_STATS=1 to print the peak token count for a file, which is how
+   to tell whether a limit is being approached rather than finding out from a
+   struct mysteriously losing its members. */
+/* The OS build gets a smaller table. It is the same source compiled for a
+   machine where this array is a process's memory rather than a host's, and
+   at 288 bytes a token, 200000 of them is 57MB of .bss -- larger than the
+   loader accepts. It compiles small programs; the host compiles the kernel
+   images. NANO_CC_INOS is injected by the awk transform in kernel/Makefile
+   that produces user/ccbuild/cc.c. */
+#ifdef NANO_CC_INOS
 #define MAX_TOK 60000
+#else
+#define MAX_TOK 200000
+#endif
 static Token toks[MAX_TOK];
 static int   ntok = 0;
 
 static int  tok_pos = 0;                  // where the token being lexed started
-static void add_tok(int kind) { toks[ntok].kind = kind; toks[ntok].pos = tok_pos; ntok++; }
+
+/* add_tok used to have NO bounds check. Past MAX_TOK it wrote straight off
+   the end of `toks` into whatever static followed it and carried on, so the
+   symptom of a too-large file was not "file too large" -- it was a struct
+   definition quietly losing its members, and an error like
+
+       no member 'used' in type kind 2 tag '(untagged)'
+
+   pointing at a line that is perfectly correct. That is the silent size
+   ceiling this compiler has had all along: lex() entering and never coming
+   back, or a program failing with an error about the wrong thing entirely.
+
+   Nothing in this tree currently reaches the limit -- the error that sent me
+   looking turned out to be a name collision, not size -- but an unchecked
+   write past a static array does not become safe by not having fired yet.
+
+   Failing here costs one comparison per token and turns a memory-corruption
+   bug into a sentence that says what is wrong. */
+static void add_tok(int kind) {
+    if (ntok >= MAX_TOK) {
+        fprintf(stderr,
+                "nano_cc: error: too many tokens (limit %d)\n"
+                "  the file is larger than the compiler's token table.\n"
+                "  raise MAX_TOK in simpleC++.c, or split the file.\n",
+                MAX_TOK);
+        exit(1);
+    }
+    toks[ntok].kind = kind; toks[ntok].pos = tok_pos; ntok++;
+}
 
 // Report an error against a token rather than against nothing. The line number
 // is a line of the PREPROCESSED buffer, so the text of the line is printed too
@@ -2642,6 +2694,14 @@ int main(int argc, char **argv) {
     preprocess(inpath);
     SRC[SRC_LEN] = 0;
     lex();
+    /* How close this file came to the token ceiling. Off unless asked for,
+       because it is a build-noise line, but it is the only way to see the
+       headroom before it runs out. */
+#ifndef NANO_CC_INOS
+    if (getenv("NANO_CC_STATS"))
+        fprintf(stderr, "nano_cc: %s used %d of %d tokens (%d%%)\n",
+                inpath, ntok, MAX_TOK, (int)((long)ntok * 100 / MAX_TOK));
+#endif
 
     while (!at(T_EOF)) parse_toplevel();
 
