@@ -10,6 +10,7 @@ v2 designed to work with this selfHostingAssembler https://github.com/netpipe/Se
 $ ./nano_cc --minimal --nasm printf.c prog.asm $ ./mini_asm # reads prog.asm, writes a.out $ ./a.out
 <br>
 
+https://github.com/netpipe/nanoLinker
 
 
 
